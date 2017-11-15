@@ -150,6 +150,7 @@ ERROR(ivar_not_initialized_at_implicit_superinit,none,
       "property '%0' not initialized at implicitly generated super.init call",
       (StringRef, bool))
 
+ERROR(null_error_with_two_StringRefs, none, "", (StringRef, StringRef))
 ERROR(self_use_before_fully_init,none,
       "use of 'self' in %select{method call|property access}1 %0 before "
       "%select{all stored properties are initialized|"
@@ -157,6 +158,10 @@ ERROR(self_use_before_fully_init,none,
       "self.init initializes self}2", (DeclBaseName, bool, unsigned))
 ERROR(use_of_self_before_fully_init,none,
       "'self' used before all stored properties are initialized", ())
+ERROR(use_of_self_before_fully_init_in_enum, none,
+	  "%0 '%1' called before 'self' is initialized", (StringRef, StringRef))
+ERROR(use_of_self_before_fully_init_in_struct, none,
+	  "%0 '%1' called before 'self' is fully initialized", (StringRef, StringRef))
 ERROR(use_of_self_before_fully_init_protocol,none,
       "'self' used before chaining to another self.init requirement", ())
 

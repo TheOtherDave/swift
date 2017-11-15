@@ -16,6 +16,7 @@
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/Expr.h"
+#include "swift/AST/Decl.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
@@ -28,6 +29,10 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
+//#include "swift/Demangling/Demangler.h"
+#include "swift/Parse/Lexer.h"
+#include <algorithm>
+#include <memory>
 
 #ifdef SWIFT_SILOPTIMIZER_PASSMANAGER_DIMEMORYUSECOLLECTOR_H
 #error "Included non ownership header?!"
@@ -546,10 +551,10 @@ namespace {
     void handleInOutUse(const DIMemoryUse &Use);
     void handleEscapeUse(const DIMemoryUse &Use);
 
+    bool weDidNotDiagnoseAMoreSpecificPrematureLoadOfSelf(SILInstruction* Inst);
     void handleLoadUseFailure(const DIMemoryUse &InstInfo,
                               bool SuperInitDone,
                               bool FailedSelfUse);
-
     void handleSuperInitUse(const DIMemoryUse &InstInfo);
     void handleSelfInitUse(DIMemoryUse &InstInfo);
     void updateInstructionForInitState(DIMemoryUse &InstInfo);
@@ -1411,6 +1416,42 @@ bool LifetimeChecker::diagnoseMethodCall(const DIMemoryUse &Use,
   return false;
 }
 
+/// Just checks for a few more specific instances of load use failure. If they're
+/// found, this emits the diagnostic and returns false, otherwise it returns true
+///
+bool LifetimeChecker::weDidNotDiagnoseAMoreSpecificPrematureLoadOfSelf(SILInstruction* Inst) {
+	// See if we can dig deeper and provide a better diagnostic
+	Diag<StringRef, StringRef> deeperDiagID = diag::null_error_with_two_StringRefs;
+	NominalTypeDecl* typeDecl = TheMemory.MemorySILType.getNominalOrBoundGenericNominal();
+	SourceLoc loc = Inst->getLoc().getSourceLoc();
+	StringRef offendingIdentName;
+	StringRef offendingIdentKindDesc;
+	if (typeDecl && loc.isValid()) {
+		Lexer L(LangOptions(), Module.getASTContext().SourceMgr,
+				Module.getASTContext().SourceMgr.findBufferContainingLoc(loc),
+				nullptr, /*InSILMode=*/ false,
+				CommentRetentionMode::None);
+		
+		offendingIdentName = L.getTokenAt(loc).getText();
+		Identifier ident = Module.getASTContext().getIdentifier(offendingIdentName);
+		ValueDecl* identDecl = typeDecl->lookupDirect(DeclName(ident)).front();
+		offendingIdentKindDesc = identDecl->getDescriptiveKindName(identDecl->getDescriptiveKind());
+	}
+	if (TheMemory.isEnumInitSelf())
+		deeperDiagID = diag::use_of_self_before_fully_init_in_enum;
+	if (TheMemory.isStructInitSelf())
+		deeperDiagID = diag::use_of_self_before_fully_init_in_struct;
+	if (deeperDiagID.ID != diag::null_error_with_two_StringRefs.ID &&
+		!offendingIdentName.empty() &&
+		!offendingIdentKindDesc.empty()) {
+		diagnose(Module, Inst->getLoc(), deeperDiagID,
+				 offendingIdentKindDesc, offendingIdentName);
+		return false;
+	} else {
+		return true;
+	}
+}
+
 /// handleLoadUseFailure - Check and diagnose various failures when a load use
 /// is not fully initialized.
 ///
@@ -1418,183 +1459,184 @@ bool LifetimeChecker::diagnoseMethodCall(const DIMemoryUse &Use,
 /// initialization of the type.
 ///
 void LifetimeChecker::handleLoadUseFailure(const DIMemoryUse &Use,
-                                           bool SuperInitDone,
-                                           bool FailedSelfUse) {
-  SILInstruction *Inst = Use.Inst;
-  
-  if (FailedSelfUse) {
-    // FIXME: more specific diagnostics here, handle this case gracefully below.
-    if (!shouldEmitError(Inst))
-      return;
-    
-    diagnose(Module, Inst->getLoc(),
-             diag::self_inside_catch_superselfinit,
-             (unsigned)TheMemory.isDelegatingInit());
-    return;
-  }
-  
-  // If this is a load with a single user that is a return (and optionally a
-  // retain_value for non-trivial structs/enums), then this is a return in the
-  // enum/struct init case, and we haven't stored to self.   Emit a specific
-  // diagnostic.
-  if (auto *LI = dyn_cast<LoadInst>(Inst)) {
-    bool hasReturnUse = false, hasUnknownUses = false;
-    
-    for (auto LoadUse : LI->getUses()) {
-      auto *User = LoadUse->getUser();
-      
-      // Ignore retains of the struct/enum before the return.
-      if (isa<RetainValueInst>(User))
-        continue;
-      if (isa<ReturnInst>(User)) {
-        hasReturnUse = true;
-        continue;
-      }
+										   bool SuperInitDone,
+										   bool FailedSelfUse) {
+	SILInstruction *Inst = Use.Inst;
+	
+	if (FailedSelfUse) {
+		// FIXME: more specific diagnostics here, handle this case gracefully below.
+		if (!shouldEmitError(Inst))
+			return;
+		
+		diagnose(Module, Inst->getLoc(),
+				 diag::self_inside_catch_superselfinit,
+				 (unsigned)TheMemory.isDelegatingInit());
+		return;
+	}
+	
+	// If this is a load with a single user that is a return (and optionally a
+	// retain_value for non-trivial structs/enums), then this is a return in the
+	// enum/struct init case, and we haven't stored to self.   Emit a specific
+	// diagnostic.
+	if (auto *LI = dyn_cast<LoadInst>(Inst)) {
+		bool hasReturnUse = false, hasUnknownUses = false;
+		
+		for (auto LoadUse : LI->getUses()) {
+			auto *User = LoadUse->getUser();
+			
+			// Ignore retains of the struct/enum before the return.
+			if (isa<RetainValueInst>(User))
+				continue;
+			if (isa<ReturnInst>(User)) {
+				hasReturnUse = true;
+				continue;
+			}
+			
+			if (auto *EI = dyn_cast<EnumInst>(User))
+				if (isFailableInitReturnUseOfEnum(EI)) {
+					hasReturnUse = true;
+					continue;
+				}
+			
+			hasUnknownUses = true;
+			break;
+		}
+		
+		// Okay, this load is part of a return sequence, diagnose it specially.
+		if (hasReturnUse && !hasUnknownUses) {
+			// The load is probably part of the common epilog for the function, try to
+			// find a more useful source location than the syntactic end of the
+			// function.
+			SILLocation returnLoc = Inst->getLoc();
+			auto TermLoc = Inst->getParent()->getTerminator()->getLoc();
+			if (TermLoc.getKind() == SILLocation::ReturnKind) {
+				// Function has a single return that got merged into the epilog block.
+				returnLoc = TermLoc;
+			} else {
+				// Otherwise, there are multiple paths to the epilog block, scan its
+				// predecessors to see if there are any where the value is unavailable.
+				// If so, we can use its location information for more precision.
+				for (auto pred : LI->getParent()->getPredecessorBlocks()) {
+					auto *TI = pred->getTerminator();
+					// Check if this is an early return with uninitialized members.
+					if (TI->getLoc().getKind() == SILLocation::ReturnKind &&
+						getAnyUninitializedMemberAtInst(TI, Use.FirstElement,
+														Use.NumElements) != -1)
+						returnLoc = TI->getLoc();
+				}
+			}
+			
+			if (TheMemory.isEnumInitSelf()) {
+				if (!shouldEmitError(Inst)) return;
+				diagnose(Module, returnLoc,
+						 diag::return_from_init_without_initing_self);
+				return;
+			}
+			
+			if (TheMemory.isAnyInitSelf() && !TheMemory.isClassInitSelf() &&
+				!TheMemory.isDelegatingInit()) {
+				if (!shouldEmitError(Inst)) return;
+				diagnose(Module, returnLoc,
+						 diag::return_from_init_without_initing_stored_properties);
+				noteUninitializedMembers(Use);
+				return;
+			}
+		}
+	}
 
-      if (auto *EI = dyn_cast<EnumInst>(User))
-        if (isFailableInitReturnUseOfEnum(EI)) {
-          hasReturnUse = true;
-          continue;
-        }
-
-      hasUnknownUses = true;
-      break;
-    }
-    
-    // Okay, this load is part of a return sequence, diagnose it specially.
-    if (hasReturnUse && !hasUnknownUses) {
-      // The load is probably part of the common epilog for the function, try to
-      // find a more useful source location than the syntactic end of the
-      // function.
-      SILLocation returnLoc = Inst->getLoc();
-      auto TermLoc = Inst->getParent()->getTerminator()->getLoc();
-      if (TermLoc.getKind() == SILLocation::ReturnKind) {
-        // Function has a single return that got merged into the epilog block.
-        returnLoc = TermLoc;
-      } else {
-        // Otherwise, there are multiple paths to the epilog block, scan its
-        // predecessors to see if there are any where the value is unavailable.
-        // If so, we can use its location information for more precision.
-        for (auto pred : LI->getParent()->getPredecessorBlocks()) {
-          auto *TI = pred->getTerminator();
-          // Check if this is an early return with uninitialized members.
-          if (TI->getLoc().getKind() == SILLocation::ReturnKind &&
-              getAnyUninitializedMemberAtInst(TI, Use.FirstElement,
-                                              Use.NumElements) != -1)
-            returnLoc = TI->getLoc();
-        }
-      }
-      
-      if (TheMemory.isEnumInitSelf()) {
-        if (!shouldEmitError(Inst)) return;
-        diagnose(Module, returnLoc,
-                 diag::return_from_init_without_initing_self);
-        return;
-      }
-      
-      if (TheMemory.isAnyInitSelf() && !TheMemory.isClassInitSelf() &&
-                 !TheMemory.isDelegatingInit()) {
-        if (!shouldEmitError(Inst)) return;
-        diagnose(Module, returnLoc,
-                 diag::return_from_init_without_initing_stored_properties);
-        noteUninitializedMembers(Use);
-        return;
-      }
-    }
-  }
-  
-  // If this is a copy_addr into the 'self' argument, and the memory object is a
-  // rootself struct/enum or a non-delegating initializer, then we're looking at
-  // the implicit "return self" in an address-only initializer.  Emit a specific
-  // diagnostic.
-  if (auto *CA = dyn_cast<CopyAddrInst>(Inst)) {
-    if (CA->isInitializationOfDest() &&
-        !CA->getFunction()->getArguments().empty() &&
-        SILValue(CA->getFunction()->getArgument(0)) == CA->getDest()) {
-      if (TheMemory.isEnumInitSelf()) {
-        if (!shouldEmitError(Inst)) return;
-        diagnose(Module, Inst->getLoc(),
-                 diag::return_from_init_without_initing_self);
-        return;
-      }
-
-      if (TheMemory.isProtocolInitSelf()) {
-        if (!shouldEmitError(Inst)) return;
-        diagnose(Module, Inst->getLoc(),
-                 diag::return_from_protocol_init_without_initing_self);
-        return;
-      }
-
-      if (TheMemory.isAnyInitSelf() && !TheMemory.isClassInitSelf() &&
-          !TheMemory.isDelegatingInit()) {
-        if (!shouldEmitError(Inst)) return;
-        diagnose(Module, Inst->getLoc(),
-                 diag::return_from_init_without_initing_stored_properties);
-        noteUninitializedMembers(Use);
-        return;
-      }
-    }
-  }
-
-  // Check to see if we're returning self in a class initializer before all the
-  // ivars/super.init are set up.
-  if (isa<ReturnInst>(Inst) && TheMemory.isAnyInitSelf()) {
-    if (!shouldEmitError(Inst)) return;
-    if (!SuperInitDone) {
-      diagnose(Module, Inst->getLoc(),
-               diag::superselfinit_not_called_before_return,
-               (unsigned)TheMemory.isDelegatingInit());
-    } else {
-      diagnose(Module, Inst->getLoc(),
-               diag::return_from_init_without_initing_stored_properties);
-      noteUninitializedMembers(Use);
-    }
-    return;
-  }
-
-  // Check to see if this is a use of self or super, due to a method call.  If
-  // so, emit a specific diagnostic.
-  if (diagnoseMethodCall(Use, SuperInitDone))
-    return;
-
-  // Otherwise, we couldn't find a specific thing to complain about, so emit a
-  // generic error, depending on what kind of failure this is.
-  if (!SuperInitDone) {
-    if (!shouldEmitError(Inst)) return;
-    diagnose(Module, Inst->getLoc(), diag::self_before_superselfinit,
-             (unsigned)TheMemory.isDelegatingInit());
-    return;
-  }
-
-  // If this is a call to a method in a class initializer, then it must be a use
-  // of self before the stored properties are set up.
-  if (isa<ApplyInst>(Inst) && TheMemory.isClassInitSelf()) {
-    if (!shouldEmitError(Inst)) return;
-    diagnose(Module, Inst->getLoc(), diag::use_of_self_before_fully_init);
-    noteUninitializedMembers(Use);
-    return;
-  }
-
-  // If this is a load of self in a struct/enum/protocol initializer, then it
-  // must be a use of 'self' before all the stored properties are set up.
-  if (isa<LoadInst>(Inst) && TheMemory.isAnyInitSelf() &&
-      !TheMemory.isClassInitSelf()) {
-    if (!shouldEmitError(Inst)) return;
-
-    auto diagID = diag::use_of_self_before_fully_init;
-    if (TheMemory.isProtocolInitSelf())
-      diagID = diag::use_of_self_before_fully_init_protocol;
-    diagnose(Module, Inst->getLoc(), diagID);
-    noteUninitializedMembers(Use);
-    return;
-  }
-  
-  // If this is a load into a promoted closure capture, diagnose properly as
-  // a capture.
-  if (isa<LoadInst>(Inst) && Inst->getLoc().isASTNode<AbstractClosureExpr>())
-    diagnoseInitError(Use, diag::variable_closure_use_uninit);
-  else
-    diagnoseInitError(Use, diag::variable_used_before_initialized);
+	// If this is a copy_addr into the 'self' argument, and the memory object is a
+	// rootself struct/enum or a non-delegating initializer, then we're looking at
+	// the implicit "return self" in an address-only initializer.  Emit a specific
+	// diagnostic.
+	if (auto *CA = dyn_cast<CopyAddrInst>(Inst)) {
+		if (CA->isInitializationOfDest() &&
+			!CA->getFunction()->getArguments().empty() &&
+			SILValue(CA->getFunction()->getArgument(0)) == CA->getDest()) {
+			if (TheMemory.isEnumInitSelf()) {
+				if (!shouldEmitError(Inst)) return;
+				diagnose(Module, Inst->getLoc(),
+						 diag::return_from_init_without_initing_self);
+				return;
+			}
+			
+			if (TheMemory.isProtocolInitSelf()) {
+				if (!shouldEmitError(Inst)) return;
+				diagnose(Module, Inst->getLoc(),
+						 diag::return_from_protocol_init_without_initing_self);
+				return;
+			}
+			
+			if (TheMemory.isAnyInitSelf() && !TheMemory.isClassInitSelf() &&
+				!TheMemory.isDelegatingInit()) {
+				if (!shouldEmitError(Inst)) return;
+				diagnose(Module, Inst->getLoc(),
+						 diag::return_from_init_without_initing_stored_properties);
+				noteUninitializedMembers(Use);
+				return;
+			}
+		}
+	}
+	
+	// Check to see if we're returning self in a class initializer before all the
+	// ivars/super.init are set up.
+	if (isa<ReturnInst>(Inst) && TheMemory.isAnyInitSelf()) {
+		if (!shouldEmitError(Inst)) return;
+		if (!SuperInitDone) {
+			diagnose(Module, Inst->getLoc(),
+					 diag::superselfinit_not_called_before_return,
+					 (unsigned)TheMemory.isDelegatingInit());
+		} else {
+			diagnose(Module, Inst->getLoc(),
+					 diag::return_from_init_without_initing_stored_properties);
+			noteUninitializedMembers(Use);
+		}
+		return;
+	}
+	
+	// Check to see if this is a use of self or super, due to a method call.  If
+	// so, emit a specific diagnostic.
+	if (diagnoseMethodCall(Use, SuperInitDone))
+		return;
+	
+	// Otherwise, we couldn't find a specific thing to complain about, so emit a
+	// generic error, depending on what kind of failure this is.
+	if (!SuperInitDone) {
+		if (!shouldEmitError(Inst)) return;
+		diagnose(Module, Inst->getLoc(), diag::self_before_superselfinit,
+				 (unsigned)TheMemory.isDelegatingInit());
+		return;
+	}
+	
+	// If this is a call to a method in a class initializer, then it must be a use
+	// of self before the stored properties are set up.
+	if (isa<ApplyInst>(Inst) && TheMemory.isClassInitSelf()) {
+		if (!shouldEmitError(Inst)) return;
+		diagnose(Module, Inst->getLoc(), diag::use_of_self_before_fully_init);
+		noteUninitializedMembers(Use);
+		return;
+	}
+	
+	// If this is a load of self in a struct/enum/protocol initializer, then it
+	// must be a use of 'self' before all the stored properties are set up.
+	if (isa<LoadInst>(Inst) && TheMemory.isAnyInitSelf() &&
+		!TheMemory.isClassInitSelf()) {
+		if (!shouldEmitError(Inst)) return;
+		
+		auto diagID = diag::use_of_self_before_fully_init;
+		if (TheMemory.isProtocolInitSelf())
+			diagID = diag::use_of_self_before_fully_init_protocol;
+		if (weDidNotDiagnoseAMoreSpecificPrematureLoadOfSelf(Inst))
+			diagnose(Module, Inst->getLoc(), diagID);
+		noteUninitializedMembers(Use);
+		return;
+	}
+	
+	// If this is a load into a promoted closure capture, diagnose properly as
+	// a capture.
+	if (isa<LoadInst>(Inst) && Inst->getLoc().isASTNode<AbstractClosureExpr>())
+		diagnoseInitError(Use, diag::variable_closure_use_uninit);
+	else
+		diagnoseInitError(Use, diag::variable_used_before_initialized);
 }
 
 /// handleSuperInitUse - When processing a 'self' argument on a class, this is
