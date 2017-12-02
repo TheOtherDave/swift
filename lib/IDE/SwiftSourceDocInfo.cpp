@@ -80,7 +80,7 @@ bool CursorInfoResolver::tryResolve(ValueDecl *D, TypeDecl *CtorTyRef,
     return false;
 
   if (Loc == LocToResolve) {
-    CursorInfo = { D, CtorTyRef, ExtTyRef, Loc, IsRef, Ty, ContainerType };
+    CursorInfo.setValueRef(D, CtorTyRef, ExtTyRef, IsRef, Ty, ContainerType);
     return true;
   }
   return false;
@@ -88,7 +88,7 @@ bool CursorInfoResolver::tryResolve(ValueDecl *D, TypeDecl *CtorTyRef,
 
 bool CursorInfoResolver::tryResolve(ModuleEntity Mod, SourceLoc Loc) {
   if (Loc == LocToResolve) {
-    CursorInfo = { Mod, Loc };
+    CursorInfo.setModuleRef(Mod);
     return true;
   }
   return false;
@@ -97,13 +97,13 @@ bool CursorInfoResolver::tryResolve(ModuleEntity Mod, SourceLoc Loc) {
 bool CursorInfoResolver::tryResolve(Stmt *St) {
   if (auto *LST = dyn_cast<LabeledStmt>(St)) {
     if (LST->getStartLoc() == LocToResolve) {
-      CursorInfo = { St };
+      CursorInfo.setTrailingStmt(St);
       return true;
     }
   }
   if (auto *CS = dyn_cast<CaseStmt>(St)) {
     if (CS->getStartLoc() == LocToResolve) {
-      CursorInfo = { St };
+      CursorInfo.setTrailingStmt(St);
       return true;
     }
   }
@@ -111,16 +111,17 @@ bool CursorInfoResolver::tryResolve(Stmt *St) {
 }
 
 bool CursorInfoResolver::visitSubscriptReference(ValueDecl *D, CharSourceRange Range,
-                                              bool IsOpenBracket) {
+                                                 Optional<AccessKind> AccKind,
+                                                 bool IsOpenBracket) {
   // We should treat both open and close brackets equally
   return visitDeclReference(D, Range, nullptr, nullptr, Type(),
-                    ReferenceMetaData(SemaReferenceKind::SubscriptRef, None));
+                    ReferenceMetaData(SemaReferenceKind::SubscriptRef, AccKind));
 }
 
 ResolvedCursorInfo CursorInfoResolver::resolve(SourceLoc Loc) {
   assert(Loc.isValid());
   LocToResolve = Loc;
-  CursorInfo = ResolvedCursorInfo();
+  CursorInfo.Loc = Loc;
   walk(SrcFile);
   return CursorInfo;
 }
@@ -188,9 +189,19 @@ bool CursorInfoResolver::walkToExprPre(Expr *E) {
         ContainerType = ME->getBase()->getType();
       }
     }
-
+    auto IsProperCursorLocation = E->getStartLoc() == LocToResolve;
+    // Handle cursor placement after `try` in ForceTry and OptionalTry Expr.
+    auto CheckLocation = [&IsProperCursorLocation, this](SourceLoc Loc) {
+      IsProperCursorLocation = Loc == LocToResolve || IsProperCursorLocation;
+    };
+    if (auto *FTE = dyn_cast<ForceTryExpr>(E)) {
+      CheckLocation(FTE->getExclaimLoc());
+    }
+    if (auto *OTE = dyn_cast<OptionalTryExpr>(E)) {
+      CheckLocation(OTE->getQuestionLoc());
+    }
     // Keep track of trailing expressions.
-    if (!E->isImplicit() && E->getStartLoc() == LocToResolve)
+    if (!E->isImplicit() && IsProperCursorLocation)
       TrailingExprStack.push_back(E);
   }
   return true;
@@ -201,7 +212,7 @@ bool CursorInfoResolver::walkToExprPost(Expr *E) {
     return false;
   if (!TrailingExprStack.empty() && TrailingExprStack.back() == E) {
     // We return the outtermost expression in the token info.
-    CursorInfo = { TrailingExprStack.front() };
+    CursorInfo.setTrailingExpr(TrailingExprStack.front());
     return false;
   }
   return true;
@@ -338,7 +349,7 @@ bool NameMatcher::walkToDeclPre(Decl *D) {
     tryResolve(ASTWalker::ParentTy(D), D->getLoc(), LabelRangeType::Param,
                LabelRanges);
   } else if (SubscriptDecl *SD = dyn_cast<SubscriptDecl>(D)) {
-    tryResolve(ASTWalker::ParentTy(D), D->getLoc(), LabelRangeType::Param,
+    tryResolve(ASTWalker::ParentTy(D), D->getLoc(), LabelRangeType::NoncollapsibleParam,
                getLabelRanges(SD->getIndices(), getSourceMgr()));
   } else if (EnumElementDecl *EED = dyn_cast<EnumElementDecl>(D)) {
     if (TupleTypeRepr *TTR = dyn_cast_or_null<TupleTypeRepr>(EED->getArgumentTypeLoc().getTypeRepr())) {
@@ -423,6 +434,25 @@ std::pair<bool, Expr*> NameMatcher::walkToExprPre(Expr *E) {
           tryResolve(ASTWalker::ParentTy(E), nextLoc());
         } while (!shouldSkip(E));
         break;
+      case ExprKind::Subscript: {
+        auto SubExpr = cast<SubscriptExpr>(E);
+        // visit and check in source order
+        if (!SubExpr->getBase()->walk(*this))
+          return {false, nullptr};
+
+        auto Labels = getCallArgLabelRanges(getSourceMgr(), SubExpr->getIndex(),
+                                            LabelRangeEndAt::BeforeElemStart);
+        tryResolve(ASTWalker::ParentTy(E), E->getLoc(), LabelRangeType::CallArg, Labels);
+        if (isDone())
+            break;
+        if (!SubExpr->getIndex()->walk(*this))
+          return {false, nullptr};
+
+        // We already visited the children.
+        if (!walkToExprPost(E))
+          return {false, nullptr};
+        return {false, E};
+      }
       case ExprKind::Tuple: {
         TupleExpr *T = cast<TupleExpr>(E);
         // Handle arg label locations (the index reports property occurrences
@@ -553,35 +583,21 @@ void NameMatcher::skipLocsBefore(SourceLoc Start) {
 }
 
 bool NameMatcher::shouldSkip(Expr *E) {
-  if (!isa<StringLiteralExpr>(E) || !Parent.getAsExpr() ||
-      !isa<InterpolatedStringLiteralExpr>(Parent.getAsExpr()))
-    return shouldSkip(E->getSourceRange());
+  if (isa<StringLiteralExpr>(E) && Parent.getAsExpr()) {
+    // Attempting to get the CharSourceRange from the SourceRange of a
+    // StringLiteralExpr that is a segment of an interpolated string gives
+    // incorrect ranges. Use the CharSourceRange of the corresponding token
+    // instead.
 
-  // The lexer treats interpolated strings as a single token when computing the
-  // CharSourceRange, so when we try to get the CharSourceRange of its first
-  // child StringLiteralExpr (at the same SourceLoc) it goes beyond any
-  // interpolated values. Use the StartLoc of the next sibling to bound it.
+    auto ExprStart = E->getStartLoc();
+    auto RemaingTokens = TokensToCheck.drop_while([&](const Token &tok) -> bool {
+      return getSourceMgr().isBeforeInBuffer(tok.getRange().getStart(), ExprStart);
+    });
 
-  StringLiteralExpr *SL = cast<StringLiteralExpr>(E);
-  InterpolatedStringLiteralExpr *ISL =
-    cast<InterpolatedStringLiteralExpr>(Parent.getAsExpr());
-
-  SourceLoc Start = SL->getStartLoc();
-  ArrayRef<Expr*> Segments = ISL->getSegments();
-  Segments = Segments.drop_until([&](Expr *Item){ return Item == SL; })
-    .drop_front();
-
-  CharSourceRange Range;
-  if (Segments.empty()) {
-    Range = Lexer::getCharSourceRangeFromSourceRange(getSourceMgr(),
-                                                     SourceRange(Start));
-  } else {
-    SourceLoc NextSiblingLoc = Segments.front()->getStartLoc();
-    unsigned Length = getSourceMgr().getByteDistance(Start, NextSiblingLoc);
-    Range = CharSourceRange(Start, Length);
+    if (!RemaingTokens.empty() && RemaingTokens.front().getLoc() == ExprStart)
+      return shouldSkip(RemaingTokens.front().getRange());
   }
-
-  return shouldSkip(Range);
+  return shouldSkip(E->getSourceRange());
 }
 
 bool NameMatcher::shouldSkip(SourceRange Range) {
@@ -688,6 +704,7 @@ void ResolvedRangeInfo::print(llvm::raw_ostream &OS) {
   switch (Kind) {
   case RangeKind::SingleExpression: OS << "SingleExpression"; break;
   case RangeKind::SingleDecl: OS << "SingleDecl"; break;
+  case RangeKind::MultiTypeMemberDecl: OS << "MultiTypeMemberDecl"; break;
   case RangeKind::MultiStatement: OS << "MultiStatement"; break;
   case RangeKind::PartOfExpression: OS << "PartOfExpression"; break;
   case RangeKind::SingleStatement: OS << "SingleStatement"; break;
@@ -773,8 +790,9 @@ calculateContentRange(ArrayRef<Token> Tokens) {
   auto StartLoc = StartTok.hasComment() ?
     StartTok.getCommentStart() : StartTok.getLoc();
   auto EndLoc = EndTok.getRange().getEnd();
-  return CharSourceRange(StartLoc, (char*)EndLoc.getOpaquePointerValue() -
-    (char*)StartLoc.getOpaquePointerValue());
+  auto Length = static_cast<const char *>(EndLoc.getOpaquePointerValue()) -
+                static_cast<const char *>(StartLoc.getOpaquePointerValue());
+  return CharSourceRange(StartLoc, Length);
 }
 
 bool DeclaredDecl::operator==(const DeclaredDecl& Other) {
@@ -813,7 +831,7 @@ static bool hasUnhandledError(ArrayRef<ASTNode> Nodes) {
 
   return Nodes.end() != std::find_if(Nodes.begin(), Nodes.end(), [](ASTNode N) {
     ThrowingEntityAnalyzer Analyzer;
-    N.walk(Analyzer);
+    Analyzer.walk(N);
     return Analyzer.isThrowing();
   });
 }
@@ -872,10 +890,21 @@ private:
       return llvm::any_of(StartMatches, IsCase) &&
           llvm::any_of(EndMatches, IsCase);
     }
+
+    bool isMultiTypeMemberDecl() {
+      if (StartMatches.empty() || EndMatches.empty())
+        return false;
+
+      // Multi-decls should have the same nominal type as a common parent
+      if (auto ParentDecl = Parent.dyn_cast<Decl *>())
+        return isa<NominalTypeDecl>(ParentDecl);
+
+      return false;
+    }
   };
 
 
-  std::vector<Token> TokensInRange;
+  ArrayRef<Token> TokensInRange;
   SourceLoc Start;
   SourceLoc End;
 
@@ -900,6 +929,7 @@ private:
     switch(Kind) {
     case RangeKind::Invalid:
     case RangeKind::SingleDecl:
+    case RangeKind::MultiTypeMemberDecl:
     case RangeKind::PartOfExpression:
       llvm_unreachable("cannot get type.");
 
@@ -1066,32 +1096,41 @@ public:
   createInstance(SourceFile &File, unsigned StartOff, unsigned Length) {
     SourceManager &SM = File.getASTContext().SourceMgr;
     unsigned BufferId = File.getBufferID().getValue();
-
-    LangOptions Opts = File.getASTContext().LangOpts;
-    Opts.AttachCommentsToDecls = true;
-    std::vector<Token> AllTokens = tokenize(Opts, SM, BufferId, 0, 0, false);
-    auto TokenComp = [&](Token &LHS, SourceLoc Loc) {
-      return SM.isBeforeInBuffer(LHS.getLoc(), Loc);
-    };
-
+    auto AllTokens = File.getAllTokens();
     SourceLoc StartRaw = SM.getLocForOffset(BufferId, StartOff);
     SourceLoc EndRaw = SM.getLocForOffset(BufferId, StartOff + Length);
 
     // This points to the first token after or on the start loc.
-    auto StartIt = std::lower_bound(AllTokens.begin(), AllTokens.end(), StartRaw,
-                                    TokenComp);
-    // This points to the first token after or on the end loc;
-    auto EndIt = std::lower_bound(AllTokens.begin(), AllTokens.end(), EndRaw,
-                                  TokenComp);
+    auto StartIt = token_lower_bound(AllTokens, StartRaw);
+
+    // Skip all the comments.
+    while(StartIt != AllTokens.end()) {
+      if (StartIt->getKind() != tok::comment)
+        break;
+      StartIt ++;
+    }
+
     // Erroneous case.
-    if (StartIt == AllTokens.end() || EndIt == AllTokens.begin())
+    if (StartIt == AllTokens.end())
       return nullptr;
 
-    // The start token is inclusive.
-    unsigned StartIdx = StartIt - AllTokens.begin();
+    // This points to the first token after or on the end loc;
+    auto EndIt = token_lower_bound(AllTokens, EndRaw);
 
+    // Adjust end token to skip comments.
+    while (EndIt != AllTokens.begin()) {
+      EndIt --;
+      if (EndIt->getKind() != tok::comment)
+        break;
+    }
+
+    // Erroneous case.
+    if (EndIt < StartIt)
+      return nullptr;
+
+    unsigned StartIdx = StartIt - AllTokens.begin();
     return std::unique_ptr<Implementation>(new Implementation(File,
-      llvm::makeArrayRef(AllTokens.data() + StartIdx, EndIt - StartIt)));
+      AllTokens.slice(StartIdx, EndIt - StartIt + 1)));
   }
 
   static std::unique_ptr<Implementation>
@@ -1161,7 +1200,7 @@ public:
   void postAnalysis(ASTNode EndNode) {
     // Visit the content of this node thoroughly, because the walker may
     // abort early.
-    EndNode.walk(CompleteWalker(this));
+    CompleteWalker(this).walk(EndNode);
 
     // Analyze whether declared decls in the range is referenced outside of it.
     FurtherReferenceWalker(this).walk(getImmediateContext());
@@ -1194,18 +1233,20 @@ public:
         // For each continue/break statement, record its target's range and the
         // orphan kind.
         if (auto *CS = dyn_cast<ContinueStmt>(S)) {
-          Ranges.emplace_back(CS->getTarget()->getSourceRange(),
-                              OrphanKind::Continue);
+          if (auto *Target = CS->getTarget()) {
+            Ranges.emplace_back(Target->getSourceRange(), OrphanKind::Continue);
+          }
         } else if (auto *BS = dyn_cast<BreakStmt>(S)) {
-          Ranges.emplace_back(BS->getTarget()->getSourceRange(),
-                              OrphanKind::Break);
+          if (auto *Target = BS->getTarget()) {
+            Ranges.emplace_back(Target->getSourceRange(), OrphanKind::Break);
+          }
         }
         return true;
       }
     };
     for (auto N : Nodes) {
       ControlFlowStmtSelector TheWalker;
-      N.walk(TheWalker);
+      TheWalker.walk(N);
       for (auto Pair : TheWalker.Ranges) {
 
         // If the entire range does not include the target's range, we find
@@ -1225,7 +1266,15 @@ public:
     Decl *D = Node.is<Decl*>() ? Node.get<Decl*>() : nullptr;
     analyzeDecl(D);
     auto &DCInfo = getCurrentDC();
-    switch (getRangeMatchKind(Node.getSourceRange())) {
+
+    auto NodeRange = Node.getSourceRange();
+
+    // Widen the node's source range to include all attributes to get a range
+    // match if a function with its attributes has been selected.
+    if (auto D = Node.dyn_cast<Decl *>())
+      NodeRange = D->getSourceRangeIncludingAttrs();
+
+    switch (getRangeMatchKind(NodeRange)) {
     case RangeMatchKind::NoneMatch: {
       // PatternBindingDecl is not visited; we need to explicitly analyze here.
       if (auto *VA = dyn_cast_or_null<VarDecl>(D))
@@ -1266,6 +1315,21 @@ public:
                 TokensInRange,
                 getImmediateContext(), nullptr,
                 hasSingleEntryPoint(ContainedASTNodes),
+                hasUnhandledError(ContainedASTNodes),
+                getOrphanKind(ContainedASTNodes),
+                llvm::makeArrayRef(ContainedASTNodes),
+                llvm::makeArrayRef(DeclaredDecls),
+                llvm::makeArrayRef(ReferencedDecls)};
+    }
+
+    if (DCInfo.isMultiTypeMemberDecl()) {
+      postAnalysis(DCInfo.EndMatches.back());
+      Result = {RangeKind::MultiTypeMemberDecl,
+                ReturnInfo(),
+                TokensInRange,
+                getImmediateContext(),
+                /*Common Parent Expr*/ nullptr,
+                /*SinleEntry*/ true,
                 hasUnhandledError(ContainedASTNodes),
                 getOrphanKind(ContainedASTNodes),
                 llvm::makeArrayRef(ContainedASTNodes),
@@ -1315,6 +1379,11 @@ public:
 
   void analyzeDeclRef(ValueDecl *VD, SourceLoc Start, Type Ty,
                       ReferenceMetaData Data) {
+    // Add defensive check in case the given type is null.
+    // FIXME: we should receive error type instead of null type.
+    if (Ty.isNull())
+      return;
+
     // Only collect decl ref.
     if (Data.Kind != SemaReferenceKind::DeclRef)
       return;

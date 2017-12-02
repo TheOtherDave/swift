@@ -26,6 +26,7 @@
 #include "JumpDest.h"
 #include "ManagedValue.h"
 #include "RValue.h"
+#include "swift/Basic/ProfileCounter.h"
 #include "swift/SIL/SILBuilder.h"
 
 namespace swift {
@@ -190,6 +191,9 @@ public:
                         bool objc, ArrayRef<SILType> elementTypes,
                         ArrayRef<ManagedValue> elementCountOperands);
 
+  using SILBuilder::createTuple;
+  ManagedValue createTuple(SILLocation loc, SILType type,
+                           ArrayRef<ManagedValue> elements);
   using SILBuilder::createTupleExtract;
   ManagedValue createTupleExtract(SILLocation loc, ManagedValue value,
                                   unsigned index, SILType type);
@@ -204,6 +208,14 @@ public:
   using SILBuilder::createLoadBorrow;
   ManagedValue createLoadBorrow(SILLocation loc, ManagedValue base);
   ManagedValue createFormalAccessLoadBorrow(SILLocation loc, ManagedValue base);
+
+  using SILBuilder::createStoreBorrow;
+  void createStoreBorrow(SILLocation loc, ManagedValue value, SILValue address);
+
+  /// Create a store_borrow if we have a non-trivial value and a store [trivial]
+  /// otherwise.
+  void createStoreBorrowOrTrivial(SILLocation loc, ManagedValue value,
+                                  SILValue address);
 
   /// Prepares a buffer to receive the result of an expression, either using the
   /// 'emit into' initialization buffer if available, or allocating a temporary
@@ -257,7 +269,9 @@ public:
   void createCheckedCastBranch(SILLocation loc, bool isExact,
                                ManagedValue operand, SILType type,
                                SILBasicBlock *trueBlock,
-                               SILBasicBlock *falseBlock);
+                               SILBasicBlock *falseBlock,
+                               ProfileCounter Target1Count,
+                               ProfileCounter Target2Count);
 
   using SILBuilder::createCheckedCastValueBranch;
   void createCheckedCastValueBranch(SILLocation loc, ManagedValue operand,
@@ -284,6 +298,14 @@ public:
   ManagedValue createOpenExistentialValue(SILLocation loc,
                                           ManagedValue original, SILType type);
 
+  using SILBuilder::createOpenExistentialBoxValue;
+  ManagedValue createOpenExistentialBoxValue(SILLocation loc,
+                                          ManagedValue original, SILType type);
+
+  /// Convert a @convention(block) value to AnyObject.
+  ManagedValue createBlockToAnyObject(SILLocation loc, ManagedValue block,
+                                      SILType type);
+
   using SILBuilder::createOptionalSome;
   ManagedValue createOptionalSome(SILLocation Loc, ManagedValue Arg);
   ManagedValue createManagedOptionalNone(SILLocation Loc, SILType Type);
@@ -299,8 +321,26 @@ public:
 
   using SILBuilder::createSuperMethod;
   ManagedValue createSuperMethod(SILLocation loc, ManagedValue operand,
-                                 SILDeclRef member, SILType methodTy,
-                                 bool isVolatile = false);
+                                 SILDeclRef member, SILType methodTy);
+
+  using SILBuilder::createObjCSuperMethod;
+  ManagedValue createObjCSuperMethod(SILLocation loc, ManagedValue operand,
+                                     SILDeclRef member, SILType methodTy);
+
+  using SILBuilder::createValueMetatype;
+  ManagedValue createValueMetatype(SILLocation loc, SILType metatype,
+                                   ManagedValue base);
+
+  using SILBuilder::createBridgeObjectToRef;
+  ManagedValue createBridgeObjectToRef(SILLocation loc, ManagedValue mv,
+                                       SILType destType);
+
+  using SILBuilder::createBranch;
+  BranchInst *createBranch(SILLocation Loc, SILBasicBlock *TargetBlock,
+                           ArrayRef<ManagedValue> Args);
+
+  using SILBuilder::createReturn;
+  ReturnInst *createReturn(SILLocation Loc, ManagedValue ReturnValue);
 };
 
 class SwitchCaseFullExpr;
@@ -326,11 +366,13 @@ private:
     SILBasicBlock *block;
     NullablePtr<SILBasicBlock> contBlock;
     NormalCaseHandler handler;
+    ProfileCounter count;
 
     NormalCaseData(EnumElementDecl *decl, SILBasicBlock *block,
                    NullablePtr<SILBasicBlock> contBlock,
-                   NormalCaseHandler handler)
-        : decl(decl), block(block), contBlock(contBlock), handler(handler) {}
+                   NormalCaseHandler handler, ProfileCounter count)
+        : decl(decl), block(block), contBlock(contBlock), handler(handler),
+          count(count) {}
     ~NormalCaseData() = default;
   };
 
@@ -339,12 +381,13 @@ private:
     NullablePtr<SILBasicBlock> contBlock;
     DefaultCaseHandler handler;
     DefaultDispatchTime dispatchTime;
+    ProfileCounter count;
 
     DefaultCaseData(SILBasicBlock *block, NullablePtr<SILBasicBlock> contBlock,
                     DefaultCaseHandler handler,
-                    DefaultDispatchTime dispatchTime)
+                    DefaultDispatchTime dispatchTime, ProfileCounter count)
         : block(block), contBlock(contBlock), handler(handler),
-          dispatchTime(dispatchTime) {}
+          dispatchTime(dispatchTime), count(count) {}
     ~DefaultCaseData() = default;
   };
 
@@ -359,17 +402,19 @@ public:
                     ManagedValue optional)
       : builder(builder), loc(loc), optional(optional) {}
 
-  void addDefaultCase(SILBasicBlock *defaultBlock,
-                      NullablePtr<SILBasicBlock> contBlock,
-                      DefaultCaseHandler handle,
-                      DefaultDispatchTime dispatchTime =
-                          DefaultDispatchTime::AfterNormalCases) {
-    defaultBlockData.emplace(defaultBlock, contBlock, handle, dispatchTime);
+  void addDefaultCase(
+      SILBasicBlock *defaultBlock, NullablePtr<SILBasicBlock> contBlock,
+      DefaultCaseHandler handle,
+      DefaultDispatchTime dispatchTime = DefaultDispatchTime::AfterNormalCases,
+      ProfileCounter count = ProfileCounter()) {
+    defaultBlockData.emplace(defaultBlock, contBlock, handle, dispatchTime,
+                             count);
   }
 
   void addCase(EnumElementDecl *decl, SILBasicBlock *caseBlock,
-               NullablePtr<SILBasicBlock> contBlock, NormalCaseHandler handle) {
-    caseDataArray.emplace_back(decl, caseBlock, contBlock, handle);
+               NullablePtr<SILBasicBlock> contBlock, NormalCaseHandler handle,
+               ProfileCounter count = ProfileCounter()) {
+    caseDataArray.emplace_back(decl, caseBlock, contBlock, handle, count);
   }
 
   void emit() &&;

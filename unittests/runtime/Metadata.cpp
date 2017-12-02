@@ -165,13 +165,14 @@ uint32_t Global2 = 0;
 uint32_t Global3 = 0;
 
 /// The general structure of a generic metadata.
-template <typename Instance>
+template <typename Instance, unsigned NumArguments>
 struct GenericMetadataTest {
   GenericMetadata Header;
   Instance Template;
+  void *Storage[NumArguments];
 };
 
-GenericMetadataTest<StructMetadata> MetadataTest1 = {
+GenericMetadataTest<StructMetadata, 1> MetadataTest1 = {
   // Header
   {
     // allocation function
@@ -191,9 +192,11 @@ GenericMetadataTest<StructMetadata> MetadataTest1 = {
   // Fields
   {
     MetadataKind::Struct,
-    reinterpret_cast<const NominalTypeDescriptor*>(&Global1),
-    nullptr
-  }
+    reinterpret_cast<const NominalTypeDescriptor*>(&Global1)
+  },
+
+  // Arguments
+  {nullptr}
 };
 
 struct TestObjContainer {
@@ -297,8 +300,8 @@ TEST(MetadataTest, getGenericMetadata) {
       auto fields = reinterpret_cast<void * const *>(inst);
 
       EXPECT_EQ(MetadataKind::Struct, inst->getKind());
-      EXPECT_EQ((const NominalTypeDescriptor*)&Global1,
-                inst->Description.get());
+      EXPECT_EQ(reinterpret_cast<const NominalTypeDescriptor *>(&Global1),
+                inst->Description);
 
       EXPECT_EQ(&Global2, fields[2]);
 
@@ -315,8 +318,8 @@ TEST(MetadataTest, getGenericMetadata) {
 
       auto fields = reinterpret_cast<void * const *>(inst);
       EXPECT_EQ(MetadataKind::Struct, inst->getKind());
-      EXPECT_EQ((const NominalTypeDescriptor*)&Global1,
-                inst->Description.get());
+      EXPECT_EQ(reinterpret_cast<const NominalTypeDescriptor *>(&Global1),
+                inst->Description);
 
       EXPECT_EQ(&Global3, fields[2]);
 
@@ -935,17 +938,27 @@ static void initializeRelativePointer(int32_t *ptr, T value) {
 // Tests for resilient witness table instantiation, with runtime-provided
 // default requirements
 
+struct WitnessTableSlice {
+  WitnessTable **tables;
+  size_t count;
+};
+
 static void witnessTableInstantiator(WitnessTable *instantiatedTable,
                                      const Metadata *type,
                                      void * const *instantiationArgs) {
   EXPECT_EQ(type, nullptr);
-  EXPECT_EQ(instantiationArgs, nullptr);
 
   EXPECT_EQ(((void **) instantiatedTable)[0], (void*) 123);
   EXPECT_EQ(((void **) instantiatedTable)[1], (void*) 234);
 
   // The last witness is computed dynamically at instantiation time.
   ((void **) instantiatedTable)[2] = (void *) 345;
+
+  auto conditionalTables = (WitnessTableSlice *)instantiationArgs;
+
+  EXPECT_EQ(conditionalTables->count, 1UL);
+  EXPECT_EQ(conditionalTables->tables[0], (void *)678);
+  ((void **)instantiatedTable)[-1] = conditionalTables->tables[0];
 }
 
 static void fakeDefaultWitness1() {}
@@ -973,17 +986,17 @@ struct TestProtocol {
 
     using Flags = ProtocolRequirementFlags;
 
-    requirements[0].Flags = Flags(Flags::Kind::InstanceMethod);
+    requirements[0].Flags = Flags(Flags::Kind::Method);
     requirements[0].DefaultImplementation = nullptr;
-    requirements[1].Flags = Flags(Flags::Kind::InstanceMethod);
+    requirements[1].Flags = Flags(Flags::Kind::Method);
     requirements[1].DefaultImplementation = nullptr;
-    requirements[2].Flags = Flags(Flags::Kind::InstanceMethod);
+    requirements[2].Flags = Flags(Flags::Kind::Method);
     requirements[2].DefaultImplementation = nullptr;
-    requirements[3].Flags = Flags(Flags::Kind::InstanceMethod);
+    requirements[3].Flags = Flags(Flags::Kind::Method);
     initializeRelativePointer(
       (int32_t *) &requirements[3].DefaultImplementation,
       fakeDefaultWitness1);
-    requirements[4].Flags = Flags(Flags::Kind::InstanceMethod);
+    requirements[4].Flags = Flags(Flags::Kind::Method);
     initializeRelativePointer(
       (int32_t *) &requirements[4].DefaultImplementation,
       fakeDefaultWitness2);
@@ -1009,6 +1022,9 @@ const void *witnesses[] = {
   (void *) 456,
   (void *) 567
 };
+
+WitnessTable *conditionalTablesBuffer[] = {(WitnessTable *)678};
+WitnessTableSlice conditionalTablesSlice = {conditionalTablesBuffer, 1};
 
 TEST(WitnessTableTest, getGenericWitnessTable) {
   EXPECT_EQ(sizeof(GenericWitnessTableStorage), sizeof(GenericWitnessTable));
@@ -1045,7 +1061,7 @@ TEST(WitnessTableTest, getGenericWitnessTable) {
   // and an initializer, so we must instantiate.
   {
     tableStorage2.WitnessTableSizeInWords = 5;
-    tableStorage2.WitnessTablePrivateSizeInWords = 1;
+    tableStorage2.WitnessTablePrivateSizeInWords = 1 + 1;
     initializeRelativePointer(&tableStorage2.Protocol, &testProtocol.descriptor);
     initializeRelativePointer(&tableStorage2.Pattern, witnesses);
     initializeRelativePointer(&tableStorage2.Instantiator,
@@ -1057,12 +1073,13 @@ TEST(WitnessTableTest, getGenericWitnessTable) {
 
     RaceTest_ExpectEqual<const WitnessTable *>(
       [&]() -> const WitnessTable * {
-        const WitnessTable *instantiatedTable =
-            swift_getGenericWitnessTable(table, nullptr, nullptr);
+        const WitnessTable *instantiatedTable = swift_getGenericWitnessTable(
+            table, nullptr, (void**)&conditionalTablesSlice);
 
         EXPECT_NE(instantiatedTable, table->Pattern.get());
 
-        EXPECT_EQ(((void **) instantiatedTable)[-1], (void *) 0);
+        EXPECT_EQ(((void **) instantiatedTable)[-2], (void *) 0);
+        EXPECT_EQ(((void **) instantiatedTable)[-1], (void *) 678);
 
         EXPECT_EQ(((void **) instantiatedTable)[0], (void *) 123);
         EXPECT_EQ(((void **) instantiatedTable)[1], (void *) 234);
@@ -1077,7 +1094,7 @@ TEST(WitnessTableTest, getGenericWitnessTable) {
   // Conformance needs one default requirement to be filled in
   {
     tableStorage3.WitnessTableSizeInWords = 4;
-    tableStorage3.WitnessTablePrivateSizeInWords = 1;
+    tableStorage3.WitnessTablePrivateSizeInWords = 1 + 1;
     initializeRelativePointer(&tableStorage3.Protocol, &testProtocol.descriptor);
     initializeRelativePointer(&tableStorage3.Pattern, witnesses);
     initializeRelativePointer(&tableStorage3.Instantiator, witnessTableInstantiator);
@@ -1088,12 +1105,13 @@ TEST(WitnessTableTest, getGenericWitnessTable) {
 
     RaceTest_ExpectEqual<const WitnessTable *>(
       [&]() -> const WitnessTable * {
-        const WitnessTable *instantiatedTable =
-            swift_getGenericWitnessTable(table, nullptr, nullptr);
+        const WitnessTable *instantiatedTable = swift_getGenericWitnessTable(
+            table, nullptr, (void**)&conditionalTablesSlice);
 
         EXPECT_NE(instantiatedTable, table->Pattern.get());
 
-        EXPECT_EQ(((void **) instantiatedTable)[-1], (void *) 0);
+        EXPECT_EQ(((void **) instantiatedTable)[-2], (void *) 0);
+        EXPECT_EQ(((void **) instantiatedTable)[-1], (void *) 678);
 
         EXPECT_EQ(((void **) instantiatedTable)[0], (void *) 123);
         EXPECT_EQ(((void **) instantiatedTable)[1], (void *) 234);
@@ -1109,7 +1127,7 @@ TEST(WitnessTableTest, getGenericWitnessTable) {
   // to be filled in
   {
     tableStorage4.WitnessTableSizeInWords = 3;
-    tableStorage4.WitnessTablePrivateSizeInWords = 1;
+    tableStorage4.WitnessTablePrivateSizeInWords = 1 + 1;
     initializeRelativePointer(&tableStorage4.Protocol, &testProtocol.descriptor);
     initializeRelativePointer(&tableStorage4.Pattern, witnesses);
     initializeRelativePointer(&tableStorage4.Instantiator, witnessTableInstantiator);
@@ -1120,12 +1138,13 @@ TEST(WitnessTableTest, getGenericWitnessTable) {
 
     RaceTest_ExpectEqual<const WitnessTable *>(
       [&]() -> const WitnessTable * {
-        const WitnessTable *instantiatedTable =
-            swift_getGenericWitnessTable(table, nullptr, nullptr);
+        const WitnessTable *instantiatedTable = swift_getGenericWitnessTable(
+            table, nullptr, (void**)&conditionalTablesSlice);
 
         EXPECT_NE(instantiatedTable, table->Pattern.get());
 
-        EXPECT_EQ(((void **) instantiatedTable)[-1], (void *) 0);
+        EXPECT_EQ(((void **) instantiatedTable)[-2], (void *) 0);
+        EXPECT_EQ(((void **) instantiatedTable)[-1], (void *) 678);
 
         EXPECT_EQ(((void **) instantiatedTable)[0], (void *) 123);
         EXPECT_EQ(((void **) instantiatedTable)[1], (void *) 234);

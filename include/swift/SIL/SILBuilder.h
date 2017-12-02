@@ -13,6 +13,7 @@
 #ifndef SWIFT_SIL_SILBUILDER_H
 #define SWIFT_SIL_SILBUILDER_H
 
+#include "swift/Basic/ProfileCounter.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILFunction.h"
@@ -35,6 +36,10 @@ class SILBuilder {
 
   SILFunction *F;
   SILModule &Mod;
+
+  /// Allow the SIL module conventions to be overriden within the builder.
+  /// This supports passes that lower SIL to a new stage.
+  SILModuleConventions silConv = SILModuleConventions(Mod);
 
   /// If this is non-null, the instruction is inserted in the specified
   /// basic block, at the specified InsertPt.  If null, created instructions
@@ -101,6 +106,13 @@ public:
       : F(BB->getParent()), Mod(BB->getParent()->getModule()),
         InsertedInstrs(InsertedInstrs) {
     setInsertionPoint(BB, InsertPt);
+  }
+
+  // Allow a pass to override the current SIL module conventions. This should
+  // only be done by a pass responsible for lowering SIL to a new stage
+  // (e.g. AddressLowering).
+  void setSILConventions(SILModuleConventions silConv) {
+    this->silConv = silConv;
   }
 
   SILFunction &getFunction() const {
@@ -333,10 +345,9 @@ public:
   ApplyInst *createApply(
       SILLocation Loc, SILValue Fn, SubstitutionList Subs,
       ArrayRef<SILValue> Args, bool isNonThrowing,
-      const GenericSpecializationInformation *SpecializationInfo = nullptr,
-      Optional<SILModuleConventions> ModuleConventions = None) {
+      const GenericSpecializationInformation *SpecializationInfo = nullptr) {
     return insert(ApplyInst::create(getSILDebugLocation(Loc), Fn, Subs, Args,
-                                    isNonThrowing, ModuleConventions, *F,
+                                    isNonThrowing, silConv, *F,
                                     OpenedArchetypes, SpecializationInfo));
   }
 
@@ -368,6 +379,25 @@ public:
                                            Args, Subs, CalleeConvention, *F,
                                            OpenedArchetypes,
                                            SpecializationInfo));
+  }
+
+  BeginApplyInst *createBeginApply(
+      SILLocation Loc, SILValue Fn, SubstitutionList Subs,
+      ArrayRef<SILValue> Args, bool isNonThrowing,
+      const GenericSpecializationInformation *SpecializationInfo = nullptr) {
+    return insert(BeginApplyInst::create(getSILDebugLocation(Loc), Fn, Subs,
+                                         Args, isNonThrowing, silConv, *F,
+                                         OpenedArchetypes, SpecializationInfo));
+  }
+
+  AbortApplyInst *createAbortApply(SILLocation loc, SILValue beginApply) {
+    return insert(new (getModule()) AbortApplyInst(getSILDebugLocation(loc),
+                                                   beginApply));
+  }
+
+  EndApplyInst *createEndApply(SILLocation loc, SILValue beginApply) {
+    return insert(new (getModule()) EndApplyInst(getSILDebugLocation(loc),
+                                                 beginApply));
   }
 
   BuiltinInst *createBuiltin(SILLocation Loc, Identifier Name, SILType ResultTy,
@@ -500,8 +530,23 @@ public:
         getSILDebugLocation(Loc), text.toStringRef(Out), encoding, getModule()));
   }
 
+  /// If \p LV is non-trivial, return a \p Qualifier load of \p LV. If \p LV is
+  /// trivial, use trivial instead.
+  ///
+  /// *NOTE* The SupportUnqualifiedSIL is an option to ease the bring up of
+  /// Semantic SIL. It enables a pass that must be able to run on both Semantic
+  /// SIL and non-Semantic SIL. It has a default argument of false, so if this
+  /// is not necessary for your pass, just ignore the parameter.
   LoadInst *createTrivialLoadOr(SILLocation Loc, SILValue LV,
-                                LoadOwnershipQualifier Qualifier) {
+                                LoadOwnershipQualifier Qualifier,
+                                bool SupportUnqualifiedSIL = false) {
+    if (SupportUnqualifiedSIL && getFunction().hasUnqualifiedOwnership()) {
+      assert(
+          Qualifier != LoadOwnershipQualifier::Copy &&
+          "In unqualified SIL, a copy must be done separately form the load");
+      return createLoad(Loc, LV, LoadOwnershipQualifier::Unqualified);
+    }
+
     if (LV->getType().isTrivial(getModule())) {
       return createLoad(Loc, LV, LoadOwnershipQualifier::Trivial);
     }
@@ -525,9 +570,11 @@ public:
   KeyPathInst *createKeyPath(SILLocation Loc,
                              KeyPathPattern *Pattern,
                              SubstitutionList Subs,
+                             ArrayRef<SILValue> Args,
                              SILType Ty) {
     return insert(KeyPathInst::create(getSILDebugLocation(Loc),
-                                      Pattern, Subs, Ty, getFunction()));
+                                      Pattern, Subs, Args,
+                                      Ty, getFunction()));
   }
 
   /// Convenience function for calling emitLoad on the type lowering for
@@ -554,9 +601,22 @@ public:
 
   /// Utility function that returns a trivial store if the stored type is
   /// trivial and a \p Qualifier store if the stored type is non-trivial.
+  ///
+  /// *NOTE* The SupportUnqualifiedSIL is an option to ease the bring up of
+  /// Semantic SIL. It enables a pass that must be able to run on both Semantic
+  /// SIL and non-Semantic SIL. It has a default argument of false, so if this
+  /// is not necessary for your pass, just ignore the parameter.
   StoreInst *createTrivialStoreOr(SILLocation Loc, SILValue Src,
                                   SILValue DestAddr,
-                                  StoreOwnershipQualifier Qualifier) {
+                                  StoreOwnershipQualifier Qualifier,
+                                  bool SupportUnqualifiedSIL = false) {
+    if (SupportUnqualifiedSIL && getFunction().hasUnqualifiedOwnership()) {
+      assert(
+          Qualifier != StoreOwnershipQualifier::Assign &&
+          "In unqualified SIL, assigns must be represented via 2 instructions");
+      return createStore(Loc, Src, DestAddr,
+                         StoreOwnershipQualifier::Unqualified);
+    }
     if (Src->getType().isTrivial(getModule())) {
       return createStore(Loc, Src, DestAddr, StoreOwnershipQualifier::Trivial);
     }
@@ -876,12 +936,6 @@ public:
                       RefToUnmanagedInst(getSILDebugLocation(Loc), op, ty));
   }
 
-  IsNonnullInst *createIsNonnull(SILLocation Loc, SILValue operand) {
-    return insert(new (getModule()) IsNonnullInst(
-        getSILDebugLocation(Loc), operand,
-        SILType::getBuiltinIntegerType(1, getASTContext())));
-  }
-
   UnconditionalCheckedCastInst *
   createUnconditionalCheckedCast(SILLocation Loc, SILValue op, SILType destTy) {
     return insert(UnconditionalCheckedCastInst::create(
@@ -1072,27 +1126,33 @@ public:
         getSILDebugLocation(Loc), Operand, Element));
   }
 
-  SelectEnumInst *createSelectEnum(
-      SILLocation Loc, SILValue Operand, SILType Ty, SILValue DefaultValue,
-      ArrayRef<std::pair<EnumElementDecl *, SILValue>> CaseValues) {
-    return insert(SelectEnumInst::create(getSILDebugLocation(Loc), Operand,
-                                 Ty, DefaultValue, CaseValues, getFunction()));
+  SelectEnumInst *
+  createSelectEnum(SILLocation Loc, SILValue Operand, SILType Ty,
+                   SILValue DefaultValue,
+                   ArrayRef<std::pair<EnumElementDecl *, SILValue>> CaseValues,
+                   Optional<ArrayRef<ProfileCounter>> CaseCounts = None,
+                   ProfileCounter DefaultCount = ProfileCounter()) {
+    return insert(SelectEnumInst::create(
+        getSILDebugLocation(Loc), Operand, Ty, DefaultValue, CaseValues,
+        getFunction(), CaseCounts, DefaultCount));
   }
 
   SelectEnumAddrInst *createSelectEnumAddr(
       SILLocation Loc, SILValue Operand, SILType Ty, SILValue DefaultValue,
-      ArrayRef<std::pair<EnumElementDecl *, SILValue>> CaseValues) {
+      ArrayRef<std::pair<EnumElementDecl *, SILValue>> CaseValues,
+      Optional<ArrayRef<ProfileCounter>> CaseCounts = None,
+      ProfileCounter DefaultCount = ProfileCounter()) {
     return insert(SelectEnumAddrInst::create(
         getSILDebugLocation(Loc), Operand, Ty, DefaultValue, CaseValues,
-                                             getFunction()));
+        getFunction(), CaseCounts, DefaultCount));
   }
 
   SelectValueInst *createSelectValue(
       SILLocation Loc, SILValue Operand, SILType Ty, SILValue DefaultResult,
       ArrayRef<std::pair<SILValue, SILValue>> CaseValuesAndResults) {
-    return insert(SelectValueInst::create(getSILDebugLocation(Loc), Operand,
-                                          Ty, DefaultResult,
-                                          CaseValuesAndResults, getFunction()));
+    return insert(SelectValueInst::create(getSILDebugLocation(Loc), Operand, Ty,
+                                          DefaultResult, CaseValuesAndResults,
+                                          getFunction()));
   }
 
   TupleExtractInst *createTupleExtract(SILLocation Loc, SILValue Operand,
@@ -1165,50 +1225,66 @@ public:
                                                       Ref, ResultTy));
   }
 
+  DestructureStructInst *createDestructureStruct(SILLocation Loc,
+                                                 SILValue Operand) {
+    return insert(DestructureStructInst::create(
+        getModule(), getSILDebugLocation(Loc), Operand));
+  }
+
+  DestructureTupleInst *createDestructureTuple(SILLocation Loc,
+                                               SILValue Operand) {
+    return insert(DestructureTupleInst::create(
+        getModule(), getSILDebugLocation(Loc), Operand));
+  }
+
+  MultipleValueInstruction *emitDestructureValueOperation(SILLocation Loc,
+                                                          SILValue Operand) {
+    SILType OpTy = Operand->getType();
+    if (OpTy.is<TupleType>())
+      return createDestructureTuple(Loc, Operand);
+    if (OpTy.getStructOrBoundGenericStruct())
+      return createDestructureStruct(Loc, Operand);
+    llvm_unreachable("Can not emit a destructure for this type of operand.");
+  }
+
+  void
+  emitShallowDestructureValueOperation(SILLocation Loc, SILValue Operand,
+                                       llvm::SmallVectorImpl<SILValue> &Result);
+
+  void emitShallowDestructureAddressOperation(
+      SILLocation Loc, SILValue Operand,
+      llvm::SmallVectorImpl<SILValue> &Result);
+
   ClassMethodInst *createClassMethod(SILLocation Loc, SILValue Operand,
-                                     SILDeclRef Member, SILType MethodTy,
-                                     bool Volatile = false) {
+                                     SILDeclRef Member, SILType MethodTy) {
     return insert(new (getModule()) ClassMethodInst(
-        getSILDebugLocation(Loc), Operand, Member, MethodTy, Volatile));
+        getSILDebugLocation(Loc), Operand, Member, MethodTy));
   }
-
-  ClassMethodInst *createClassMethod(SILLocation Loc, SILValue Operand,
-                                     SILDeclRef Member, bool Volatile = false) {
-    auto MethodTy = getModule().Types.getConstantOverrideType(Member);
-    return createClassMethod(Loc, Operand, Member,
-                             SILType::getPrimitiveObjectType(MethodTy),
-                             Volatile);
-  }
-
-  /// Emit a class_method reference to the least derived overridden decl for
-  /// the given method, and upcast the "self" pointer to the matching superclass
-  /// type.
-  std::pair<ClassMethodInst *, SILValue> emitClassMethod(SILLocation Loc,
-                                                         SILValue Self,
-                                                         SILDeclRef Member,
-                                                         bool Volatile = false);
 
   SuperMethodInst *createSuperMethod(SILLocation Loc, SILValue Operand,
-                                     SILDeclRef Member, SILType MethodTy,
-                                     bool Volatile = false) {
+                                     SILDeclRef Member, SILType MethodTy) {
     return insert(new (getModule()) SuperMethodInst(
-        getSILDebugLocation(Loc), Operand, Member, MethodTy, Volatile));
+        getSILDebugLocation(Loc), Operand, Member, MethodTy));
+  }
+
+  ObjCMethodInst *createObjCMethod(SILLocation Loc, SILValue Operand,
+                                   SILDeclRef Member, SILType MethodTy) {
+    return insert(ObjCMethodInst::create(
+        getSILDebugLocation(Loc), Operand, Member, MethodTy,
+        &getFunction(), OpenedArchetypes));
+  }
+
+  ObjCSuperMethodInst *createObjCSuperMethod(SILLocation Loc, SILValue Operand,
+                                             SILDeclRef Member, SILType MethodTy) {
+    return insert(new (getModule()) ObjCSuperMethodInst(
+        getSILDebugLocation(Loc), Operand, Member, MethodTy));
   }
 
   WitnessMethodInst *createWitnessMethod(SILLocation Loc, CanType LookupTy,
                                          ProtocolConformanceRef Conformance,
-                                         SILDeclRef Member, SILType MethodTy,
-                                         bool Volatile = false) {
+                                         SILDeclRef Member, SILType MethodTy) {
     return insert(WitnessMethodInst::create(
         getSILDebugLocation(Loc), LookupTy, Conformance, Member, MethodTy,
-        &getFunction(), OpenedArchetypes, Volatile));
-  }
-
-  DynamicMethodInst *createDynamicMethod(SILLocation Loc, SILValue Operand,
-                                         SILDeclRef Member, SILType MethodTy,
-                                         bool Volatile = false) {
-    return insert(DynamicMethodInst::create(
-        getSILDebugLocation(Loc), Operand, Member, MethodTy, Volatile,
         &getFunction(), OpenedArchetypes));
   }
 
@@ -1513,12 +1589,12 @@ public:
   // Create an UncheckedRefCast if the source and dest types are legal,
   // otherwise return null.
   // Unwrap or wrap optional types as needed.
-  SILInstruction *tryCreateUncheckedRefCast(SILLocation Loc, SILValue Op,
-                                            SILType ResultTy);
+  SingleValueInstruction *tryCreateUncheckedRefCast(SILLocation Loc, SILValue Op,
+                                                    SILType ResultTy);
 
   // Create the appropriate cast instruction based on result type.
-  SILInstruction *createUncheckedBitCast(SILLocation Loc, SILValue Op,
-                                         SILType Ty);
+  SingleValueInstruction *createUncheckedBitCast(SILLocation Loc, SILValue Op,
+                                                 SILType Ty);
 
   //===--------------------------------------------------------------------===//
   // Runtime failure
@@ -1577,28 +1653,45 @@ public:
         new (getModule()) ThrowInst(getSILDebugLocation(Loc), errorValue));
   }
 
-  CondBranchInst *createCondBranch(SILLocation Loc, SILValue Cond,
-                                   SILBasicBlock *Target1,
-                                   SILBasicBlock *Target2) {
-    return insertTerminator(CondBranchInst::create(getSILDebugLocation(Loc),
-                                       Cond, Target1, Target2, getFunction()));
+  UnwindInst *createUnwind(SILLocation loc) {
+    return insertTerminator(
+        new (getModule()) UnwindInst(getSILDebugLocation(loc)));
   }
 
-  CondBranchInst *createCondBranch(SILLocation Loc, SILValue Cond,
-                                   SILBasicBlock *Target1,
-                                   ArrayRef<SILValue> Args1,
-                                   SILBasicBlock *Target2,
-                                   ArrayRef<SILValue> Args2) {
-    return insertTerminator(CondBranchInst::create(
-        getSILDebugLocation(Loc), Cond, Target1, Args1, Target2, Args2,
-                            getFunction()));
+  YieldInst *createYield(SILLocation loc, ArrayRef<SILValue> yieldedValues,
+                         SILBasicBlock *resumeBB, SILBasicBlock *unwindBB) {
+    return insertTerminator(
+        YieldInst::create(getSILDebugLocation(loc), yieldedValues,
+                          resumeBB, unwindBB, getFunction()));
   }
 
-  CondBranchInst *createCondBranch(SILLocation Loc, SILValue Cond,
-                                   SILBasicBlock *Target1,
-                                   OperandValueArrayRef Args1,
-                                   SILBasicBlock *Target2,
-                                   OperandValueArrayRef Args2) {
+  CondBranchInst *
+  createCondBranch(SILLocation Loc, SILValue Cond, SILBasicBlock *Target1,
+                   SILBasicBlock *Target2,
+                   ProfileCounter Target1Count = ProfileCounter(),
+                   ProfileCounter Target2Count = ProfileCounter()) {
+    return insertTerminator(
+        CondBranchInst::create(getSILDebugLocation(Loc), Cond, Target1, Target2,
+                               Target1Count, Target2Count, getFunction()));
+  }
+
+  CondBranchInst *
+  createCondBranch(SILLocation Loc, SILValue Cond, SILBasicBlock *Target1,
+                   ArrayRef<SILValue> Args1, SILBasicBlock *Target2,
+                   ArrayRef<SILValue> Args2,
+                   ProfileCounter Target1Count = ProfileCounter(),
+                   ProfileCounter Target2Count = ProfileCounter()) {
+    return insertTerminator(
+        CondBranchInst::create(getSILDebugLocation(Loc), Cond, Target1, Args1,
+                               Target2, Args2, Target1Count, Target2Count, getFunction()));
+  }
+
+  CondBranchInst *
+  createCondBranch(SILLocation Loc, SILValue Cond, SILBasicBlock *Target1,
+                   OperandValueArrayRef Args1, SILBasicBlock *Target2,
+                   OperandValueArrayRef Args2,
+                   ProfileCounter Target1Count = ProfileCounter(),
+                   ProfileCounter Target2Count = ProfileCounter()) {
     SmallVector<SILValue, 6> ArgsCopy1;
     SmallVector<SILValue, 6> ArgsCopy2;
 
@@ -1610,10 +1703,9 @@ public:
     for (auto I = Args2.begin(), E = Args2.end(); I != E; ++I)
       ArgsCopy2.push_back(*I);
 
-    return insertTerminator(CondBranchInst::create(getSILDebugLocation(Loc),
-                                                   Cond, Target1, ArgsCopy1,
-                                                   Target2, ArgsCopy2,
-                                                   getFunction()));
+    return insertTerminator(CondBranchInst::create(
+        getSILDebugLocation(Loc), Cond, Target1, ArgsCopy1, Target2, ArgsCopy2,
+        Target1Count, Target2Count, getFunction()));
   }
 
   BranchInst *createBranch(SILLocation Loc, SILBasicBlock *TargetBlock) {
@@ -1640,16 +1732,22 @@ public:
 
   SwitchEnumInst *createSwitchEnum(
       SILLocation Loc, SILValue Operand, SILBasicBlock *DefaultBB,
-      ArrayRef<std::pair<EnumElementDecl *, SILBasicBlock *>> CaseBBs) {
+      ArrayRef<std::pair<EnumElementDecl *, SILBasicBlock *>> CaseBBs,
+      Optional<ArrayRef<ProfileCounter>> CaseCounts = None,
+      ProfileCounter DefaultCount = ProfileCounter()) {
     return insertTerminator(SwitchEnumInst::create(
-        getSILDebugLocation(Loc), Operand, DefaultBB, CaseBBs, getFunction()));
+        getSILDebugLocation(Loc), Operand, DefaultBB, CaseBBs, getFunction(),
+        CaseCounts, DefaultCount));
   }
 
   SwitchEnumAddrInst *createSwitchEnumAddr(
       SILLocation Loc, SILValue Operand, SILBasicBlock *DefaultBB,
-      ArrayRef<std::pair<EnumElementDecl *, SILBasicBlock *>> CaseBBs) {
+      ArrayRef<std::pair<EnumElementDecl *, SILBasicBlock *>> CaseBBs,
+      Optional<ArrayRef<ProfileCounter>> CaseCounts = None,
+      ProfileCounter DefaultCount = ProfileCounter()) {
     return insertTerminator(SwitchEnumAddrInst::create(
-        getSILDebugLocation(Loc), Operand, DefaultBB, CaseBBs, getFunction()));
+        getSILDebugLocation(Loc), Operand, DefaultBB, CaseBBs, getFunction(),
+        CaseCounts, DefaultCount));
   }
 
   DynamicMethodBranchInst *
@@ -1661,13 +1759,15 @@ public:
                               Member, HasMethodBB, NoMethodBB, getFunction()));
   }
 
-  CheckedCastBranchInst *createCheckedCastBranch(SILLocation Loc, bool isExact,
-                                                 SILValue op, SILType destTy,
-                                                 SILBasicBlock *successBB,
-                                                 SILBasicBlock *failureBB) {
+  CheckedCastBranchInst *
+  createCheckedCastBranch(SILLocation Loc, bool isExact, SILValue op,
+                          SILType destTy, SILBasicBlock *successBB,
+                          SILBasicBlock *failureBB,
+                          ProfileCounter Target1Count = ProfileCounter(),
+                          ProfileCounter Target2Count = ProfileCounter()) {
     return insertTerminator(CheckedCastBranchInst::create(
         getSILDebugLocation(Loc), isExact, op, destTy, successBB, failureBB,
-        getFunction(), OpenedArchetypes));
+        getFunction(), OpenedArchetypes, Target1Count, Target2Count));
   }
 
   CheckedCastValueBranchInst *
@@ -1683,10 +1783,12 @@ public:
   createCheckedCastAddrBranch(SILLocation Loc, CastConsumptionKind consumption,
                               SILValue src, CanType sourceType, SILValue dest,
                               CanType targetType, SILBasicBlock *successBB,
-                              SILBasicBlock *failureBB) {
+                              SILBasicBlock *failureBB,
+                              ProfileCounter Target1Count = ProfileCounter(),
+                              ProfileCounter Target2Count = ProfileCounter()) {
     return insertTerminator(new (getModule()) CheckedCastAddrBranchInst(
         getSILDebugLocation(Loc), consumption, src, sourceType, dest,
-        targetType, successBB, failureBB));
+        targetType, successBB, failureBB, Target1Count, Target2Count));
   }
 
   //===--------------------------------------------------------------------===//
@@ -1808,6 +1910,53 @@ public:
     assert(!v->getType().isAddress());
     auto &lowering = getTypeLowering(v->getType());
     lowering.emitDestroyValue(*this, Loc, v);
+  }
+
+  /// Convenience function for handling begin_borrow instructions in ownership
+  /// and non-ownership SIL. In non-ownership SIL we just forward the input
+  /// value. Otherwise, we emit the begin_borrow instruction.
+  SILValue emitBeginBorrowOperation(SILLocation Loc, SILValue Value) {
+    assert(!Value->getType().isAddress());
+    // If ownership is not enabled in the function, just return our original
+    // value.
+    if (getFunction().hasUnqualifiedOwnership())
+      return Value;
+
+    // If we have a trivial value, just return the value. Trivial values have
+    // lifetimes independent of any other values.
+    //
+    // *NOTE* For now to be conservative since we do not have the ownership
+    // verifier everywhere, we use getType()::isTrivial() instead of
+    // getOwnershipKind().
+    if (Value->getType().isTrivial(getModule())) {
+      return Value;
+    }
+
+    // Otherwise, we have a non-trivial value, perform the borrow.
+    return createBeginBorrow(Loc, Value);
+  }
+
+  /// Convenience function for handling end_borrow instructions in ownership and
+  /// non-ownership SIL. In non-ownership SIL we just early exit. Otherwise, we
+  /// emit the end_borrow.
+  void emitEndBorrowOperation(SILLocation Loc, SILValue Borrowed,
+                              SILValue Original) {
+    assert(!Borrowed->getType().isAddress());
+    // If ownership is not enabled, just return.
+    if (getFunction().hasUnqualifiedOwnership())
+      return;
+
+    // If we have a trivial value, just return. Trivial values have lifetimes
+    // independent of any other values.
+    //
+    // *NOTE* For now to be conservative since we do not have the ownership
+    // verifier everywhere, we use getType()::isTrivial() instead of
+    // getOwnershipKind().
+    if (Borrowed->getType().isTrivial(getModule())) {
+      return;
+    }
+
+    createEndBorrow(Loc, Borrowed, Original);
   }
 
   SILValue emitTupleExtract(SILLocation Loc, SILValue Operand, unsigned FieldNo,
@@ -1933,6 +2082,35 @@ public:
                                SILInstruction *InheritScopeFrom)
       : SILBuilder(BB) {
     inheritScopeFrom(InheritScopeFrom);
+  }
+};
+
+class SavedInsertionPointRAII {
+  SILBuilder &Builder;
+  PointerUnion<SILInstruction *, SILBasicBlock *> SavedIP;
+
+public:
+  SavedInsertionPointRAII(SILBuilder &B, SILInstruction *NewIP)
+      : Builder(B), SavedIP(&*B.getInsertionPoint()) {
+    Builder.setInsertionPoint(NewIP);
+  }
+
+  SavedInsertionPointRAII(SILBuilder &B, SILBasicBlock *NewIP)
+      : Builder(B), SavedIP(B.getInsertionBB()) {
+    Builder.setInsertionPoint(NewIP);
+  }
+
+  SavedInsertionPointRAII(const SavedInsertionPointRAII &) = delete;
+  SavedInsertionPointRAII &operator=(const SavedInsertionPointRAII &) = delete;
+  SavedInsertionPointRAII(SavedInsertionPointRAII &&) = delete;
+  SavedInsertionPointRAII &operator=(SavedInsertionPointRAII &&) = delete;
+
+  ~SavedInsertionPointRAII() {
+    if (SavedIP.is<SILInstruction *>()) {
+      Builder.setInsertionPoint(SavedIP.get<SILInstruction *>());
+    } else {
+      Builder.setInsertionPoint(SavedIP.get<SILBasicBlock *>());
+    }
   }
 };
 

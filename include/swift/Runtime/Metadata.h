@@ -35,8 +35,42 @@
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/Runtime/Unreachable.h"
 #include "../../../stdlib/public/SwiftShims/HeapObject.h"
+#if SWIFT_OBJC_INTEROP
+#include <objc/runtime.h>
+#endif
 
 namespace swift {
+
+#if SWIFT_OBJC_INTEROP
+
+  // Const cast shorthands for ObjC types.
+
+  /// Cast to id, discarding const if necessary.
+  template <typename T>
+  static inline id id_const_cast(const T* value) {
+    return reinterpret_cast<id>(const_cast<T*>(value));
+  }
+
+  /// Cast to Class, discarding const if necessary.
+  template <typename T>
+  static inline Class class_const_cast(const T* value) {
+    return reinterpret_cast<Class>(const_cast<T*>(value));
+  }
+
+  /// Cast to Protocol*, discarding const if necessary.
+  template <typename T>
+  static inline Protocol* protocol_const_cast(const T* value) {
+    return reinterpret_cast<Protocol *>(const_cast<T*>(value));
+  }
+
+  /// Cast from a CF type, discarding const if necessary.
+  template <typename T>
+  static inline T cf_const_cast(const void* value) {
+    return reinterpret_cast<T>(const_cast<void *>(value));
+  }
+
+#endif
+
 
 template <unsigned PointerSize>
 struct RuntimeTarget;
@@ -323,6 +357,7 @@ namespace value_witness_types {
 #define TYPE_TYPE const Metadata *
 #define SIZE_TYPE size_t
 #define INT_TYPE int
+#define UINT_TYPE unsigned
 #define VOID_TYPE void
 #include "swift/ABI/ValueWitness.def"
 
@@ -626,7 +661,7 @@ const ExtraInhabitantsValueWitnessTable METATYPE_VALUE_WITNESS_SYM(Bo); // Built
 
 /// Return the value witnesses for unmanaged pointers.
 static inline const ValueWitnessTable &getUnmanagedPointerValueWitnesses() {
-#ifdef __LP64__
+#if __POINTER_WIDTH__ == 64
   return VALUE_WITNESS_SYM(Bi64_);
 #else
   return VALUE_WITNESS_SYM(Bi32_);
@@ -685,87 +720,7 @@ namespace {
     using type = R;
   };
 }
-  
-namespace heap_object_abi {
-  
-// The extra inhabitants and spare bits of heap object pointers.
-// These must align with the values in IRGen's SwiftTargetInfo.cpp.
-#if defined(__x86_64__)
 
-# ifdef __APPLE__
-static const uintptr_t LeastValidPointerValue =
-  SWIFT_ABI_DARWIN_X86_64_LEAST_VALID_POINTER;
-# else
-static const uintptr_t LeastValidPointerValue =
-  SWIFT_ABI_DEFAULT_LEAST_VALID_POINTER;
-# endif
-static const uintptr_t SwiftSpareBitsMask =
-  SWIFT_ABI_X86_64_SWIFT_SPARE_BITS_MASK;
-static const uintptr_t ObjCReservedBitsMask =
-  SWIFT_ABI_X86_64_OBJC_RESERVED_BITS_MASK;
-static const unsigned ObjCReservedLowBits =
-  SWIFT_ABI_X86_64_OBJC_NUM_RESERVED_LOW_BITS;
-
-#elif defined(__arm64__)
-
-# ifdef __APPLE__
-static const uintptr_t LeastValidPointerValue =
-  SWIFT_ABI_DARWIN_ARM64_LEAST_VALID_POINTER;
-# else
-static const uintptr_t LeastValidPointerValue =
-  SWIFT_ABI_DEFAULT_LEAST_VALID_POINTER;
-# endif
-static const uintptr_t SwiftSpareBitsMask =
-  SWIFT_ABI_ARM64_SWIFT_SPARE_BITS_MASK;
-static const uintptr_t ObjCReservedBitsMask =
-  SWIFT_ABI_ARM64_OBJC_RESERVED_BITS_MASK;
-static const unsigned ObjCReservedLowBits =
-  SWIFT_ABI_ARM64_OBJC_NUM_RESERVED_LOW_BITS;
-
-#elif defined(__powerpc64__)
-
-static const uintptr_t LeastValidPointerValue =
-  SWIFT_ABI_DEFAULT_LEAST_VALID_POINTER;
-static const uintptr_t SwiftSpareBitsMask =
-  SWIFT_ABI_POWERPC64_SWIFT_SPARE_BITS_MASK;
-static const uintptr_t ObjCReservedBitsMask =
-  SWIFT_ABI_DEFAULT_OBJC_RESERVED_BITS_MASK;
-static const unsigned ObjCReservedLowBits =
-  SWIFT_ABI_DEFAULT_OBJC_NUM_RESERVED_LOW_BITS;
-
-#elif defined(__s390x__)
-
-static const uintptr_t LeastValidPointerValue =
-  SWIFT_ABI_DEFAULT_LEAST_VALID_POINTER;
-static const uintptr_t SwiftSpareBitsMask =
-  SWIFT_ABI_S390X_SWIFT_SPARE_BITS_MASK;
-static const uintptr_t ObjCReservedBitsMask =
-  SWIFT_ABI_DEFAULT_OBJC_RESERVED_BITS_MASK;
-static const unsigned ObjCReservedLowBits =
-  SWIFT_ABI_DEFAULT_OBJC_NUM_RESERVED_LOW_BITS;
-
-#else
-
-static const uintptr_t LeastValidPointerValue =
-  SWIFT_ABI_DEFAULT_LEAST_VALID_POINTER;
-static const uintptr_t SwiftSpareBitsMask =
-# if __i386__
-  SWIFT_ABI_I386_SWIFT_SPARE_BITS_MASK
-# elif __arm__
-  SWIFT_ABI_ARM_SWIFT_SPARE_BITS_MASK
-# else
-  SWIFT_ABI_DEFAULT_SWIFT_SPARE_BITS_MASK
-# endif
-  ;
-static const uintptr_t ObjCReservedBitsMask =
-  SWIFT_ABI_DEFAULT_OBJC_RESERVED_BITS_MASK;
-static const unsigned ObjCReservedLowBits =
-  SWIFT_ABI_DEFAULT_OBJC_NUM_RESERVED_LOW_BITS;
-
-#endif
-
-}
-  
 template <typename Runtime> struct TargetNominalTypeDescriptor;
 template <typename Runtime> struct TargetGenericMetadata;
 template <typename Runtime> struct TargetClassMetadata;
@@ -932,9 +887,7 @@ public:
 
   /// Get the nominal type descriptor if this metadata describes a nominal type,
   /// or return null if it does not.
-  const ConstTargetFarRelativeDirectPointer<Runtime,
-                                            TargetNominalTypeDescriptor,
-                                            /*nullable*/ true> &
+  ConstTargetMetadataPointer<Runtime, TargetNominalTypeDescriptor>
   getNominalTypeDescriptor() const {
     switch (getKind()) {
     case MetadataKind::Class: {
@@ -948,7 +901,8 @@ public:
     case MetadataKind::Struct:
     case MetadataKind::Enum:
     case MetadataKind::Optional:
-      return static_cast<const TargetStructMetadata<Runtime> *>(this)->Description;
+      return static_cast<const TargetStructMetadata<Runtime> *>(this)
+          ->Description;
     case MetadataKind::ForeignClass:
     case MetadataKind::Opaque:
     case MetadataKind::Tuple:
@@ -965,15 +919,24 @@ public:
 
     swift_runtime_unreachable("Unhandled MetadataKind in switch.");
   }
-  
-  /// Get the generic metadata pattern from which this generic type instance was
-  /// instantiated, or null if the type is not generic.
-  const TargetGenericMetadata<Runtime> *getGenericPattern() const;
-  
+
   /// Get the class object for this type if it has one, or return null if the
   /// type is not a class (or not a class with a class object).
   const TargetClassMetadata<Runtime> *getClassObject() const;
-  
+
+#if SWIFT_OBJC_INTEROP
+  /// Get the ObjC class object for this type if it has one, or return null if
+  /// the type is not a class (or not a class with a class object).
+  /// This is allowed for InProcess values only.
+  template <typename R = Runtime>
+  typename std::enable_if<std::is_same<R, InProcess>::value, Class>::type
+  getObjCClassObject() const {
+    return reinterpret_cast<Class>(
+      const_cast<TargetClassMetadata<InProcess>*>(
+        getClassObject()));
+  }
+#endif
+
 protected:
   friend struct TargetOpaqueMetadata<Runtime>;
   
@@ -1055,6 +1018,13 @@ struct TargetHeapMetadata : TargetMetadata<Runtime> {
 };
 using HeapMetadata = TargetHeapMetadata<InProcess>;
 
+struct GenericContextDescriptor {
+  /// The number of primary type parameters. This is always less than or equal
+  /// to NumGenericRequirements; it counts only the type parameters
+  /// and not any required witness tables.
+  uint32_t NumPrimaryParams;
+};
+
 /// Header for a generic parameter descriptor. This is a variable-sized
 /// structure that describes how to find and parse a generic parameter vector
 /// within the type metadata for an instance of a nominal type.
@@ -1062,8 +1032,7 @@ struct GenericParameterDescriptor {
   /// The offset to the first generic argument from the start of
   /// metadata record.
   ///
-  /// This is meaningful if either NumGenericRequirements is nonzero or
-  /// (for classes) if Flags.hasParent() is true.
+  /// This is meaningful if NumGenericRequirements is nonzero.
   uint32_t Offset;
 
   /// The amount of generic requirement data in the metadata record, in
@@ -1079,6 +1048,10 @@ struct GenericParameterDescriptor {
   /// and not any required witness tables.
   uint32_t NumPrimaryParams;
 
+  /// The number of types that this type is nested inside of, including itself
+  /// (so this value is at least 1).
+  uint16_t NestingDepth;
+
   /// Flags for this generic parameter descriptor.
   GenericParameterDescriptorFlags Flags;
 
@@ -1088,7 +1061,12 @@ struct GenericParameterDescriptor {
 
   /// True if the nominal type is generic in any way.
   bool isGeneric() const {
-    return hasGenericRequirements() || Flags.hasGenericParent();
+    return hasGenericRequirements();
+  }
+
+  GenericContextDescriptor getContext(unsigned depth) const {
+    assert(depth < NestingDepth);
+    return ((const GenericContextDescriptor *)(this + 1))[depth];
   }
 
   // TODO: add meaningful descriptions of the generic requirements.
@@ -1123,10 +1101,6 @@ struct TargetVTableDescriptor {
     return VTable[index].Impl.get();
   }
 };
-
-struct ClassTypeDescriptor;
-struct StructTypeDescriptor;
-struct EnumTypeDescriptor;
 
 /// Common information about all nominal types. For generic types, this
 /// descriptor is shared for all instantiations of the generic type.
@@ -1230,9 +1204,7 @@ struct TargetNominalTypeDescriptor {
     } Enum;
   };
   
-  RelativeDirectPointerIntPair<TargetGenericMetadata<Runtime>,
-                               NominalTypeKind, /*Nullable*/ true>
-    GenericMetadataPatternAndKind;
+  NominalTypeKind Kind;
 
   using NonGenericMetadataAccessFunction = const Metadata *();
 
@@ -1247,19 +1219,12 @@ struct TargetNominalTypeDescriptor {
   TargetRelativeDirectPointer<Runtime, NonGenericMetadataAccessFunction,
                               /*Nullable*/ true> AccessFunction;
 
-  /// A pointer to the generic metadata pattern that is used to instantiate
-  /// instances of this type. Zero if the type is not generic.
-  TargetGenericMetadata<Runtime> *getGenericMetadataPattern() const {
-    return const_cast<TargetGenericMetadata<Runtime>*>(
-                                    GenericMetadataPatternAndKind.getPointer());
-  }
-
   NonGenericMetadataAccessFunction *getAccessFunction() const {
     return AccessFunction.get();
   }
 
   NominalTypeKind getKind() const {
-    return GenericMetadataPatternAndKind.getInt();
+    return Kind;
   }
 
   int32_t offsetToNameOffset() const {
@@ -1273,12 +1238,13 @@ struct TargetNominalTypeDescriptor {
         !GenericParams.Flags.hasVTable())
       return nullptr;
 
-    auto asWords = reinterpret_cast<const void * const*>(this + 1);
+    auto asWords = reinterpret_cast<const uint32_t *>(this + 1);
 
     // TODO: Once we emit reflective descriptions of generic requirements,
     // skip the right number of words here.
 
-    return reinterpret_cast<const VTableDescriptor *>(asWords);
+    return reinterpret_cast<const VTableDescriptor *>(asWords
+        + GenericParams.NestingDepth);
   }
 
   /// The generic parameter descriptor header. This describes how to find and
@@ -1321,20 +1287,16 @@ struct TargetClassMetadata : public TargetHeapMetadata<Runtime> {
       Description(nullptr), IVarDestroyer(ivarDestroyer) {}
 
   // Description's copy ctor is deleted so we have to do this the hard way.
-  TargetClassMetadata(const TargetClassMetadata& other)
-    : TargetHeapMetadata<Runtime>(other),
-      SuperClass(other.SuperClass),
-      CacheData{other.CacheData[0], other.CacheData[1]},
-      Data(other.Data),
-      Flags(other.Flags),
-      InstanceAddressPoint(other.InstanceAddressPoint),
-      InstanceSize(other.InstanceSize),
-      InstanceAlignMask(other.InstanceAlignMask),
-      Reserved(other.Reserved),
-      ClassSize(other.ClassSize),
-      ClassAddressPoint(other.ClassAddressPoint),
-      Description(other.Description.get()),
-      IVarDestroyer(other.IVarDestroyer) {}
+  TargetClassMetadata(const TargetClassMetadata &other)
+      : TargetHeapMetadata<Runtime>(other),
+        SuperClass(other.SuperClass),
+        CacheData{other.CacheData[0], other.CacheData[1]},
+        Data(other.Data), Flags(other.Flags),
+        InstanceAddressPoint(other.InstanceAddressPoint),
+        InstanceSize(other.InstanceSize),
+        InstanceAlignMask(other.InstanceAlignMask), Reserved(other.Reserved),
+        ClassSize(other.ClassSize), ClassAddressPoint(other.ClassAddressPoint),
+        Description(other.Description), IVarDestroyer(other.IVarDestroyer) {}
 
   /// The metadata for the superclass.  This is null for the root class.
   ConstTargetMetadataPointer<Runtime, swift::TargetClassMetadata> SuperClass;
@@ -1396,8 +1358,7 @@ private:
   /// if this is an artificial subclass.  We currently provide no
   /// supported mechanism for making a non-artificial subclass
   /// dynamically.
-  ConstTargetFarRelativeDirectPointer<Runtime, TargetNominalTypeDescriptor,
-                                      /*nullable*/ true> Description;
+  ConstTargetMetadataPointer<Runtime, TargetNominalTypeDescriptor> Description;
 
   /// A function for destroying instance variables, used to clean up
   /// after an early return from a constructor.
@@ -1411,15 +1372,12 @@ private:
   //   - "tabulated" virtual methods
 
 public:
-  const ConstTargetFarRelativeDirectPointer<Runtime,
-                                            TargetNominalTypeDescriptor,
-                                            /*nullable*/ true> &
+  ConstTargetMetadataPointer<Runtime, TargetNominalTypeDescriptor>
   getDescription() const {
     assert(isTypeMetadata());
-    assert(!isArtificialSubclass());
     return Description;
   }
-  
+
   void setDescription(const TargetNominalTypeDescriptor<Runtime> *
                       description) {
     Description = description;
@@ -1522,21 +1480,6 @@ public:
       return nullptr;
     
     return getter(this);
-  }
-
-  /// Return the parent type for a given level in the class hierarchy, or
-  /// null if that level does not have a parent type.
-  const TargetMetadata<Runtime> *
-  getParentType(const TargetNominalTypeDescriptor<Runtime> *theClass) const {
-    if (!theClass->GenericParams.Flags.hasParent())
-      return nullptr;
-
-    auto metadataAsWords = reinterpret_cast<const Metadata * const *>(this);
-    return metadataAsWords[theClass->GenericParams.Offset - 1];
-  }
-
-  StoredPointer offsetToDescriptorOffset() const {
-    return offsetof(TargetClassMetadata<Runtime>, Description);
   }
 
   static bool classof(const TargetMetadata<Runtime> *metadata) {
@@ -1701,22 +1644,11 @@ template <typename Runtime>
 struct TargetValueMetadata : public TargetMetadata<Runtime> {
   using StoredPointer = typename Runtime::StoredPointer;
   TargetValueMetadata(MetadataKind Kind,
-    ConstTargetMetadataPointer<Runtime, TargetNominalTypeDescriptor>
-                      description,
-    ConstTargetMetadataPointer<Runtime, swift::TargetMetadata> parent)
-    : TargetMetadata<Runtime>(Kind),
-      Description(description),
-      Parent(parent)
-  {}
+                      const TargetNominalTypeDescriptor<Runtime> *description)
+      : TargetMetadata<Runtime>(Kind), Description(description) {}
 
   /// An out-of-line description of the type.
-  ConstTargetFarRelativeDirectPointer<Runtime, TargetNominalTypeDescriptor>
-  Description;
-
-  /// The parent type of this member type, or null if this is not a
-  /// member type.  It's acceptable to make this a direct pointer because
-  /// parent types are relatively uncommon.
-  TargetPointer<Runtime, const TargetMetadata<Runtime>> Parent;
+  const TargetNominalTypeDescriptor<Runtime> *Description;
 
   static bool classof(const TargetMetadata<Runtime> *metadata) {
     return metadata->getKind() == MetadataKind::Struct
@@ -1736,17 +1668,8 @@ struct TargetValueMetadata : public TargetMetadata<Runtime> {
   }
 
   const TargetNominalTypeDescriptor<Runtime> *getDescription() const {
-    return Description.get();
+    return Description;
   }
-
-  StoredPointer offsetToDescriptorOffset() const {
-    return offsetof(TargetValueMetadata<Runtime>, Description);
-  }
-
-  StoredPointer offsetToParentOffset() const {
-    return offsetof(TargetValueMetadata<Runtime>, Parent);
-  }
-  
 };
 using ValueMetadata = TargetValueMetadata<InProcess>;
 
@@ -1822,35 +1745,52 @@ using EnumMetadata = TargetEnumMetadata<InProcess>;
 template <typename Runtime>
 struct TargetFunctionTypeMetadata : public TargetMetadata<Runtime> {
   using StoredSize = typename Runtime::StoredSize;
-
-  // TODO: Make this target agnostic
-  using Argument = FlaggedPointer<const TargetMetadata<Runtime> *, 0>;
+  using Parameter = ConstTargetMetadataPointer<Runtime, swift::TargetMetadata>;
 
   TargetFunctionTypeFlags<StoredSize> Flags;
 
   /// The type metadata for the result type.
   ConstTargetMetadataPointer<Runtime, swift::TargetMetadata> ResultType;
 
-  TargetPointer<Runtime, Argument> getArguments() {
-    return reinterpret_cast<TargetPointer<Runtime, Argument>>(this + 1);
+  Parameter *getParameters() { return reinterpret_cast<Parameter *>(this + 1); }
+
+  const Parameter *getParameters() const {
+    return reinterpret_cast<const Parameter *>(this + 1);
   }
 
-  TargetPointer<Runtime, const Argument> getArguments() const {
-    return reinterpret_cast<TargetPointer<Runtime, const Argument>>(this + 1);
+  Parameter getParameter(unsigned index) const {
+    assert(index < getNumParameters());
+    return getParameters()[index];
   }
-  
-  StoredSize getNumArguments() const {
-    return Flags.getNumArguments();
+
+  ParameterFlags getParameterFlags(unsigned index) const {
+    assert(index < getNumParameters());
+    auto flags = hasParameterFlags() ? getParameterFlags()[index] : 0;
+    return ParameterFlags::fromIntValue(flags);
+  }
+
+  StoredSize getNumParameters() const {
+    return Flags.getNumParameters();
   }
   FunctionMetadataConvention getConvention() const {
     return Flags.getConvention();
   }
   bool throws() const { return Flags.throws(); }
+  bool hasParameterFlags() const { return Flags.hasParameterFlags(); }
 
   static constexpr StoredSize OffsetToFlags = sizeof(TargetMetadata<Runtime>);
 
   static bool classof(const TargetMetadata<Runtime> *metadata) {
     return metadata->getKind() == MetadataKind::Function;
+  }
+
+  uint32_t *getParameterFlags() {
+    return reinterpret_cast<uint32_t *>(getParameters() + getNumParameters());
+  }
+
+  const uint32_t *getParameterFlags() const {
+    return reinterpret_cast<const uint32_t *>(getParameters() +
+                                              getNumParameters());
   }
 };
 using FunctionTypeMetadata = TargetFunctionTypeMetadata<InProcess>;
@@ -2481,7 +2421,9 @@ template <typename Runtime>
 struct TargetProtocolConformanceRecord {
 public:
   using WitnessTableAccessorFn
-    = const WitnessTable *(const TargetMetadata<Runtime>*);
+    = const WitnessTable *(const TargetMetadata<Runtime>*,
+                           const WitnessTable **,
+                           size_t);
 
 private:
   /// The protocol being conformed to.
@@ -2716,28 +2658,58 @@ swift_getGenericWitnessTable(GenericWitnessTable *genericTable,
 /// \brief Fetch a uniqued metadata for a function type.
 SWIFT_RUNTIME_EXPORT
 const FunctionTypeMetadata *
-swift_getFunctionTypeMetadata(const void *flagsArgsAndResult[]);
+swift_getFunctionTypeMetadata(FunctionTypeFlags flags,
+                              const Metadata *const *parameters,
+                              const uint32_t *parameterFlags,
+                              const Metadata *result);
 
 SWIFT_RUNTIME_EXPORT
 const FunctionTypeMetadata *
 swift_getFunctionTypeMetadata1(FunctionTypeFlags flags,
-                               const void *arg0,
-                               const Metadata *resultMetadata);
+                               const Metadata *arg0,
+                               const Metadata *result);
+
+SWIFT_RUNTIME_EXPORT
+const FunctionTypeMetadata *
+swift_getFunctionTypeMetadata1WithFlags(FunctionTypeFlags flags,
+                                        const Metadata *arg0,
+                                        ParameterFlags flags0,
+                                        const Metadata *result);
 
 SWIFT_RUNTIME_EXPORT
 const FunctionTypeMetadata *
 swift_getFunctionTypeMetadata2(FunctionTypeFlags flags,
-                               const void *arg0,
-                               const void *arg1,
-                               const Metadata *resultMetadata);
+                               const Metadata *arg0,
+                               const Metadata *arg1,
+                               const Metadata *result);
 
 SWIFT_RUNTIME_EXPORT
 const FunctionTypeMetadata *
-swift_getFunctionTypeMetadata3(FunctionTypeFlags flags,
-                               const void *arg0,
-                               const void *arg1,
-                               const void *arg2,
-                               const Metadata *resultMetadata);
+swift_getFunctionTypeMetadata2WithFlags(FunctionTypeFlags flags,
+                                        const Metadata *arg0,
+                                        ParameterFlags flags0,
+                                        const Metadata *arg1,
+                                        ParameterFlags flags1,
+                                        const Metadata *result);
+
+SWIFT_RUNTIME_EXPORT
+const FunctionTypeMetadata *swift_getFunctionTypeMetadata3(
+                                                FunctionTypeFlags flags,
+                                                const Metadata *arg0,
+                                                const Metadata *arg1,
+                                                const Metadata *arg2,
+                                                const Metadata *result);
+
+SWIFT_RUNTIME_EXPORT
+const FunctionTypeMetadata *swift_getFunctionTypeMetadata3WithFlags(
+                                                FunctionTypeFlags flags,
+                                                const Metadata *arg0,
+                                                ParameterFlags flags0,
+                                                const Metadata *arg1,
+                                                ParameterFlags flags1,
+                                                const Metadata *arg2,
+                                                ParameterFlags flags2,
+                                                const Metadata *result);
 
 /// \brief Fetch a uniqued metadata for a thin function type.
 SWIFT_RUNTIME_EXPORT
@@ -2827,12 +2799,17 @@ swift_getBlockTypeMetadata3(const void *arg0,
 SWIFT_RUNTIME_EXPORT
 void
 swift_instantiateObjCClass(const ClassMetadata *theClass);
-#endif
 
 /// \brief Fetch a uniqued type metadata for an ObjC class.
 SWIFT_RUNTIME_EXPORT
 const Metadata *
 swift_getObjCClassMetadata(const ClassMetadata *theClass);
+
+/// \brief Get the ObjC class object from class type metadata.
+SWIFT_RUNTIME_EXPORT
+const ClassMetadata *
+swift_getObjCClassFromMetadata(const Metadata *theClass);
+#endif
 
 /// \brief Fetch a unique type metadata object for a foreign type.
 SWIFT_RUNTIME_EXPORT

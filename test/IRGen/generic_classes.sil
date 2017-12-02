@@ -21,14 +21,18 @@ import Swift
 // CHECK-SAME:   i32 15,
 // --       field names
 // CHECK-SAME:   [7 x i8]* [[ROOTGENERIC_FIELDS]]
-// --       generic metadata pattern
-// CHECK-SAME:   @_T015generic_classes11RootGenericCMP
+// --       kind 0 (class)
+// CHECK-SAME:   i32 0,
 // --       generic parameter vector offset
 // CHECK-SAME:   i32 10,
 // --       generic parameter count, primary count
 // CHECK-SAME:   i32 1, i32 1,
+// --       nesting depth
+// CHECK-SAME:   i16 1,
 // --       flags -- has vtable
-// CHECK-SAME:   i32 4,
+// CHECK-SAME:   i16 4,
+// --       generic parameters at depth 0
+// CHECK-SAME:   i32 1,
 // --       vtable offset
 // CHECK-SAME:   i32 11,
 // --       vtable size
@@ -49,9 +53,9 @@ import Swift
 
 // -- Check that offset vars are emitted for fixed-layout generics
 //    <rdar://problem/15081049>
-// CHECK: @_T015generic_classes22RootGenericFixedLayoutC1xs5UInt8VvWvd = hidden constant i64 16, align 8
-// CHECK: @_T015generic_classes22RootGenericFixedLayoutC1ySayxGvWvd = hidden constant i64 24, align 8
-// CHECK: @_T015generic_classes22RootGenericFixedLayoutC1zs5UInt8VvWvd = hidden constant i64 32, align 8
+// CHECK: @_T015generic_classes22RootGenericFixedLayoutC1xs5UInt8VvpWvd = hidden constant i64 16, align 8
+// CHECK: @_T015generic_classes22RootGenericFixedLayoutC1ySayxGvpWvd = hidden constant i64 24, align 8
+// CHECK: @_T015generic_classes22RootGenericFixedLayoutC1zs5UInt8VvpWvd = hidden constant i64 32, align 8
 
 // -- fixed-layout nongeneric descriptor
 //    FIXME: Strings should be unnamed_addr. rdar://problem/22674524
@@ -360,7 +364,7 @@ entry(%c : $RootGeneric<Int32>):
 // CHECK:   [[T0:%.*]] = bitcast %swift.type* %B to i8***
 // CHECK:   [[T1:%.*]] = getelementptr inbounds i8**, i8*** [[T0]], i64 -1
 // CHECK:   [[VWT:%.*]] = load i8**, i8*** [[T1]], align 8
-// CHECK:   [[T0:%.*]] = getelementptr inbounds i8*, i8** [[VWT]], i32 11
+// CHECK:   [[T0:%.*]] = getelementptr inbounds i8*, i8** [[VWT]], i32 9
 // CHECK:   [[T1:%.*]] = getelementptr inbounds i8**, i8*** [[FIELDS_ADDR]], i32 0
 // CHECK:   store i8** [[T0]], i8*** [[T1]], align 8
 // CHECK:   call %swift.type* @swift_initClassMetadata_UniversalStrategy(%swift.type* [[METADATA]], i64 1, i8*** [[FIELDS_ADDR]], i64* [[OFFSETS]])

@@ -22,6 +22,7 @@
 #include "TypeInfo.h"
 #include "StructLayout.h"
 #include "swift/Basic/Range.h"
+#include "swift/SIL/SILModule.h"
 
 using namespace swift;
 using namespace irgen;
@@ -71,18 +72,24 @@ llvm::Constant *irgen::emitAddrOfConstantString(IRGenModule &IGM,
 }
 
 static llvm::Constant *emitConstantValue(IRGenModule &IGM, SILValue operand) {
-  if (auto *SI = dyn_cast<StructInst>(operand))
+  if (auto *SI = dyn_cast<StructInst>(operand)) {
     return emitConstantStruct(IGM, SI);
-  else if (auto *TI = dyn_cast<TupleInst>(operand))
+  } else if (auto *TI = dyn_cast<TupleInst>(operand)) {
     return emitConstantTuple(IGM, TI);
-  else if (auto *ILI = dyn_cast<IntegerLiteralInst>(operand))
+  } else if (auto *ILI = dyn_cast<IntegerLiteralInst>(operand)) {
     return emitConstantInt(IGM, ILI);
-  else if (auto *FLI = dyn_cast<FloatLiteralInst>(operand))
+  } else if (auto *FLI = dyn_cast<FloatLiteralInst>(operand)) {
     return emitConstantFP(IGM, FLI);
-  else if (auto *SLI = dyn_cast<StringLiteralInst>(operand))
+  } else if (auto *SLI = dyn_cast<StringLiteralInst>(operand)) {
     return emitAddrOfConstantString(IGM, SLI);
-  else
+  } else if (auto *BI = dyn_cast<BuiltinInst>(operand)) {
+    assert(IGM.getSILModule().getBuiltinInfo(BI->getName()).ID ==
+           BuiltinValueKind::PtrToInt);
+    llvm::Constant *ptr = emitConstantValue(IGM, BI->getArguments()[0]);
+    return llvm::ConstantExpr::getPtrToInt(ptr, IGM.IntPtrTy);
+  } else {
     llvm_unreachable("Unsupported SILInstruction in static initializer!");
+  }
 }
 
 namespace {
@@ -160,9 +167,12 @@ llvm::Constant *irgen::emitConstantObject(IRGenModule &IGM, ObjectInst *OI,
   // Construct the object init value including tail allocated elements.
   for (unsigned i = 0; i != NumElems; i++) {
     SILValue Val = OI->getAllElements()[i];
-    unsigned EltIdx = ClassLayout->getElements()[i].getStructIndex();
-    assert(EltIdx != 0 && "the first element is the object header");
-    elts[EltIdx] = emitConstantValue(IGM, Val);
+    const ElementLayout &EL = ClassLayout->getElements()[i];
+    if (!EL.isEmpty()) {
+      unsigned EltIdx = EL.getStructIndex();
+      assert(EltIdx != 0 && "the first element is the object header");
+      elts[EltIdx] = emitConstantValue(IGM, Val);
+    }
   }
   // Construct the object header.
   llvm::Type *ObjectHeaderTy = sTy->getElementType(0);

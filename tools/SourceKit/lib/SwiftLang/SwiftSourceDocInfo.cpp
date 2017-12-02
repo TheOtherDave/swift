@@ -19,13 +19,13 @@
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/NameLookup.h"
-#include "swift/AST/SourceEntityWalker.h"
 #include "swift/AST/SwiftNameTranslation.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
 #include "swift/IDE/CommentConversion.h"
 #include "swift/IDE/ModuleInterfacePrinting.h"
+#include "swift/IDE/SourceEntityWalker.h"
 #include "swift/IDE/Utils.h"
 #include "swift/IDE/Refactoring.h"
 #include "swift/Markup/XMLUtils.h"
@@ -1515,6 +1515,7 @@ static void resolveRange(SwiftLangSupport &Lang,
         return;
       }
       case RangeKind::SingleDecl:
+      case RangeKind::MultiTypeMemberDecl:
       case RangeKind::MultiStatement:
       case RangeKind::SingleStatement: {
         Receiver(Result);
@@ -1657,7 +1658,7 @@ getNameInfo(StringRef InputFile, unsigned Offset, NameTranslatingInfo &Input,
                      SwiftArgs, OpArgs);
     }
 
-    IFaceGenRef->accessASTAsync([this, IFaceGenRef, Offset, Input, Receiver] {
+    IFaceGenRef->accessASTAsync([IFaceGenRef, Offset, Input, Receiver] {
       SwiftInterfaceGenContext::ResolvedEntity Entity;
       Entity = IFaceGenRef->resolveEntityForOffset(Offset);
       if (Entity.isResolved()) {

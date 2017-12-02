@@ -44,7 +44,7 @@ namespace Lowering {
 /// The default convention for handling the callee object on thick
 /// callees.
 const ParameterConvention DefaultThickCalleeConvention =
-  ParameterConvention::Direct_Owned;
+    ParameterConvention::Direct_Guaranteed;
 
 /// Given an AST function type, return a type that is identical except
 /// for using the given ExtInfo.
@@ -67,21 +67,31 @@ inline CanAnyFunctionType adjustFunctionType(CanAnyFunctionType t,
   
 /// Given a SIL function type, return a type that is identical except
 /// for using the given ExtInfo.
-CanSILFunctionType adjustFunctionType(CanSILFunctionType type,
-                                      SILFunctionType::ExtInfo extInfo,
-                                      ParameterConvention calleeConv);
-inline CanSILFunctionType adjustFunctionType(CanSILFunctionType type,
-                                      SILFunctionType::ExtInfo extInfo) {
-  return adjustFunctionType(type, extInfo, type->getCalleeConvention());
+CanSILFunctionType
+adjustFunctionType(CanSILFunctionType type, SILFunctionType::ExtInfo extInfo,
+                   ParameterConvention calleeConv,
+                   Optional<ProtocolConformanceRef> witnessMethodConformance);
+inline CanSILFunctionType
+adjustFunctionType(CanSILFunctionType type, SILFunctionType::ExtInfo extInfo,
+                   Optional<ProtocolConformanceRef> witnessMethodConformance) {
+  return adjustFunctionType(type, extInfo, type->getCalleeConvention(),
+                            witnessMethodConformance);
 }
-inline CanSILFunctionType adjustFunctionType(CanSILFunctionType t,
-                                         SILFunctionType::Representation rep) {
+inline CanSILFunctionType
+adjustFunctionType(CanSILFunctionType t, SILFunctionType::Representation rep,
+                   Optional<ProtocolConformanceRef> witnessMethodConformance) {
   if (t->getRepresentation() == rep) return t;
   auto extInfo = t->getExtInfo().withRepresentation(rep);
-  
+  auto contextConvention = DefaultThickCalleeConvention;
   return adjustFunctionType(t, extInfo,
-                    extInfo.hasContext() ? DefaultThickCalleeConvention
-                                         : ParameterConvention::Direct_Unowned);
+                            extInfo.hasContext()
+                                ? contextConvention
+                                : ParameterConvention::Direct_Unowned,
+                            witnessMethodConformance);
+}
+inline CanSILFunctionType
+adjustFunctionType(CanSILFunctionType t, SILFunctionType::Representation rep) {
+  return adjustFunctionType(t, rep, t->getWitnessMethodConformanceOrNone());
 }
   
 
@@ -262,7 +272,11 @@ public:
     return TypeLowering::LoweringStyle::Shallow;
   }
 
-  /// Emit a lowered 'release_value' operation.
+  //===--------------------------------------------------------------------===//
+  // DestroyValue
+  //===--------------------------------------------------------------------===//
+
+  /// Emit a lowered destroy value operation.
   ///
   /// This type must be loadable.
   virtual void emitLoweredDestroyValue(SILBuilder &B, SILLocation loc,
@@ -277,7 +291,7 @@ public:
     return emitDestroyValue(B, loc, value);
   }
 
-  /// Emit a lowered 'release_value' operation.
+  /// Emit a lowered destroy value operation.
   ///
   /// This type must be loadable.
   void emitLoweredDestroyValueShallow(SILBuilder &B, SILLocation loc,
@@ -285,7 +299,7 @@ public:
     emitLoweredDestroyValue(B, loc, value, LoweringStyle::Shallow);
   }
 
-  /// Emit a lowered 'release_value' operation.
+  /// Emit a lowered destroy_value operation.
   ///
   /// This type must be loadable.
   void emitLoweredDestroyValueDeep(SILBuilder &B, SILLocation loc,
@@ -304,14 +318,18 @@ public:
   virtual void emitDestroyValue(SILBuilder &B, SILLocation loc,
                                 SILValue value) const = 0;
 
-  /// Emit a lowered 'retain_value' operation.
+  //===--------------------------------------------------------------------===//
+  // CopyValue
+  //===--------------------------------------------------------------------===//
+
+  /// Emit a lowered copy value operation.
   ///
   /// This type must be loadable.
   virtual SILValue emitLoweredCopyValue(SILBuilder &B, SILLocation loc,
                                         SILValue value,
                                         LoweringStyle style) const = 0;
 
-  /// Emit a lowered 'retain_value' operation.
+  /// Emit a lowered copy value operation.
   ///
   /// This type must be loadable.
   SILValue emitLoweredCopyValueShallow(SILBuilder &B, SILLocation loc,
@@ -319,7 +337,7 @@ public:
     return emitLoweredCopyValue(B, loc, value, LoweringStyle::Shallow);
   }
 
-  /// Emit a lowered 'retain_value' operation.
+  /// Emit a lowered copy value operation.
   ///
   /// This type must be loadable.
   SILValue emitLoweredCopyValueDeep(SILBuilder &B, SILLocation loc,
@@ -531,9 +549,9 @@ class TypeConverter {
 
   llvm::SmallVector<DependentTypeState, 1> DependentTypes;
 
-  llvm::DenseMap<SILDeclRef, SILConstantInfo> ConstantTypes;
+  llvm::DenseMap<SILDeclRef, SILConstantInfo *> ConstantTypes;
   
-  llvm::DenseMap<OverrideKey, SILConstantInfo> ConstantOverrideTypes;
+  llvm::DenseMap<OverrideKey, SILConstantInfo *> ConstantOverrideTypes;
 
   llvm::DenseMap<AnyFunctionRef, CaptureInfo> LoweredCaptures;
 
@@ -658,11 +676,10 @@ public:
   /// whose type cannot be represented in the AST because it is
   /// a polymorphic function value. This function returns the
   /// unsubstituted lowered type of this callback.
-  CanSILFunctionType
-  getMaterializeForSetCallbackType(AbstractStorageDecl *storage,
-                                   CanGenericSignature genericSig,
-                                   Type selfType,
-                                   SILFunctionTypeRepresentation rep);
+  CanSILFunctionType getMaterializeForSetCallbackType(
+      AbstractStorageDecl *storage, CanGenericSignature genericSig,
+      Type selfType, SILFunctionTypeRepresentation rep,
+      Optional<ProtocolConformanceRef> witnessMethodConformance);
 
   /// Return the SILFunctionType for a native function value of the
   /// given type.

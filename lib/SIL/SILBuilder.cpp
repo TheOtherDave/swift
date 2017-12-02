@@ -10,8 +10,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/AST/Expr.h"
 #include "swift/SIL/SILBuilder.h"
+#include "swift/AST/Expr.h"
+#include "swift/SIL/Projection.h"
 #include "swift/SIL/SILGlobalVariable.h"
 
 using namespace swift;
@@ -79,8 +80,10 @@ SILType SILBuilder::getPartialApplyResultType(SILType origTy, unsigned argCount,
   }
 
   auto appliedFnType = SILFunctionType::get(nullptr, extInfo,
+                                            FTI->getCoroutineKind(),
                                             calleeConvention,
                                             newParams,
+                                            FTI->getYields(),
                                             results,
                                             FTI->getOptionalErrorResult(),
                                             M.getASTContext());
@@ -90,9 +93,9 @@ SILType SILBuilder::getPartialApplyResultType(SILType origTy, unsigned argCount,
 
 // If legal, create an unchecked_ref_cast from the given operand and result
 // type, otherwise return null.
-SILInstruction *SILBuilder::tryCreateUncheckedRefCast(SILLocation Loc,
-                                                      SILValue Op,
-                                                      SILType ResultTy) {
+SingleValueInstruction *
+SILBuilder::tryCreateUncheckedRefCast(SILLocation Loc, SILValue Op,
+                                      SILType ResultTy) {
   if (!SILType::canRefCast(Op->getType(), ResultTy, getModule()))
     return nullptr;
 
@@ -101,9 +104,8 @@ SILInstruction *SILBuilder::tryCreateUncheckedRefCast(SILLocation Loc,
 }
 
 // Create the appropriate cast instruction based on result type.
-SILInstruction *SILBuilder::createUncheckedBitCast(SILLocation Loc,
-                                                   SILValue Op,
-                                                   SILType Ty) {
+SingleValueInstruction *
+SILBuilder::createUncheckedBitCast(SILLocation Loc, SILValue Op, SILType Ty) {
   if (Ty.isTrivial(getModule()))
     return insert(UncheckedTrivialBitCastInst::create(
         getSILDebugLocation(Loc), Op, Ty, getFunction(), OpenedArchetypes));
@@ -410,23 +412,35 @@ void SILBuilder::addOpenedArchetypeOperands(SILInstruction *I) {
   if (I && I->getNumTypeDependentOperands() > 0)
     return;
 
+  // Keep track of already visited instructions to avoid infinite loops.
+  SmallPtrSet<SILInstruction *, 8> Visited;
+
   while (I && I->getNumOperands() == 1 &&
          I->getNumTypeDependentOperands() == 0) {
-    I = dyn_cast<SILInstruction>(I->getOperand(0));
-    if (!I)
+    // All the open instructions are single-value instructions.
+    auto SVI = dyn_cast<SingleValueInstruction>(I->getOperand(0));
+    // Within SimplifyCFG this function may be called for an instruction
+    // within unreachable code. And within an unreachable block it can happen
+    // that defs do not dominate uses (because there is no dominance defined).
+    // To avoid the infinite loop when following the chain of instructions via
+    // their operands, bail if the operand is not an instruction or this
+    // instruction was seen already.
+    if (!SVI || !Visited.insert(SVI).second)
       return;
     // If it is a definition of an opened archetype,
     // register it and exit.
-    auto Archetype = getOpenedArchetypeOf(I);
-    if (!Archetype)
+    auto Archetype = getOpenedArchetypeOf(SVI);
+    if (!Archetype) {
+      I = SVI;
       continue;
+    }
     auto Def = OpenedArchetypes.getOpenedArchetypeDef(Archetype);
     // Return if it is a known open archetype.
     if (Def)
       return;
     // Otherwise register it and return.
     if (OpenedArchetypesTracker)
-      OpenedArchetypesTracker->addOpenedArchetypeDef(Archetype, I);
+      OpenedArchetypesTracker->addOpenedArchetypeDef(Archetype, SVI);
     return;
   }
 
@@ -445,4 +459,53 @@ ValueMetatypeInst *SILBuilder::createValueMetatype(SILLocation Loc,
       "type");
   return insert(new (getModule()) ValueMetatypeInst(getSILDebugLocation(Loc),
                                                       MetatypeTy, Base));
+}
+
+// TODO: This should really be an operation on type lowering.
+void SILBuilder::emitShallowDestructureValueOperation(
+    SILLocation Loc, SILValue V, llvm::SmallVectorImpl<SILValue> &Results) {
+  // Once destructure is allowed everywhere, remove the projection code.
+
+  // If we do not have a tuple or a struct, add to our results list and return.
+  SILType Ty = V->getType();
+  if (!(Ty.is<TupleType>() || Ty.getStructOrBoundGenericStruct())) {
+    Results.emplace_back(V);
+    return;
+  }
+
+  // Otherwise, we want to destructure add the destructure and return.
+  if (getFunction().hasQualifiedOwnership()) {
+    auto *DI = emitDestructureValueOperation(Loc, V);
+    copy(DI->getResults(), std::back_inserter(Results));
+    return;
+  }
+
+  // In non qualified ownership SIL, drop back to using projection code.
+  llvm::SmallVector<Projection, 16> Projections;
+  Projection::getFirstLevelProjections(V->getType(), getModule(), Projections);
+  transform(Projections, std::back_inserter(Results),
+            [&](const Projection &P) -> SILValue {
+              return P.createObjectProjection(*this, Loc, V).get();
+            });
+}
+
+// TODO: Can we put this on type lowering? It would take a little bit of work
+// since we would need to be able to handle aggregate trivial types which is not
+// represented today in TypeLowering.
+void SILBuilder::emitShallowDestructureAddressOperation(
+    SILLocation Loc, SILValue V, llvm::SmallVectorImpl<SILValue> &Results) {
+
+  // If we do not have a tuple or a struct, add to our results list.
+  SILType Ty = V->getType();
+  if (!(Ty.is<TupleType>() || Ty.getStructOrBoundGenericStruct())) {
+    Results.emplace_back(V);
+    return;
+  }
+
+  llvm::SmallVector<Projection, 16> Projections;
+  Projection::getFirstLevelProjections(V->getType(), getModule(), Projections);
+  transform(Projections, std::back_inserter(Results),
+            [&](const Projection &P) -> SILValue {
+              return P.createAddressProjection(*this, Loc, V).get();
+            });
 }

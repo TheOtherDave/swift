@@ -36,16 +36,31 @@ Action(llvm::cl::desc("kind:"), llvm::cl::init(RefactoringKind::None),
                       "fill-stub", "Perform fill protocol stub refactoring"),
            clEnumValN(RefactoringKind::ExpandDefault,
                       "expand-default", "Perform expand default statement refactoring"),
+           clEnumValN(RefactoringKind::ExpandSwitchCases,
+                      "expand-switch-cases", "Perform switch cases expand refactoring"),
            clEnumValN(RefactoringKind::LocalizeString,
                       "localize-string", "Perform string localization refactoring"),
+           clEnumValN(RefactoringKind::CollapseNestedIfExpr,
+                      "collapse-nested-if", "Perform collapse nested if statements"),
+           clEnumValN(RefactoringKind::ConvertToDoCatch,
+                      "convert-to-do-catch", "Perform force try to do try catch refactoring"),
+           clEnumValN(RefactoringKind::SimplifyNumberLiteral,
+                      "simplify-long-number", "Perform simplify long number literal refactoring"),
+           clEnumValN(RefactoringKind::ConvertStringsConcatenationToInterpolation,
+                      "strings-concatenation-to-interpolation", "Perform strings concatenation to interpolation refactoring"),
            clEnumValN(RefactoringKind::ExtractFunction,
                       "extract-function", "Perform extract function refactoring"),
+           clEnumValN(RefactoringKind::MoveMembersToExtension,
+                      "move-to-extension", "Move selected members to an extension"),
            clEnumValN(RefactoringKind::GlobalRename,
                       "syntactic-rename", "Perform syntactic rename"),
            clEnumValN(RefactoringKind::FindGlobalRenameRanges,
                       "find-rename-ranges", "Find detailed ranges for syntactic rename"),
            clEnumValN(RefactoringKind::FindLocalRenameRanges,
-                      "find-local-rename-ranges", "Find detailed ranges for local rename")));
+                      "find-local-rename-ranges", "Find detailed ranges for local rename"),
+           clEnumValN(RefactoringKind::TrailingClosure,
+                      "trailingclosure", "Perform trailing closure refactoring")));
+
 
 static llvm::cl::opt<std::string>
 ModuleName("module-name", llvm::cl::desc("The module name of the given test."),
@@ -216,6 +231,7 @@ int main(int argc, char *argv[]) {
     reinterpret_cast<void *>(&anchorForGetMainExecutable)));
   Invocation.addInputFilename(options::SourceFilename);
   Invocation.getLangOptions().AttachCommentsToDecls = true;
+  Invocation.getLangOptions().KeepSyntaxInfoInSourceFile = true;
 
   for (auto FileName : options::InputFilenames)
     Invocation.addInputFilename(FileName);
@@ -230,7 +246,7 @@ int main(int argc, char *argv[]) {
   switch (options::Action) {
     case RefactoringKind::GlobalRename:
     case RefactoringKind::FindGlobalRenameRanges:
-      CI.performParseOnly();
+      CI.performParseOnly(/*EvaluateConditionals*/true);
       break;
     default:
       CI.performSema();

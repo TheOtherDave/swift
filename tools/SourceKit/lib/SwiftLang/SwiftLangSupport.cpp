@@ -421,6 +421,8 @@ UIdent SwiftLangSupport::getUIDForSyntaxStructureKind(
       return KindExprDictionary;
     case SyntaxStructureKind::ObjectLiteralExpression:
       return KindExprObjectLiteral;
+    case SyntaxStructureKind::TupleExpression:
+      return KindExprTuple;
     case SyntaxStructureKind::Argument:
       return KindExprArg;
   }
@@ -449,6 +451,8 @@ getUIDForRangeKind(swift::ide::RangeKind Kind) {
     case swift::ide::RangeKind::SingleStatement: return KindRangeSingleStatement;
     case swift::ide::RangeKind::SingleDecl: return KindRangeSingleDeclaration;
     case swift::ide::RangeKind::MultiStatement: return KindRangeMultiStatement;
+    case swift::ide::RangeKind::MultiTypeMemberDecl:
+      return KindRangeMultiTypeMemberDeclaration;
     case swift::ide::RangeKind::PartOfExpression: return KindRangeInvalid;
     case swift::ide::RangeKind::Invalid: return KindRangeInvalid;
   }
@@ -478,6 +482,8 @@ getUIDForRefactoringRangeKind(ide::RefactoringRangeKind Kind) {
     return KindRenameRangeKeywordBase;
   case ide::RefactoringRangeKind::ParameterName:
     return KindRenameRangeParam;
+  case ide::RefactoringRangeKind::NoncollapsibleParameterName:
+    return KindRenameRangeNoncollapsibleParam;
   case ide::RefactoringRangeKind::DeclArgumentLabel:
     return KindRenameRangeDeclArgLabel;
   case ide::RefactoringRangeKind::CallArgumentLabel:
@@ -591,77 +597,108 @@ swift::ide::NameKind SwiftLangSupport::getNameKindForUID(SourceKit::UIdent Id) {
   return swift::ide::NameKind::Swift;
 }
 
-std::vector<UIdent> SwiftLangSupport::UIDsFromDeclAttributes(const DeclAttributes &Attrs) {
-  std::vector<UIdent> AttrUIDs;
-
-#define ATTR(X) \
-  if (Attrs.has(AK_##X)) { \
-    static UIdent Attr_##X("source.decl.attribute."#X); \
-    AttrUIDs.push_back(Attr_##X); \
-  }
-#include "swift/AST/Attr.def"
-
-  for (auto Attr : Attrs) {
-    // Check special-case names first.
-    switch (Attr->getKind()) {
+Optional<UIdent> SwiftLangSupport::getUIDForDeclAttribute(const swift::DeclAttribute *Attr) {
+  // Check special-case names first.
+  switch (Attr->getKind()) {
     case DAK_IBAction: {
       static UIdent Attr_IBAction("source.decl.attribute.ibaction");
-      AttrUIDs.push_back(Attr_IBAction);
-      continue;
+      return Attr_IBAction;
     }
     case DAK_IBOutlet: {
       static UIdent Attr_IBOutlet("source.decl.attribute.iboutlet");
-      AttrUIDs.push_back(Attr_IBOutlet);
-      continue;
+      return Attr_IBOutlet;
     }
     case DAK_IBDesignable: {
       static UIdent Attr_IBDesignable("source.decl.attribute.ibdesignable");
-      AttrUIDs.push_back(Attr_IBDesignable);
-      continue;
+      return Attr_IBDesignable;
     }
     case DAK_IBInspectable: {
       static UIdent Attr_IBInspectable("source.decl.attribute.ibinspectable");
-      AttrUIDs.push_back(Attr_IBInspectable);
-      continue;
+      return Attr_IBInspectable;
     }
     case DAK_GKInspectable: {
       static UIdent Attr_GKInspectable("source.decl.attribute.gkinspectable");
-      AttrUIDs.push_back(Attr_GKInspectable);
-      continue;
+      return Attr_GKInspectable;
     }
     case DAK_ObjC: {
       static UIdent Attr_Objc("source.decl.attribute.objc");
       static UIdent Attr_ObjcNamed("source.decl.attribute.objc.name");
       if (cast<ObjCAttr>(Attr)->hasName()) {
-        AttrUIDs.push_back(Attr_ObjcNamed);
+        return Attr_ObjcNamed;
       } else {
-        AttrUIDs.push_back(Attr_Objc);
+        return Attr_Objc;
       }
-      continue;
+    }
+    case DAK_AccessControl: {
+      static UIdent Attr_Private("source.decl.attribute.private");
+      static UIdent Attr_FilePrivate("source.decl.attribute.fileprivate");
+      static UIdent Attr_Internal("source.decl.attribute.internal");
+      static UIdent Attr_Public("source.decl.attribute.public");
+      static UIdent Attr_Open("source.decl.attribute.open");
+
+      switch (cast<AbstractAccessControlAttr>(Attr)->getAccess()) {
+        case AccessLevel::Private:
+          return Attr_Private;
+        case AccessLevel::FilePrivate:
+          return Attr_FilePrivate;
+        case AccessLevel::Internal:
+          return Attr_Internal;
+        case AccessLevel::Public:
+          return Attr_Public;
+        case AccessLevel::Open:
+          return Attr_Open;
+      }
+    }
+    case DAK_SetterAccess: {
+      static UIdent Attr_Private("source.decl.attribute.setter_access.private");
+      static UIdent Attr_FilePrivate("source.decl.attribute.setter_access.fileprivate");
+      static UIdent Attr_Internal("source.decl.attribute.setter_access.internal");
+      static UIdent Attr_Public("source.decl.attribute.setter_access.public");
+      static UIdent Attr_Open("source.decl.attribute.setter_access.open");
+
+      switch (cast<AbstractAccessControlAttr>(Attr)->getAccess()) {
+        case AccessLevel::Private:
+          return Attr_Private;
+        case AccessLevel::FilePrivate:
+          return Attr_FilePrivate;
+        case AccessLevel::Internal:
+          return Attr_Internal;
+        case AccessLevel::Public:
+          return Attr_Public;
+        case AccessLevel::Open:
+          return Attr_Open;
+      }
     }
 
-    // We handle access control explicitly.
-    case DAK_AccessControl:
-    case DAK_SetterAccess:
     // Ignore these.
     case DAK_ShowInInterface:
     case DAK_RawDocComment:
     case DAK_DowngradeExhaustivityCheck:
-      continue;
+      return None;
     default:
       break;
-    }
+  }
 
-    switch (Attr->getKind()) {
+  switch (Attr->getKind()) {
     case DAK_Count:
       break;
 #define DECL_ATTR(X, CLASS, ...)\
     case DAK_##CLASS: {\
       static UIdent Attr_##X("source.decl.attribute."#X); \
-      AttrUIDs.push_back(Attr_##X); \
-      break;\
+      return Attr_##X; \
     }
 #include "swift/AST/Attr.def"
+  }
+
+  return None;
+}
+
+std::vector<UIdent> SwiftLangSupport::UIDsFromDeclAttributes(const DeclAttributes &Attrs) {
+  std::vector<UIdent> AttrUIDs;
+
+  for (auto Attr : Attrs) {
+    if (auto AttrUID = getUIDForDeclAttribute(Attr)) {
+      AttrUIDs.push_back(AttrUID.getValue());
     }
   }
 
@@ -717,6 +754,14 @@ std::string SwiftLangSupport::resolvePathSymlinks(StringRef FilePath) {
       fileHandle, full_path, sizeof(full_path), FILE_NAME_NORMALIZED);
   return (success ? full_path : InputPath);
 #endif
+}
+
+void SwiftLangSupport::getStatistics(StatisticsReceiver receiver) {
+  std::vector<Statistic *> stats = {
+#define SWIFT_STATISTIC(VAR, UID, DESC) &Stats.VAR,
+#include "SwiftStatistics.def"
+  };
+  receiver(stats);
 }
 
 CloseClangModuleFiles::~CloseClangModuleFiles() {

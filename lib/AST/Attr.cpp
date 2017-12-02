@@ -340,6 +340,7 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
   case DAK_AccessControl:
   case DAK_Ownership:
   case DAK_Effects:
+  case DAK_Optimize:
     if (DeclAttribute::isDeclModifier(getKind())) {
       Printer.printKeyword(getAttrName());
     } else {
@@ -577,6 +578,18 @@ StringRef DeclAttribute::getAttrName() const {
     }
     llvm_unreachable("Invalid inline kind");
   }
+  case DAK_Optimize: {
+    switch (cast<OptimizeAttr>(this)->getMode()) {
+    case OptimizationMode::NoOptimization:
+      return "_optimize(none)";
+    case OptimizationMode::ForSpeed:
+      return "_optimize(speed)";
+    case OptimizationMode::ForSize:
+      return "_optimize(size)";
+    default:
+      llvm_unreachable("Invalid optimization kind");
+    }
+  }
   case DAK_Effects:
     switch (cast<EffectsAttr>(this)->getKind()) {
       case EffectsKind::ReadNone:
@@ -671,7 +684,7 @@ ObjCAttr *ObjCAttr::createNullary(ASTContext &Ctx, SourceLoc AtLoc,
                                   SourceLoc NameLoc, Identifier Name,
                                   SourceLoc RParenLoc) {
   void *mem = Ctx.Allocate(totalSizeToAlloc<SourceLoc>(3), alignof(ObjCAttr));
-  return new (mem) ObjCAttr(AtLoc, SourceRange(ObjCLoc),
+  return new (mem) ObjCAttr(AtLoc, SourceRange(ObjCLoc, RParenLoc),
                             ObjCSelector(Ctx, 0, Name),
                             SourceRange(LParenLoc, RParenLoc),
                             NameLoc);
@@ -690,7 +703,7 @@ ObjCAttr *ObjCAttr::createSelector(ASTContext &Ctx, SourceLoc AtLoc,
   assert(NameLocs.size() == Names.size());
   void *mem = Ctx.Allocate(totalSizeToAlloc<SourceLoc>(NameLocs.size() + 2),
                            alignof(ObjCAttr));
-  return new (mem) ObjCAttr(AtLoc, SourceRange(ObjCLoc),
+  return new (mem) ObjCAttr(AtLoc, SourceRange(ObjCLoc, RParenLoc),
                             ObjCSelector(Ctx, Names.size(), Names),
                             SourceRange(LParenLoc, RParenLoc),
                             NameLocs);

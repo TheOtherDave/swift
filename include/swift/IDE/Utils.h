@@ -19,7 +19,7 @@
 #include "swift/AST/DeclNameLoc.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ASTPrinter.h"
-#include "swift/AST/SourceEntityWalker.h"
+#include "swift/IDE/SourceEntityWalker.h"
 #include "swift/Parse/Token.h"
 #include "llvm/ADT/StringRef.h"
 #include <memory>
@@ -157,11 +157,12 @@ enum class CursorInfoKind {
 
 struct ResolvedCursorInfo {
   CursorInfoKind Kind = CursorInfoKind::Invalid;
+  SourceFile *SF;
+  SourceLoc Loc;
   ValueDecl *ValueD = nullptr;
   TypeDecl *CtorTyRef = nullptr;
   ExtensionDecl *ExtTyRef = nullptr;
   ModuleEntity Mod;
-  SourceLoc Loc;
   bool IsRef = true;
   bool IsKeywordArgument = false;
   Type Ty;
@@ -171,33 +172,36 @@ struct ResolvedCursorInfo {
   Expr *TrailingExpr = nullptr;
 
   ResolvedCursorInfo() = default;
-  ResolvedCursorInfo(ValueDecl *ValueD,
-                     TypeDecl *CtorTyRef,
-                     ExtensionDecl *ExtTyRef,
-                     SourceLoc Loc,
-                     bool IsRef,
-                     Type Ty,
-                     Type ContainerType) :
-                        Kind(CursorInfoKind::ValueRef),
-                        ValueD(ValueD),
-                        CtorTyRef(CtorTyRef),
-                        ExtTyRef(ExtTyRef),
-                        Loc(Loc),
-                        IsRef(IsRef),
-                        Ty(Ty),
-                        DC(ValueD->getDeclContext()),
-                        ContainerType(ContainerType) {}
-  ResolvedCursorInfo(ModuleEntity Mod,
-                     SourceLoc Loc) :
-                        Kind(CursorInfoKind::ModuleRef),
-                        Mod(Mod),
-                        Loc(Loc) { }
-  ResolvedCursorInfo(Stmt *TrailingStmt) :
-                        Kind(CursorInfoKind::StmtStart),
-                        TrailingStmt(TrailingStmt) {}
-  ResolvedCursorInfo(Expr* TrailingExpr) :
-                        Kind(CursorInfoKind::ExprStart),
-                        TrailingExpr(TrailingExpr) {}
+  ResolvedCursorInfo(SourceFile *SF) : SF(SF) {}
+  
+  void setValueRef(ValueDecl *ValueD,
+                   TypeDecl *CtorTyRef,
+                   ExtensionDecl *ExtTyRef,
+                   bool IsRef,
+                   Type Ty,
+                   Type ContainerType) {
+    Kind = CursorInfoKind::ValueRef;
+    this->ValueD = ValueD;
+    this->CtorTyRef = CtorTyRef;
+    this->ExtTyRef = ExtTyRef;
+    this->IsRef = IsRef;
+    this->Ty = Ty;
+    this->DC = ValueD->getDeclContext();
+    this->ContainerType = ContainerType;
+  }
+  void setModuleRef(ModuleEntity Mod) {
+    Kind = CursorInfoKind::ModuleRef;
+    this->Mod = Mod;
+  }
+  void setTrailingStmt(Stmt *TrailingStmt) {
+    Kind = CursorInfoKind::StmtStart;
+    this->TrailingStmt = TrailingStmt;
+  }
+  void setTrailingExpr(Expr* TrailingExpr) {
+    Kind = CursorInfoKind::ExprStart;
+    this->TrailingExpr = TrailingExpr;
+  }
+
   bool isValid() const { return !isInvalid(); }
   bool isInvalid() const { return Kind == CursorInfoKind::Invalid; }
 };
@@ -210,7 +214,8 @@ class CursorInfoResolver : public SourceEntityWalker {
   llvm::SmallVector<Expr*, 4> TrailingExprStack;
 
 public:
-  explicit CursorInfoResolver(SourceFile &SrcFile) : SrcFile(SrcFile) { }
+  explicit CursorInfoResolver(SourceFile &SrcFile) :
+    SrcFile(SrcFile), CursorInfo(&SrcFile) {}
   ResolvedCursorInfo resolve(SourceLoc Loc);
   SourceManager &getSourceMgr() const;
 private:
@@ -237,6 +242,7 @@ private:
   bool tryResolve(ModuleEntity Mod, SourceLoc Loc);
   bool tryResolve(Stmt *St);
   bool visitSubscriptReference(ValueDecl *D, CharSourceRange Range,
+                               Optional<AccessKind> AccKind,
                                bool IsOpenBracket) override;
 };
 
@@ -249,6 +255,7 @@ enum class LabelRangeType {
   None,
   CallArg,    // foo([a: ]2) or .foo([a: ]String)
   Param,  // func([a b]: Int)
+  NoncollapsibleParam, // subscript([a a]: Int)
   Selector,   // #selector(foo.func([a]:))
 };
 
@@ -311,7 +318,7 @@ public:
   std::vector<ResolvedLoc> resolve(ArrayRef<UnresolvedLoc> Locs, ArrayRef<Token> Tokens);
 };
 
-enum class RangeKind : int8_t{
+enum class RangeKind : int8_t {
   Invalid = -1,
   SingleExpression,
   SingleStatement,
@@ -319,6 +326,8 @@ enum class RangeKind : int8_t{
 
   MultiStatement,
   PartOfExpression,
+
+  MultiTypeMemberDecl,
 };
 
 struct DeclaredDecl {
@@ -492,14 +501,15 @@ enum class RegionType {
 };
 
 enum class RefactoringRangeKind {
-  BaseName,              // func [foo](a b: Int)
-  KeywordBaseName,       // [init](a: Int)
-  ParameterName,         // func foo(a [b]: Int)
-  DeclArgumentLabel,     // func foo([a] b: Int)
-  CallArgumentLabel,     // foo([a]: 1)
-  CallArgumentColon,     // foo(a[: ]1)
-  CallArgumentCombined,  // foo([]1) could expand to foo([a: ]1)
-  SelectorArgumentLabel, // foo([a]:)
+  BaseName,                    // func [foo](a b: Int)
+  KeywordBaseName,             // [init](a: Int)
+  ParameterName,               // func foo(a[ b]: Int)
+  NoncollapsibleParameterName, // subscript(a[ a]: Int)
+  DeclArgumentLabel,           // func foo([a] b: Int)
+  CallArgumentLabel,           // foo([a]: 1)
+  CallArgumentColon,           // foo(a[: ]1)
+  CallArgumentCombined,        // foo([]1) could expand to foo([a: ]1)
+  SelectorArgumentLabel,       // foo([a]:)
 };
 
 struct NoteRegion {
@@ -527,6 +537,42 @@ public:
   void accept(SourceManager &SM, SourceLoc Loc, StringRef Text, ArrayRef<NoteRegion> SubRegions = {});
   void insertAfter(SourceManager &SM, SourceLoc Loc, StringRef Text, ArrayRef<NoteRegion> SubRegions = {});
   void accept(SourceManager &SM, Replacement Replacement) { accept(SM, RegionType::ActiveCode, {Replacement}); }
+  void remove(SourceManager &SM, CharSourceRange Range);
+};
+
+/// This helper stream inserts text into a SourceLoc by calling functions in
+/// SourceEditorConsumer when it is destroyed.
+class EditorConsumerInsertStream: public raw_ostream {
+  SourceEditConsumer &Consumer;
+  SourceManager &SM;
+  CharSourceRange Range;
+  llvm::SmallString<64> Buffer;
+  llvm::raw_svector_ostream OS;
+
+public:
+  explicit EditorConsumerInsertStream(SourceEditConsumer &Consumer,
+                                      SourceManager &SM,
+                                      CharSourceRange Range):
+    Consumer(Consumer), SM(SM), Range(Range), Buffer(), OS(Buffer) {}
+
+  explicit EditorConsumerInsertStream(SourceEditConsumer &Consumer,
+                                      SourceManager &SM,
+                                      SourceLoc Loc):
+    EditorConsumerInsertStream(Consumer, SM, CharSourceRange(Loc, 0)) {}
+
+  ~EditorConsumerInsertStream() {
+    Consumer.accept(SM, Range, OS.str());
+  }
+
+  void write_impl(const char *ptr, size_t size) override {
+    OS.write(ptr, size);
+  }
+  uint64_t current_pos() const override {
+    return OS.tell();
+  }
+  size_t preferred_buffer_size() const override {
+    return 0;
+  }
 };
 
 class SourceEditJsonConsumer : public SourceEditConsumer {

@@ -22,8 +22,8 @@
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Types.h"
+#include "swift/ClangImporter/ClangImporter.h"
 #include "swift/Parse/Lexer.h"
-#include "swift/ClangImporter/ClangModule.h" // FIXME: SDK overlay semantics
 #include "llvm/Support/Debug.h"
 
 using namespace swift;
@@ -79,6 +79,7 @@ public:
   IGNORED_ATTR(FixedLayout)
   IGNORED_ATTR(Infix)
   IGNORED_ATTR(Inline)
+  IGNORED_ATTR(Optimize)
   IGNORED_ATTR(Inlineable)
   IGNORED_ATTR(NSApplicationMain)
   IGNORED_ATTR(NSCopying)
@@ -108,6 +109,7 @@ public:
   IGNORED_ATTR(Implements)
   IGNORED_ATTR(StaticInitializeObjCMetadata)
   IGNORED_ATTR(DowngradeExhaustivityCheck)
+  IGNORED_ATTR(ImplicitlyUnwrappedOptional)
 #undef IGNORED_ATTR
 
   // @noreturn has been replaced with a 'Never' return type.
@@ -278,7 +280,9 @@ void AttributeEarlyChecker::visitTransparentAttr(TransparentAttr *attr) {
   if (auto *VD = dyn_cast<VarDecl>(D)) {
     // Stored properties and variables can't be transparent.
     if (VD->hasStorage())
-      return diagnoseAndRemoveAttr(attr, diag::transparent_stored_property);
+      return diagnoseAndRemoveAttr(attr,
+                                   diag::attribute_invalid_on_stored_property,
+                                   attr->getAttrName());
   }
 }
 
@@ -826,6 +830,7 @@ public:
     IGNORED_ATTR(ObjCMembers)
     IGNORED_ATTR(StaticInitializeObjCMetadata)
     IGNORED_ATTR(DowngradeExhaustivityCheck)
+    IGNORED_ATTR(ImplicitlyUnwrappedOptional)
 #undef IGNORED_ATTR
 
   void visitAvailableAttr(AvailableAttr *attr);
@@ -864,7 +869,8 @@ public:
   void visitFixedLayoutAttr(FixedLayoutAttr *attr);
   void visitVersionedAttr(VersionedAttr *attr);
   void visitInlineableAttr(InlineableAttr *attr);
-  
+  void visitOptimizeAttr(OptimizeAttr *attr);
+
   void visitDiscardableResultAttr(DiscardableResultAttr *attr);
   void visitImplementsAttr(ImplementsAttr *attr);
 };
@@ -1327,19 +1333,7 @@ static bool isObjCClassExtensionInOverlay(DeclContext *dc) {
   if (!classDecl)
     return false;
 
-  // The class must be defined in Objective-C.
-  if (!classDecl->hasClangNode())
-    return false;
-
-  // Find the Clang module unit that stores the class.
-  auto classModuleUnit
-    = dyn_cast<ClangModuleUnit>(classDecl->getModuleScopeContext());
-  if (!classModuleUnit)
-    return false;
-
-  // Check whether the extension is in the overlay.
-  auto extModule = ext->getDeclContext()->getParentModule();
-  return extModule == classModuleUnit->getAdapterModule();
+  return isInOverlayModuleForImportedModule(ext, classDecl);
 }
 
 void AttributeChecker::visitRequiredAttr(RequiredAttr *attr) {
@@ -1675,7 +1669,6 @@ void AttributeChecker::visitSpecializeAttr(SpecializeAttr *attr) {
   DeclContext *DC = D->getDeclContext();
   auto *FD = cast<AbstractFunctionDecl>(D);
   auto *genericSig = FD->getGenericSignature();
-  auto *genericEnv = FD->getGenericEnvironment();
   auto *trailingWhereClause = attr->getTrailingWhereClause();
 
   if (!trailingWhereClause) {
@@ -1700,8 +1693,7 @@ void AttributeChecker::visitSpecializeAttr(SpecializeAttr *attr) {
   }
 
   // Form a new generic signature based on the old one.
-  GenericSignatureBuilder Builder(D->getASTContext(),
-                                  TypeChecker::LookUpConformance(TC, DC));
+  GenericSignatureBuilder Builder(D->getASTContext());
 
   // First, add the old generic signature.
   Builder.addGenericSignature(genericSig);
@@ -1728,9 +1720,9 @@ void AttributeChecker::visitSpecializeAttr(SpecializeAttr *attr) {
 
       // Map types to their interface types.
       if (firstType)
-        interfaceFirstType = genericEnv->mapTypeOutOfContext(firstType);
+        interfaceFirstType = firstType->mapTypeOutOfContext();
       if (secondType)
-        interfaceSecondType = genericEnv->mapTypeOutOfContext(secondType);
+        interfaceSecondType = secondType->mapTypeOutOfContext();
 
       collectUsedGenericParameters(interfaceFirstType,
                                    constrainedGenericParams);
@@ -1777,7 +1769,7 @@ void AttributeChecker::visitSpecializeAttr(SpecializeAttr *attr) {
 
       // Map types to their interface types.
       if (subjectType)
-        interfaceSubjectType = genericEnv->mapTypeOutOfContext(subjectType);
+        interfaceSubjectType = subjectType->mapTypeOutOfContext();
 
       collectUsedGenericParameters(interfaceSubjectType,
                                    constrainedGenericParams);
@@ -1816,7 +1808,7 @@ void AttributeChecker::visitSpecializeAttr(SpecializeAttr *attr) {
 
       // Map types to their interface types.
       if (subjectType)
-        interfaceSubjectType = genericEnv->mapTypeOutOfContext(subjectType);
+        interfaceSubjectType = subjectType->mapTypeOutOfContext();
 
       collectUsedGenericParameters(interfaceSubjectType,
                                    constrainedGenericParams);
@@ -1827,8 +1819,7 @@ void AttributeChecker::visitSpecializeAttr(SpecializeAttr *attr) {
         continue;
 
 
-      auto interfaceLayoutConstraint =
-          genericEnv->mapTypeOutOfContext(constraint);
+      auto interfaceLayoutConstraint = constraint->mapTypeOutOfContext();
 
       // Re-create a requirement using the resolved interface types.
       auto resolvedReq = RequirementRepr::getTypeConstraint(
@@ -1863,7 +1854,8 @@ void AttributeChecker::visitSpecializeAttr(SpecializeAttr *attr) {
     Builder.addRequirement(&req, DC->getParentModule());
 
   // Check the result.
-  (void)Builder.computeGenericSignature(attr->getLocation(),
+  (void)std::move(Builder).computeGenericSignature(
+                                        attr->getLocation(),
                                         /*allowConcreteGenericParams=*/true);
 }
 
@@ -1904,6 +1896,15 @@ void AttributeChecker::visitVersionedAttr(VersionedAttr *attr) {
     attr->setInvalid();
     return;
   }
+
+  // Symbols of dynamically-dispatched declarations are never referenced
+  // directly, so marking them as @_versioned does not make sense.
+  if (VD->isDynamic()) {
+    TC.diagnose(attr->getLocation(),
+                diag::versioned_dynamic_not_supported);
+    attr->setInvalid();
+    return;
+  }
 }
 
 void AttributeChecker::visitInlineableAttr(InlineableAttr *attr) {
@@ -1915,13 +1916,24 @@ void AttributeChecker::visitInlineableAttr(InlineableAttr *attr) {
   if (auto *VD = dyn_cast<VarDecl>(D)) {
     if (VD->hasStorage() || VD->getAttrs().hasAttribute<LazyAttr>()) {
       TC.diagnose(attr->getLocation(),
-                  diag::inlineable_stored_property)
+                  diag::attribute_invalid_on_stored_property,
+                  attr->getAttrName())
         .fixItRemove(attr->getRangeWithAt());
       attr->setInvalid();
+      return;
     }
   }
 
   auto *VD = cast<ValueDecl>(D);
+
+  // Calls to dynamically-dispatched declarations are never devirtualized,
+  // so marking them as @_inlinable does not make sense.
+  if (VD->isDynamic()) {
+    TC.diagnose(attr->getLocation(),
+                diag::inlineable_dynamic_not_supported);
+    attr->setInvalid();
+    return;
+  }
 
   // @_inlineable can only be applied to public or @_versioned
   // declarations.
@@ -1935,6 +1947,19 @@ void AttributeChecker::visitInlineableAttr(InlineableAttr *attr) {
         .fixItRemove(attr->getRangeWithAt());
     attr->setInvalid();
     return;
+  }
+}
+
+void AttributeChecker::visitOptimizeAttr(OptimizeAttr *attr) {
+  if (auto *VD = dyn_cast<VarDecl>(D)) {
+    if (VD->hasStorage()) {
+      TC.diagnose(attr->getLocation(),
+                  diag::attribute_invalid_on_stored_property,
+                  attr->getAttrName())
+      .fixItRemove(attr->getRangeWithAt());
+      attr->setInvalid();
+      return;
+    }
   }
 }
 
@@ -1954,8 +1979,7 @@ void AttributeChecker::visitDiscardableResultAttr(DiscardableResultAttr *attr) {
 
 void AttributeChecker::visitImplementsAttr(ImplementsAttr *attr) {
   TypeLoc &ProtoTypeLoc = attr->getProtocolType();
-  TypeResolutionOptions options;
-  options |= TR_AllowUnboundGenerics;
+  auto options = TypeResolutionFlags::AllowUnboundGenerics;
 
   DeclContext *DC = D->getDeclContext();
   Type T = TC.resolveType(ProtoTypeLoc.getTypeRepr(),
@@ -2016,6 +2040,10 @@ void TypeChecker::checkTypeModifyingDeclAttributes(VarDecl *var) {
 }
 
 void TypeChecker::checkOwnershipAttr(VarDecl *var, OwnershipAttr *attr) {
+  // Don't check ownership attribute if the declaration is already marked invalid.
+  if (var->isInvalid())
+    return;
+
   Type type = var->getType();
   Type interfaceType = var->getInterfaceType();
 
@@ -2062,6 +2090,20 @@ void TypeChecker::checkOwnershipAttr(VarDecl *var, OwnershipAttr *attr) {
     }
 
     diagnose(var->getStartLoc(), D, (unsigned) ownershipKind, underlyingType);
+    attr->setInvalid();
+  } else if (dyn_cast<ProtocolDecl>(var->getDeclContext())) {
+    // Ownership does not make sense in protocols.
+    if (Context.isSwiftVersionAtLeast(5))
+      diagnose(attr->getLocation(),
+        diag::ownership_invalid_in_protocols,
+        (unsigned) ownershipKind)
+        .fixItRemove(attr->getRange());
+    else
+      diagnose(attr->getLocation(),
+        diag::ownership_invalid_in_protocols_compat_warning,
+        (unsigned) ownershipKind)
+        .fixItRemove(attr->getRange());
+
     attr->setInvalid();
   }
 

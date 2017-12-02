@@ -54,11 +54,6 @@ FormalLinkage swift::getDeclLinkage(const ValueDecl *D) {
   case AccessLevel::Open:
     return FormalLinkage::PublicUnique;
   case AccessLevel::Internal:
-    // If we're serializing all function bodies, type metadata for internal
-    // types needs to be public too.
-    if (D->getDeclContext()->getParentModule()->getResilienceStrategy()
-        == ResilienceStrategy::Fragile)
-      return FormalLinkage::PublicUnique;
     return FormalLinkage::HiddenUnique;
   case AccessLevel::FilePrivate:
   case AccessLevel::Private:
@@ -68,23 +63,6 @@ FormalLinkage swift::getDeclLinkage(const ValueDecl *D) {
   }
 
   llvm_unreachable("Unhandled access level in switch.");
-}
-
-FormalLinkage swift::getTypeLinkage(CanType type) {
-  FormalLinkage result = FormalLinkage::Top;
-
-  // Merge all nominal types from the structural type.
-  (void) type.findIf([&](Type _type) {
-    CanType type = CanType(_type);
-
-    // For any nominal type reference, look at the type declaration.
-    if (auto nominal = type->getAnyNominal())
-      result ^= getDeclLinkage(nominal);
-
-    return false; // continue searching
-  });
-
-  return result;
 }
 
 SILLinkage swift::getSILLinkage(FormalLinkage linkage,
@@ -117,16 +95,12 @@ swift::getLinkageForProtocolConformance(const NormalProtocolConformance *C,
   if (C->isBehaviorConformance())
     return (definition ? SILLinkage::Private : SILLinkage::PrivateExternal);
 
-  ModuleDecl *conformanceModule = C->getDeclContext()->getParentModule();
-
   // If the conformance was synthesized by the ClangImporter, give it
   // shared linkage.
-  auto typeDecl = C->getType()->getNominalOrBoundGenericNominal();
-  auto typeUnit = typeDecl->getModuleScopeContext();
-  if (isa<ClangModuleUnit>(typeUnit)
-      && conformanceModule == typeUnit->getParentModule())
+  if (isa<ClangModuleUnit>(C->getDeclContext()->getModuleScopeContext()))
     return SILLinkage::Shared;
 
+  auto typeDecl = C->getType()->getNominalOrBoundGenericNominal();
   AccessLevel access = std::min(C->getProtocol()->getEffectiveAccess(),
                                 typeDecl->getEffectiveAccess());
   switch (access) {

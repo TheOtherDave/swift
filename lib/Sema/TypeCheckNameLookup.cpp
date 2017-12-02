@@ -106,9 +106,9 @@ namespace {
       ConformanceCheckOptions conformanceOptions;
       if (Options.contains(NameLookupFlags::KnownPrivate))
         conformanceOptions |= ConformanceCheckFlags::InExpression;
+      conformanceOptions |= ConformanceCheckFlags::SkipConditionalRequirements;
 
       DeclContext *foundDC = found->getDeclContext();
-      auto foundProto = foundDC->getAsProtocolOrProtocolExtensionContext();
 
       auto addResult = [&](ValueDecl *result) {
         if (Known.insert({{result, baseDC}, false}).second) {
@@ -122,6 +122,7 @@ namespace {
       if (!Options.contains(NameLookupFlags::ProtocolMembers) ||
           !isa<ProtocolDecl>(foundDC) ||
           isa<GenericTypeParamDecl>(found) ||
+          isa<TypeAliasDecl>(found) ||
           (isa<FuncDecl>(found) && cast<FuncDecl>(found)->isOperator())) {
         addResult(found);
         return;
@@ -145,13 +146,20 @@ namespace {
       // pull out the superclass instead, and use that below.
       if (foundInType->isExistentialType()) {
         auto layout = foundInType->getExistentialLayout();
-        if (layout.superclass)
+        if (layout.superclass) {
           conformingType = layout.superclass;
+        } else {
+          // Non-subclass existential: don't need to look for further
+          // conformance or witness.
+          addResult(found);
+          return;
+        }
       }
 
       // Dig out the protocol conformance.
+      auto *foundProto = cast<ProtocolDecl>(foundDC);
       auto conformance = TC.conformsToProtocol(conformingType, foundProto, DC,
-                                                 conformanceOptions);
+                                               conformanceOptions);
       if (!conformance) {
         // If there's no conformance, we have an existential
         // and we found a member from one of the protocols, and
@@ -387,7 +395,10 @@ LookupTypeResult TypeChecker::lookupMemberType(DeclContext *dc,
         }
       }
 
-      if (isa<TypeAliasDecl>(typeDecl)) {
+      // FIXME: This is a hack, we should be able to remove this entire 'if'
+      // statement once we learn how to deal with the circularity here.
+      if (isa<TypeAliasDecl>(typeDecl) &&
+          isa<ProtocolDecl>(typeDecl->getDeclContext())) {
         if (!type->is<ArchetypeType>() &&
             !type->isTypeParameter() &&
             memberType->hasTypeParameter() &&
@@ -420,6 +431,7 @@ LookupTypeResult TypeChecker::lookupMemberType(DeclContext *dc,
     ConformanceCheckOptions conformanceOptions;
     if (options.contains(NameLookupFlags::KnownPrivate))
       conformanceOptions |= ConformanceCheckFlags::InExpression;
+    conformanceOptions |= ConformanceCheckFlags::SkipConditionalRequirements;
 
     for (AssociatedTypeDecl *assocType : inferredAssociatedTypes) {
       // If the type does not actually conform to the protocol, skip this

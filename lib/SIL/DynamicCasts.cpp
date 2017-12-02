@@ -151,6 +151,11 @@ classifyDynamicCastToProtocol(CanType source,
     return DynamicCastFeasibility::WillFail;
   }
 
+  // AnyHashable is a special case: although it's a struct, there maybe another
+  // type conforming to it and to the TargetProtocol at the same time.
+  if (SourceNominalTy == SourceNominalTy->getASTContext().getAnyHashableDecl())
+    return DynamicCastFeasibility::MaySucceed;
+
   // If we are in a whole-module compilation and
   // if the source type is internal or target protocol is internal,
   // then conformances cannot be changed at run-time, because only this
@@ -213,7 +218,7 @@ bool swift::isObjectiveCBridgeable(ModuleDecl *M, CanType Ty) {
   if (bridgedProto) {
     // Find the conformance of the value type to _BridgedToObjectiveC.
     // Check whether the type conforms to _BridgedToObjectiveC.
-    auto conformance = M->lookupConformance(Ty, bridgedProto, nullptr);
+    auto conformance = M->lookupConformance(Ty, bridgedProto);
     return conformance.hasValue();
   }
   return false;
@@ -228,7 +233,7 @@ bool swift::isError(ModuleDecl *M, CanType Ty) {
   if (errorTypeProto) {
     // Find the conformance of the value type to Error.
     // Check whether the type conforms to Error.
-    auto conformance = M->lookupConformance(Ty, errorTypeProto, nullptr);
+    auto conformance = M->lookupConformance(Ty, errorTypeProto);
     return conformance.hasValue();
   }
   return false;
@@ -1175,14 +1180,12 @@ bool swift::canUseScalarCheckedCastInstructions(SILModule &M,
 
 /// Carry out the operations required for an indirect conditional cast
 /// using a scalar cast operation.
-void swift::
-emitIndirectConditionalCastWithScalar(SILBuilder &B, ModuleDecl *M,
-                                      SILLocation loc,
-                                      CastConsumptionKind consumption,
-                                      SILValue src, CanType sourceType,
-                                      SILValue dest, CanType targetType,
-                                      SILBasicBlock *indirectSuccBB,
-                                      SILBasicBlock *indirectFailBB) {
+void swift::emitIndirectConditionalCastWithScalar(
+    SILBuilder &B, ModuleDecl *M, SILLocation loc,
+    CastConsumptionKind consumption, SILValue src, CanType sourceType,
+    SILValue dest, CanType targetType, SILBasicBlock *indirectSuccBB,
+    SILBasicBlock *indirectFailBB, ProfileCounter TrueCount,
+    ProfileCounter FalseCount) {
   assert(canUseScalarCheckedCastInstructions(B.getModule(),
                                              sourceType, targetType));
 
@@ -1207,7 +1210,7 @@ emitIndirectConditionalCastWithScalar(SILBuilder &B, ModuleDecl *M,
 
   SILType targetValueType = dest->getType().getObjectType();
   B.createCheckedCastBranch(loc, /*exact*/ false, srcValue, targetValueType,
-                            scalarSuccBB, scalarFailBB);
+                            scalarSuccBB, scalarFailBB, TrueCount, FalseCount);
 
   // Emit the success block.
   B.setInsertionPoint(scalarSuccBB); {

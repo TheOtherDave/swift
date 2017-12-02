@@ -30,6 +30,13 @@
 // CHECK:         object {{.*}} ({{[^,]*}}, [tail_elems] {{[^,]*}}, {{[^,]*}})
 // CHECK-NEXT:  }
 
+// CHECK-LABEL: outlined variable #0 of returnStaticStringArray()
+// CHECK-NEXT:  sil_global private @{{.*}}returnStaticStringArray{{.*}} = {
+// CHECK-DAG:     string_literal utf8 "a"
+// CHECK-DAG:     string_literal utf8 "b"
+// CHECK:         object {{.*}} ({{[^,]*}}, [tail_elems] {{[^,]*}}, {{[^,]*}})
+// CHECK-NEXT:  }
+
 // CHECK-LABEL: outlined variable #0 of passArray()
 // CHECK-NEXT:  sil_global private @{{.*}}passArray{{.*}} = {
 // CHECK-DAG:     integer_literal $Builtin.Int{{[0-9]+}}, 27
@@ -80,6 +87,14 @@ public func returnArray() -> [Int] {
   return [20, 21]
 }
 
+// CHECK-LABEL: sil {{.*}}returnStaticStringArray{{.*}} : $@convention(thin) () -> @owned Array<StaticString> {
+// CHECK:   global_value @{{.*}}returnStaticStringArray{{.*}}
+// CHECK:   return
+@inline(never)
+public func returnStaticStringArray() -> [StaticString] {
+  return ["a", "b"]
+}
+
 public var gg: [Int]?
 
 @inline(never)
@@ -117,12 +132,23 @@ func overwriteLiteral(_ x: Int) -> [Int] {
   return a
 }
 
+struct Empty { }
+
+// CHECK-LABEL: sil {{.*}}arrayWithEmptyElements{{.*}} : $@convention(thin) () -> @owned Array<Empty> {
+func arrayWithEmptyElements() -> [Empty] {
+  // CHECK:    global_value @{{.*}}arrayWithEmptyElements{{.*}}
+  // CHECK:    return
+  return [Empty()]
+}
+
 // CHECK-OUTPUT:      [100, 101, 102]
 print(globalVariable)
 // CHECK-OUTPUT-NEXT: 11
 print(arrayLookup(1))
 // CHECK-OUTPUT-NEXT: [20, 21]
 print(returnArray())
+// CHECK-OUTPUT-NEXT: ["a", "b"]
+print(returnStaticStringArray())
 passArray()
 // CHECK-OUTPUT-NEXT: [29]
 print(gg!)

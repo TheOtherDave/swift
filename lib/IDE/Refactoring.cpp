@@ -12,6 +12,7 @@
 
 #include "swift/IDE/Refactoring.h"
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/ASTPrinter.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticsRefactoring.h"
 #include "swift/AST/Expr.h"
@@ -39,22 +40,28 @@ class ContextFinder : public SourceEntityWalker {
   SourceFile &SF;
   ASTContext &Ctx;
   SourceManager &SM;
-  ASTNode Target;
+  SourceRange Target;
   llvm::function_ref<bool(ASTNode)> IsContext;
   SmallVector<ASTNode, 4> AllContexts;
   bool contains(ASTNode Enclosing) {
-    auto Result = SM.rangeContains(Enclosing.getSourceRange(),
-                                   Target.getSourceRange());
+    auto Result = SM.rangeContains(Enclosing.getSourceRange(), Target);
     if (Result && IsContext(Enclosing))
       AllContexts.push_back(Enclosing);
     return Result;
   }
 public:
-  ContextFinder(SourceFile &SF, ASTNode Target,
+  ContextFinder(SourceFile &SF, ASTNode TargetNode,
                 llvm::function_ref<bool(ASTNode)> IsContext =
-                  [](ASTNode N) { return true; }) : SF(SF),
-                  Ctx(SF.getASTContext()), SM(Ctx.SourceMgr), Target(Target),
-                  IsContext(IsContext) {}
+                  [](ASTNode N) { return true; }) :
+                  SF(SF), Ctx(SF.getASTContext()), SM(Ctx.SourceMgr),
+                  Target(TargetNode.getSourceRange()), IsContext(IsContext) {}
+  ContextFinder(SourceFile &SF, SourceLoc TargetLoc,
+                llvm::function_ref<bool(ASTNode)> IsContext =
+                  [](ASTNode N) { return true; }) :
+                  SF(SF), Ctx(SF.getASTContext()), SM(Ctx.SourceMgr),
+                  Target(TargetLoc), IsContext(IsContext) {
+                    assert(TargetLoc.isValid() && "Invalid loc to find");
+                  }
   bool walkToDeclPre(Decl *D, CharSourceRange Range) override { return contains(D); }
   bool walkToStmtPre(Stmt *S) override { return contains(S); }
   bool walkToExprPre(Expr *E) override { return contains(E); }
@@ -111,8 +118,7 @@ public:
     size_t Index = 0;
     for (const auto &LabelRange : LabelRanges) {
       assert(LabelRange.isValid());
-
-      if (!labelRangeMatches(LabelRange, OldLabels[Index]))
+      if (!labelRangeMatches(LabelRange, RangeType, OldLabels[Index]))
         return true;
       splitAndRenameLabel(LabelRange, RangeType, Index++);
     }
@@ -128,7 +134,9 @@ private:
     case LabelRangeType::CallArg:
       return splitAndRenameCallArg(Range, NameIndex);
     case LabelRangeType::Param:
-      return splitAndRenameParamLabel(Range, NameIndex);
+      return splitAndRenameParamLabel(Range, NameIndex, /*IsCollapsible=*/true);
+    case LabelRangeType::NoncollapsibleParam:
+      return splitAndRenameParamLabel(Range, NameIndex, /*IsCollapsible=*/false);
     case LabelRangeType::Selector:
       return doRenameLabel(
           Range, RefactoringRangeKind::SelectorArgumentLabel, NameIndex);
@@ -137,28 +145,47 @@ private:
     }
   }
 
-  void splitAndRenameParamLabel(CharSourceRange Range, size_t NameIndex) {
+  void splitAndRenameParamLabel(CharSourceRange Range, size_t NameIndex, bool IsCollapsible) {
     // Split parameter range foo([a b]: Int) into decl argument label [a] and
-    // parameter name [b].  If we have only foo([a]: Int), then we add an empty
-    // range for the local name.
+    // parameter name [b] or noncollapsible parameter name [b] if IsCollapsible
+    // is false (as for subscript decls). If we have only foo([a]: Int), then we
+    // add an empty range for the local name, or for the decl argument label if
+    // IsCollapsible is false.
     StringRef Content = Range.str();
     size_t ExternalNameEnd = Content.find_first_of(" \t\n\v\f\r/");
-    ExternalNameEnd =
-        ExternalNameEnd == StringRef::npos ? Content.size() : ExternalNameEnd;
 
-    CharSourceRange Ext{Range.getStart(), unsigned(ExternalNameEnd)};
-    doRenameLabel(Ext, RefactoringRangeKind::DeclArgumentLabel, NameIndex);
+    if (ExternalNameEnd == StringRef::npos) { // foo([a]: Int)
+      if (IsCollapsible) {
+        doRenameLabel(Range, RefactoringRangeKind::DeclArgumentLabel, NameIndex);
+        doRenameLabel(CharSourceRange{Range.getEnd(), 0},
+                      RefactoringRangeKind::ParameterName, NameIndex);
+      } else {
+        doRenameLabel(CharSourceRange{Range.getStart(), 0},
+                      RefactoringRangeKind::DeclArgumentLabel, NameIndex);
+        doRenameLabel(Range, RefactoringRangeKind::NoncollapsibleParameterName,
+                      NameIndex);
+      }
+    } else { // foo([a b]: Int)
+      CharSourceRange Ext{Range.getStart(), unsigned(ExternalNameEnd)};
 
-    size_t LocalNameStart = Content.find_last_of(" \t\n\v\f\r/");
-    LocalNameStart =
-        LocalNameStart == StringRef::npos ? ExternalNameEnd : LocalNameStart;
-    // Note: we consider the leading whitespace part of the parameter name since
-    // when the parameter is removed we want to remove the whitespace too.
-    // FIXME: handle comments foo(a /*...*/b: Int).
-    auto LocalLoc = Range.getStart().getAdvancedLocOrInvalid(LocalNameStart);
-    assert(LocalLoc.isValid());
-    CharSourceRange Local{LocalLoc, unsigned(Content.size() - LocalNameStart)};
-    doRenameLabel(Local, RefactoringRangeKind::ParameterName, NameIndex);
+      // Note: we consider the leading whitespace part of the parameter name
+      // if the parameter is collapsible, since if the parameter is collapsed
+      // into a matching argument label, we want to remove the whitespace too.
+      // FIXME: handle comments foo(a /*...*/b: Int).
+      size_t LocalNameStart = Content.find_last_of(" \t\n\v\f\r/");
+      assert(LocalNameStart != StringRef::npos);
+      if (!IsCollapsible)
+        ++LocalNameStart;
+      auto LocalLoc = Range.getStart().getAdvancedLocOrInvalid(LocalNameStart);
+      CharSourceRange Local{LocalLoc, unsigned(Content.size() - LocalNameStart)};
+
+      doRenameLabel(Ext, RefactoringRangeKind::DeclArgumentLabel, NameIndex);
+      if (IsCollapsible) {
+        doRenameLabel(Local, RefactoringRangeKind::ParameterName, NameIndex);
+      } else {
+        doRenameLabel(Local, RefactoringRangeKind::NoncollapsibleParameterName, NameIndex);
+      }
+    }
   }
 
   void splitAndRenameCallArg(CharSourceRange Range, size_t NameIndex) {
@@ -185,14 +212,24 @@ private:
     doRenameLabel(Rest, RefactoringRangeKind::CallArgumentColon, NameIndex);
   }
 
-  bool labelRangeMatches(CharSourceRange Range, StringRef Expected) {
+  bool labelRangeMatches(CharSourceRange Range, LabelRangeType RangeType, StringRef Expected) {
     if (Range.getByteLength()) {
-      StringRef ExistingLabel = Lexer::getCharSourceRangeFromSourceRange(SM,
-        Range.getStart()).str();
-      if (!Expected.empty())
-        return Expected == ExistingLabel;
-      else
-        return ExistingLabel == "_";
+      CharSourceRange ExistingLabelRange =
+          Lexer::getCharSourceRangeFromSourceRange(SM, Range.getStart());
+      StringRef ExistingLabel = ExistingLabelRange.str();
+
+      switch (RangeType) {
+      case LabelRangeType::NoncollapsibleParam:
+        if (ExistingLabelRange == Range && Expected.empty()) // subscript([x]: Int)
+          return true;
+        LLVM_FALLTHROUGH;
+      case LabelRangeType::CallArg:
+      case LabelRangeType::Param:
+      case LabelRangeType::Selector:
+        return ExistingLabel == (Expected.empty() ? "_" : Expected);
+      case LabelRangeType::None:
+        llvm_unreachable("Unhandled label range type");
+      }
     }
     return Expected.empty();
   }
@@ -231,7 +268,7 @@ private:
       if (NameIndex >= OldNames.size())
         return true;
 
-      while (!labelRangeMatches(Label, OldNames[NameIndex])) {
+      while (!labelRangeMatches(Label, RangeType, OldNames[NameIndex])) {
         if (++NameIndex >= OldNames.size())
           return true;
       };
@@ -272,13 +309,16 @@ public:
 
     assert(Config.Usage != NameUsage::Call || Config.IsFunctionLike);
 
-    bool isKeywordBase = Old.base() == "init" || Old.base() == "subscript";
+    // FIXME: handle escaped keyword names `init`
+    bool IsSubscript = Old.base() == "subscript" && Config.IsFunctionLike;
+    bool IsInit = Old.base() == "init" && Config.IsFunctionLike;
+    bool IsKeywordBase = IsInit || IsSubscript;
 
-    if (!Config.IsFunctionLike || !isKeywordBase) {
+    if (!Config.IsFunctionLike || !IsKeywordBase) {
       if (renameBase(Resolved.Range, RefactoringRangeKind::BaseName))
         return RegionType::Mismatch;
 
-    } else if (isKeywordBase && Config.Usage == NameUsage::Definition) {
+    } else if (IsKeywordBase && Config.Usage == NameUsage::Definition) {
       if (renameBase(Resolved.Range, RefactoringRangeKind::KeywordBaseName))
         return RegionType::Mismatch;
     }
@@ -293,7 +333,7 @@ public:
         HandleLabels = true;
         break;
       case NameUsage::Reference:
-        HandleLabels = Resolved.LabelType == LabelRangeType::Selector;
+        HandleLabels = Resolved.LabelType == LabelRangeType::Selector || IsSubscript;
         break;
       case NameUsage::Unknown:
         HandleLabels = Resolved.LabelType != LabelRangeType::None;
@@ -308,7 +348,7 @@ public:
 
     if (HandleLabels) {
       bool isCallSite = Config.Usage != NameUsage::Definition &&
-                        Config.Usage != NameUsage::Reference &&
+                        (Config.Usage != NameUsage::Reference || IsSubscript) &&
                         Resolved.LabelType == LabelRangeType::CallArg;
 
       if (renameLabels(Resolved.LabelRanges, Resolved.LabelType, isCallSite))
@@ -388,6 +428,17 @@ private:
     return registerText(OldParam);
   }
 
+  StringRef getDeclArgumentLabelReplacement(StringRef OldLabelRange,
+                                            StringRef NewArgLabel) {
+      // OldLabelRange is subscript([]a: Int), foo([a]: Int) or foo([a] b: Int)
+      if (NewArgLabel.empty())
+        return OldLabelRange.empty() ? "" : "_";
+
+      if (OldLabelRange.empty())
+        return registerText((llvm::Twine(NewArgLabel) + " ").str());
+      return registerText(NewArgLabel);
+  }
+
   StringRef getReplacementText(StringRef LabelRange,
                                RefactoringRangeKind RangeKind,
                                StringRef OldLabel, StringRef NewLabel) {
@@ -400,9 +451,12 @@ private:
       return getCallArgCombinedReplacement(LabelRange, NewLabel);
     case RefactoringRangeKind::ParameterName:
       return getParamNameReplacement(LabelRange, OldLabel, NewLabel);
+    case RefactoringRangeKind::NoncollapsibleParameterName:
+      return LabelRange;
     case RefactoringRangeKind::DeclArgumentLabel:
+      return getDeclArgumentLabelReplacement(LabelRange, NewLabel);
     case RefactoringRangeKind::SelectorArgumentLabel:
-      return registerText(NewLabel.empty() ? "_" : NewLabel);
+      return NewLabel.empty() ? "_" : registerText(NewLabel);
     default:
       llvm_unreachable("label range type is none but there are labels");
     }
@@ -618,21 +672,17 @@ RefactoringAction(ModuleDecl *MD, RefactoringOptions &Opts,
 class TokenBasedRefactoringAction : public RefactoringAction {
 protected:
   ResolvedCursorInfo CursorInfo;
-  bool CanProceed;
 public:
   TokenBasedRefactoringAction(ModuleDecl *MD, RefactoringOptions &Opts,
                               SourceEditConsumer &EditConsumer,
                               DiagnosticConsumer &DiagConsumer) :
   RefactoringAction(MD, Opts, EditConsumer, DiagConsumer) {
     // We can only proceed with valid location and source file.
-    CanProceed = StartLoc.isValid() && TheFile;
-    if (!CanProceed)
-      return;
-
-    // Resolve the sema token and save it for later use.
-    CursorInfoResolver Resolver(*TheFile);
-    CursorInfo = Resolver.resolve(StartLoc);
-    CanProceed = CursorInfo.isValid();
+    if (StartLoc.isValid() && TheFile) {
+      // Resolve the sema token and save it for later use.
+      CursorInfoResolver Resolver(*TheFile);
+      CursorInfo = Resolver.resolve(StartLoc);
+    }
   }
 };
 
@@ -643,8 +693,11 @@ class RefactoringAction##KIND: public TokenBasedRefactoringAction {           \
                           SourceEditConsumer &EditConsumer,                   \
                           DiagnosticConsumer &DiagConsumer) :                 \
     TokenBasedRefactoringAction(MD, Opts, EditConsumer, DiagConsumer) {}      \
-  static bool isApplicable(ResolvedCursorInfo Tok);                           \
   bool performChange() override;                                              \
+  static bool isApplicable(ResolvedCursorInfo Tok, DiagnosticEngine &Diag);   \
+  bool isApplicable() {                                                       \
+    return RefactoringAction##KIND::isApplicable(CursorInfo, DiagEngine) ;    \
+  }                                                                           \
 };
 #include "swift/IDE/RefactoringKinds.def"
 
@@ -670,10 +723,14 @@ class RefactoringAction##KIND: public RangeBasedRefactoringAction {           \
     RangeBasedRefactoringAction(MD, Opts, EditConsumer, DiagConsumer) {}      \
   bool performChange() override;                                              \
   static bool isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag);   \
+  bool isApplicable() {                                                       \
+    return RefactoringAction##KIND::isApplicable(RangeInfo, DiagEngine) ;     \
+  }                                                                           \
 };
 #include "swift/IDE/RefactoringKinds.def"
 
-bool RefactoringActionLocalRename::isApplicable(ResolvedCursorInfo CursorInfo) {
+bool RefactoringActionLocalRename::
+isApplicable(ResolvedCursorInfo CursorInfo, DiagnosticEngine &Diag) {
   if (CursorInfo.Kind != CursorInfoKind::ValueRef)
     return false;
   auto RenameOp = getAvailableRenameForDecl(CursorInfo.ValueD);
@@ -746,11 +803,7 @@ StringRef getDefaultPreferredName(RefactoringKind Kind) {
       return "extractedExpr";
     case RefactoringKind::ExtractFunction:
       return "extractedFunc";
-    case RefactoringKind::ExpandDefault:
-    case RefactoringKind::FillProtocolStub:
-    case RefactoringKind::FindGlobalRenameRanges:
-    case RefactoringKind::FindLocalRenameRanges:
-    case RefactoringKind::LocalizeString:
+    default:
       return "";
   }
 }
@@ -769,14 +822,15 @@ public:
   ExtractCheckResult(ArrayRef<CannotExtractReason> AllReasons):
     KnownFailure(false), AllReasons(AllReasons.begin(), AllReasons.end()) {}
   bool success() { return success({}); }
-  bool success(llvm::ArrayRef<CannotExtractReason> WhiteList) {
+  bool success(llvm::ArrayRef<CannotExtractReason> ExpectedReasons) {
     if (KnownFailure)
       return false;
     bool Result = true;
 
-    // Check if any reasons are out of the white list provided by the client.
+    // Check if any reasons aren't covered by the list of expected reasons
+    // provided by the client.
     for (auto R: AllReasons) {
-      Result &= llvm::is_contained(WhiteList, R);
+      Result &= llvm::is_contained(ExpectedReasons, R);
     }
     return Result;
   }
@@ -812,7 +866,7 @@ ExtractCheckResult checkExtractConditions(ResolvedRangeInfo &RangeInfo,
 
   // We cannot extract expressions of l-value type.
   if (auto Ty = RangeInfo.getType()) {
-    if (Ty->hasLValueType() || Ty->getKind() == TypeKind::InOut)
+    if (Ty->hasLValueType() || Ty->is<InOutType>())
       return ExtractCheckResult();
 
     // Disallow extracting error type expressions/statements
@@ -879,6 +933,7 @@ isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
   switch (Info.Kind) {
   case RangeKind::PartOfExpression:
   case RangeKind::SingleDecl:
+  case RangeKind::MultiTypeMemberDecl:
   case RangeKind::Invalid:
     return false;
   case RangeKind::SingleExpression:
@@ -933,7 +988,7 @@ static StringRef correctNewDeclName(DeclContext *DC, StringRef Name) {
 static Type sanitizeType(Type Ty) {
   // Transform lvalue type to inout type so that we can print it properly.
   return Ty.transform([](Type Ty) {
-    if (Ty->getKind() == TypeKind::LValue) {
+    if (Ty->is<LValueType>()) {
       return Type(InOutType::get(Ty->getRValueType()->getCanonicalType()));
     }
     return Ty;
@@ -997,7 +1052,8 @@ getNotableRegions(StringRef SourceText, unsigned NameOffset, StringRef Name,
 
   CompilerInvocation Invocation{};
   Invocation.addInputBuffer(InputBuffer.get());
-  Invocation.getFrontendOptions().PrimaryInput = {0, SelectedInput::InputKind::Buffer};
+  Invocation.getFrontendOptions().Inputs.setPrimaryInput(
+      {0, SelectedInput::InputKind::Buffer});
   Invocation.getFrontendOptions().ModuleName = "extract";
 
   auto Instance = llvm::make_unique<swift::CompilerInstance>();
@@ -1028,7 +1084,7 @@ getNotableRegions(StringRef SourceText, unsigned NameOffset, StringRef Name,
 
   std::vector<NoteRegion> NoteRegions(Renamer.Ranges.size());
   std::transform(Ranges.begin(), Ranges.end(), NoteRegions.begin(),
-                 [&SM, BufferId](RenameRangeDetail &Detail) -> NoteRegion {
+                 [&SM](RenameRangeDetail &Detail) -> NoteRegion {
     auto Start = SM.getLineAndColumn(Detail.Range.getStart());
     auto End = SM.getLineAndColumn(Detail.Range.getEnd());
     return {Detail.RangeKind, Start.first, Start.second, End.first, End.second, Detail.Index};
@@ -1038,8 +1094,6 @@ getNotableRegions(StringRef SourceText, unsigned NameOffset, StringRef Name,
 }
 
 bool RefactoringActionExtractFunction::performChange() {
-  if (!isApplicable(RangeInfo, DiagEngine))
-    return true;
   // Check if the new name is ok.
   if (!Lexer::isIdentifier(PreferredName)) {
     DiagEngine.diagnose(SourceLoc(), diag::invalid_name, PreferredName);
@@ -1156,7 +1210,7 @@ bool RefactoringActionExtractFunction::performChange() {
     for (auto &RD : Parameters) {
 
       // Inout argument needs "&".
-      if (RD.Ty->getKind() == TypeKind::InOut)
+      if (RD.Ty->is<InOutType>())
         OS << "&";
       OS << RD.VD->getBaseName().userFacingName();
       if (&RD != &Parameters.back())
@@ -1260,18 +1314,7 @@ struct SimilarExprCollector: public SourceEntityWalker {
 
   /// Find all tokens included by an expression.
   llvm::ArrayRef<Token> getExprSlice(Expr *E) {
-    auto TokenComp = [&](const Token &LHS, SourceLoc Loc) {
-      return SM.isBeforeInBuffer(LHS.getLoc(), Loc);
-    };
-    SourceLoc StartLoc = E->getStartLoc();
-    SourceLoc EndLoc = E->getEndLoc();
-    auto StartIt = std::lower_bound(AllTokens.begin(), AllTokens.end(),
-                                    StartLoc, TokenComp);
-    auto EndIt = std::lower_bound(AllTokens.begin(), AllTokens.end(),
-                                  EndLoc, TokenComp);
-    assert(StartIt->getLoc() == StartLoc);
-    assert(EndIt->getLoc() == EndLoc);
-    return AllTokens.slice(StartIt - AllTokens.begin(), EndIt - StartIt + 1);
+    return slice_token_array(AllTokens, E->getStartLoc(), E->getEndLoc());
   }
 
   SimilarExprCollector(SourceManager &SM, Expr* SelectedExpr,
@@ -1336,16 +1379,12 @@ bool RefactoringActionExtractExprBase::performChange() {
     Collector.walk(BS);
 
     if (ExtractRepeated) {
-      unsigned BufferId = *TheFile->getBufferID();
-
-      // Tokenize the brace statement; all expressions should have their tokens
-      // in this array.
-      std::vector<Token> AllToks(tokenize(Ctx.LangOpts, SM, BufferId,
-          /*start offset*/SM.getLocOffsetInBuffer(BS->getStartLoc(), BufferId),
-          /*end offset*/SM.getLocOffsetInBuffer(BS->getEndLoc(), BufferId)));
-
       // Collect all expressions we are going to extract.
-      SimilarExprCollector(SM, SelectedExpr, AllToks, AllExpressions).walk(BS);
+      SimilarExprCollector(SM, SelectedExpr,
+                           slice_token_array(TheFile->getAllTokens(),
+                                             BS->getStartLoc(),
+                                             BS->getEndLoc()),
+                           AllExpressions).walk(BS);
     } else {
       AllExpressions.insert(SelectedExpr);
     }
@@ -1429,6 +1468,7 @@ isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
       return checkExtractConditions(Info, Diag).success();
     case RangeKind::PartOfExpression:
     case RangeKind::SingleDecl:
+    case RangeKind::MultiTypeMemberDecl:
     case RangeKind::SingleStatement:
     case RangeKind::MultiStatement:
     case RangeKind::Invalid:
@@ -1437,8 +1477,6 @@ isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
 }
 
 bool RefactoringActionExtractExpr::performChange() {
-  if (!isApplicable(RangeInfo, DiagEngine))
-    return true;
   return RefactoringActionExtractExprBase(TheFile, RangeInfo,
                                           DiagEngine, false, PreferredName,
                                           EditConsumer).performChange();
@@ -1452,6 +1490,7 @@ isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
         success({CannotExtractReason::Literal});
     case RangeKind::PartOfExpression:
     case RangeKind::SingleDecl:
+    case RangeKind::MultiTypeMemberDecl:
     case RangeKind::SingleStatement:
     case RangeKind::MultiStatement:
     case RangeKind::Invalid:
@@ -1459,11 +1498,299 @@ isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
   }
 }
 bool RefactoringActionExtractRepeatedExpr::performChange() {
-  if (!isApplicable(RangeInfo, DiagEngine))
-    return true;
   return RefactoringActionExtractExprBase(TheFile, RangeInfo,
                                           DiagEngine, true, PreferredName,
                                           EditConsumer).performChange();
+}
+
+// Compute a decl context that is the parent context for all decls in
+// \c DeclaredDecls. Return \c nullptr if no such context exists.
+DeclContext *getCommonDeclContext(ArrayRef<DeclaredDecl> DeclaredDecls) {
+  if (DeclaredDecls.empty())
+    return nullptr;
+
+  DeclContext *CommonDC = DeclaredDecls.front().VD->getDeclContext();
+  for (auto DD : DeclaredDecls) {
+    auto OtherDC = DD.VD->getDeclContext();
+    CommonDC = DeclContext::getCommonParentContext(CommonDC, OtherDC);
+  }
+  return CommonDC;
+}
+
+bool RefactoringActionMoveMembersToExtension::isApplicable(
+    ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
+  switch (Info.Kind) {
+  case RangeKind::SingleDecl:
+  case RangeKind::MultiTypeMemberDecl: {
+    DeclContext *CommonDC = getCommonDeclContext(Info.DeclaredDecls);
+
+    // The the common decl context is not a nomial type, we cannot create an
+    // extension for it
+    if (!CommonDC || !CommonDC->getInnermostDeclarationDeclContext() ||
+        !isa<NominalTypeDecl>(CommonDC->getInnermostDeclarationDeclContext()))
+      return false;
+
+    // Members of types not declared at top file level cannot be extracted
+    // to an extension at top file level
+    if (CommonDC->getParent()->getContextKind() != DeclContextKind::FileUnit)
+      return false;
+
+    // We should not move instance variables with storage into the extension
+    // because they are not allowed to be declared there
+    for (auto DD : Info.DeclaredDecls) {
+      if (auto ASD = dyn_cast<AbstractStorageDecl>(DD.VD)) {
+        // Only disallow storages in the common decl context, allow them in
+        // any subtypes
+        if (ASD->hasStorage() && ASD->getDeclContext() == CommonDC) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+  case RangeKind::SingleExpression:
+  case RangeKind::PartOfExpression:
+  case RangeKind::SingleStatement:
+  case RangeKind::MultiStatement:
+  case RangeKind::Invalid:
+    return false;
+  }
+}
+
+bool RefactoringActionMoveMembersToExtension::performChange() {
+  DeclContext *CommonDC = getCommonDeclContext(RangeInfo.DeclaredDecls);
+
+  auto CommonTypeDecl =
+      dyn_cast<NominalTypeDecl>(CommonDC->getInnermostDeclarationDeclContext());
+  assert(CommonTypeDecl && "Not applicable if common parent is no nomial type");
+
+  SmallString<64> Buffer;
+  llvm::raw_svector_ostream OS(Buffer);
+  OS << "\n\n";
+  OS << "extension " << CommonTypeDecl->getName() << " {\n";
+  OS << RangeInfo.ContentRange.str().trim();
+  OS << "\n}";
+
+  // Insert extension after the type declaration
+  EditConsumer.insertAfter(SM, CommonTypeDecl->getEndLoc(), Buffer);
+  EditConsumer.remove(SM, RangeInfo.ContentRange);
+
+  return false;
+}
+
+struct CollapsibleNestedIfInfo {
+  IfStmt *OuterIf;
+  IfStmt *InnerIf;
+  bool FinishedOuterIf;
+  bool FoundNonCollapsibleItem;
+  CollapsibleNestedIfInfo():
+    OuterIf(nullptr), InnerIf(nullptr),
+    FinishedOuterIf(false), FoundNonCollapsibleItem(false) {}
+  bool isValid() {
+    return OuterIf && InnerIf && FinishedOuterIf && !FoundNonCollapsibleItem;
+  }
+};
+
+static CollapsibleNestedIfInfo findCollapseNestedIfTarget(ResolvedCursorInfo CursorInfo) {
+  if (CursorInfo.Kind != CursorInfoKind::StmtStart)
+    return CollapsibleNestedIfInfo();
+  struct IfStmtFinder: public SourceEntityWalker {
+    SourceLoc StartLoc;
+    CollapsibleNestedIfInfo IfInfo;
+    IfStmtFinder(SourceLoc StartLoc): StartLoc(StartLoc), IfInfo() {}
+    bool finishedInnerIfButNotFinishedOuterIf() {
+      return IfInfo.InnerIf && !IfInfo.FinishedOuterIf;
+    }
+    bool walkToStmtPre(Stmt *S) {
+      if (finishedInnerIfButNotFinishedOuterIf()) {
+        IfInfo.FoundNonCollapsibleItem = true;
+        return false;
+      }
+
+      bool StmtIsOuterIfBrace =
+        IfInfo.OuterIf && !IfInfo.InnerIf && S->getKind() == StmtKind::Brace;
+      if (StmtIsOuterIfBrace) {
+        return true;
+      }
+
+      auto *IFS = dyn_cast<IfStmt>(S);
+      if (!IFS) {
+        return false;
+      }
+      if (!IfInfo.OuterIf) {
+        IfInfo.OuterIf = IFS;
+        return true;
+      } else {
+        IfInfo.InnerIf = IFS;
+        return false;
+      }
+    }
+    bool walkToStmtPost(Stmt *S) {
+      assert(S != IfInfo.InnerIf && "Should not traverse inner if statement");
+      if (S == IfInfo.OuterIf) {
+        IfInfo.FinishedOuterIf = true;
+      }
+      return true;
+    }
+    bool walkToDeclPre(Decl *D, CharSourceRange Range) {
+      if (finishedInnerIfButNotFinishedOuterIf()) {
+        IfInfo.FoundNonCollapsibleItem = true;
+        return false;
+      }
+      return true;
+    }
+    bool walkToExprPre(Expr *E) {
+      if (finishedInnerIfButNotFinishedOuterIf()) {
+        IfInfo.FoundNonCollapsibleItem = true;
+        return false;
+      }
+      return true;
+    }
+
+  } Walker(CursorInfo.TrailingStmt->getStartLoc());
+  Walker.walk(CursorInfo.TrailingStmt);
+  return Walker.IfInfo;
+}
+
+bool RefactoringActionCollapseNestedIfExpr::
+isApplicable(ResolvedCursorInfo Tok, DiagnosticEngine &Diag) {
+  return findCollapseNestedIfTarget(Tok).isValid();
+}
+
+bool RefactoringActionCollapseNestedIfExpr::performChange() {
+  auto Target = findCollapseNestedIfTarget(CursorInfo);
+  if (!Target.isValid())
+    return true;
+  auto OuterIfConds = Target.OuterIf->getCond().vec();
+  auto InnerIfConds = Target.InnerIf->getCond().vec();
+
+  EditorConsumerInsertStream OS(EditConsumer, SM,
+    Lexer::getCharSourceRangeFromSourceRange(
+    SM, Target.OuterIf->getSourceRange()));
+
+  OS << tok::kw_if << " ";
+  for (auto CI = OuterIfConds.begin(); CI != OuterIfConds.end(); ++CI) {
+    OS << (CI != OuterIfConds.begin() ? ", " : "");
+    OS << Lexer::getCharSourceRangeFromSourceRange(
+      SM, CI->getSourceRange()).str();
+  }
+  for (auto CI = InnerIfConds.begin(); CI != InnerIfConds.end(); ++CI) {
+    OS << ", " << Lexer::getCharSourceRangeFromSourceRange(
+      SM, CI->getSourceRange()).str();
+  }
+  auto ThenStatementText = Lexer::getCharSourceRangeFromSourceRange(
+    SM, Target.InnerIf->getThenStmt()->getSourceRange()).str();
+  OS << " " << ThenStatementText;
+  return false;
+}
+
+static std::unique_ptr<llvm::SetVector<Expr*>>
+  findConcatenatedExpressions(ResolvedRangeInfo Info, ASTContext &Ctx) {
+  if (Info.Kind != RangeKind::SingleExpression
+      && Info.Kind != RangeKind::PartOfExpression)
+    return nullptr;
+  Expr *E = Info.ContainedNodes[0].get<Expr*>();
+
+  struct StringInterpolationExprFinder: public SourceEntityWalker {
+    std::unique_ptr<llvm::SetVector<Expr*>> Bucket = llvm::
+    make_unique<llvm::SetVector<Expr*>>();
+    ASTContext &Ctx;
+
+    bool IsValidInterpolation = true;
+    StringInterpolationExprFinder(ASTContext &Ctx): Ctx(Ctx) {}
+
+    bool isConcatenationExpr(DeclRefExpr* Expr) {
+      if (!Expr)
+        return false;
+      auto *FD = dyn_cast<FuncDecl>(Expr->getDecl());
+      if (FD == nullptr || (FD != Ctx.getPlusFunctionOnString() &&
+          FD != Ctx.getPlusFunctionOnRangeReplaceableCollection())) {
+        return false;
+      }
+      return true;
+    }
+
+    bool walkToExprPre(Expr *E) {
+      if (E->isImplicit())
+        return true;
+      auto ExprType = E->getType()->getNominalOrBoundGenericNominal();
+      //Only binary concatenation operators should exist in expression
+      if (E->getKind() == ExprKind::Binary) {
+        auto *BE = dyn_cast<BinaryExpr>(E);
+        auto *OperatorDeclRef = BE->getSemanticFn()->getMemberOperatorRef();
+        if (!(isConcatenationExpr(OperatorDeclRef)
+            && ExprType == Ctx.getStringDecl())) {
+          IsValidInterpolation = false;
+          return false;
+        }
+        return true;
+      }
+      // Everything that evaluates to string should be gathered.
+      if (ExprType == Ctx.getStringDecl()) {
+        Bucket->insert(E);
+        return false;
+      }
+      if (auto *DR = dyn_cast<DeclRefExpr>(E)) {
+        // Checks whether all function references in expression are concatenations.
+        auto *FD = dyn_cast<FuncDecl>(DR->getDecl());
+        auto IsConcatenation = isConcatenationExpr(DR);
+        if (FD && IsConcatenation) {
+          return false;
+        }
+      }
+      // There was non-expected expression, it's not valid interpolation then.
+      IsValidInterpolation = false;
+      return false;
+    }
+  } Walker(Ctx);
+  Walker.walk(E);
+
+  // There should be two or more expressions to convert.
+  if (!Walker.IsValidInterpolation || Walker.Bucket->size() < 2)
+    return nullptr;
+
+  return std::move(Walker.Bucket);
+}
+
+static void interpolatedExpressionForm(Expr *E, SourceManager &SM,
+                                              llvm::raw_ostream &OS) {
+  if (auto *Literal = dyn_cast<StringLiteralExpr>(E)) {
+    OS << Literal->getValue();
+    return;
+  }
+  auto ExpStr = Lexer::getCharSourceRangeFromSourceRange(SM,
+    E->getSourceRange()).str().str();
+  if (isa<InterpolatedStringLiteralExpr>(E)) {
+    ExpStr.erase(0, 1);
+    ExpStr.pop_back();
+    OS << ExpStr;
+    return;
+  }
+  OS << "\\(" << ExpStr << ")";
+}
+
+bool RefactoringActionConvertStringsConcatenationToInterpolation::
+isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
+  auto RangeContext = Info.RangeContext;
+  if (RangeContext) {
+    auto &Ctx = Info.RangeContext->getASTContext();
+    return findConcatenatedExpressions(Info, Ctx) != nullptr;
+  }
+  return false;
+}
+
+bool RefactoringActionConvertStringsConcatenationToInterpolation::performChange() {
+  auto Expressions = findConcatenatedExpressions(RangeInfo, Ctx);
+  if (!Expressions)
+    return true;
+  EditorConsumerInsertStream OS(EditConsumer, SM, RangeInfo.ContentRange);
+  OS << "\"";
+  for (auto It = Expressions->begin(); It != Expressions->end(); It++) {
+    interpolatedExpressionForm(*It, SM, OS);
+  }
+  OS << "\"";
+  return false;
 }
 
 /// The helper class analyzes a given nominal decl or an extension decl to
@@ -1527,7 +1854,8 @@ public:
 
 FillProtocolStubContext FillProtocolStubContext::
 getContextFromCursorInfo(ResolvedCursorInfo CursorInfo) {
-  assert(CursorInfo.isValid());
+  if(!CursorInfo.isValid())
+    return FillProtocolStubContext();
   if (!CursorInfo.IsRef) {
     // If the type name is on the declared nominal, e.g. "class A {}"
     if (auto ND = dyn_cast<NominalTypeDecl>(CursorInfo.ValueD)) {
@@ -1556,22 +1884,17 @@ getUnsatisfiedRequirements(const DeclContext *DC) {
   return NonWitnessedReqs;
 }
 
-bool RefactoringActionFillProtocolStub::isApplicable(ResolvedCursorInfo Tok) {
+bool RefactoringActionFillProtocolStub::
+isApplicable(ResolvedCursorInfo Tok, DiagnosticEngine &Diag) {
   return FillProtocolStubContext::getContextFromCursorInfo(Tok).canProceed();
 };
 
 bool RefactoringActionFillProtocolStub::performChange() {
-  // If the base class says no proceeding, respect it.
-  if (!CanProceed)
-    return true;
-
   // Get the filling protocol context from the input token.
   FillProtocolStubContext Context = FillProtocolStubContext::
-  getContextFromCursorInfo(CursorInfo);
+    getContextFromCursorInfo(CursorInfo);
 
-  // If the filling context disallows continue, abort.
-  if (!Context.canProceed())
-    return true;
+  assert(Context.canProceed());
   assert(!Context.getFillingContents().empty());
   assert(Context.getFillingContext());
   llvm::SmallString<128> Text;
@@ -1611,56 +1934,25 @@ collectAvailableRefactoringsAtCursor(SourceFile *SF, unsigned Line,
   return collectAvailableRefactorings(SF, Tok, Scratch, /*Exclude rename*/false);
 }
 
-bool RefactoringActionExpandDefault::isApplicable(ResolvedCursorInfo CursorInfo) {
-  if (CursorInfo.Kind != CursorInfoKind::StmtStart)
-    return false;
-  if (auto *CS = dyn_cast<CaseStmt>(CursorInfo.TrailingStmt)) {
-    return CS->isDefault();
+static EnumDecl* getEnumDeclFromSwitchStmt(SwitchStmt *SwitchS) {
+  if (auto SubjectTy = SwitchS->getSubjectExpr()->getType()) {
+    return SubjectTy->getAnyNominal()->getAsEnumOrEnumExtensionContext();
   }
-  return false;
+  return nullptr;
 }
 
-bool RefactoringActionExpandDefault::performChange() {
-  if (!isApplicable(CursorInfo)) {
-    DiagEngine.diagnose(SourceLoc(), diag::invalid_default_location);
-    return true;
-  }
-
-  // Try to find the switch statement enclosing the default statement.
-  auto *CS = static_cast<CaseStmt*>(CursorInfo.TrailingStmt);
-  auto IsSwitch = [](ASTNode Node) {
-    return Node.is<Stmt*>() &&
-      Node.get<Stmt*>()->getKind() == StmtKind::Switch;
-  };
-  ContextFinder Finder(*TheFile, CS, IsSwitch);
-  Finder.resolve();
-
-  // If failed to find the switch statement, issue error.
-  if (Finder.getContexts().empty()) {
-    DiagEngine.diagnose(CS->getStartLoc(), diag::no_parent_switch);
-    return true;
-  }
-  auto *SwitchS = static_cast<SwitchStmt*>(Finder.getContexts().back().
-    get<Stmt*>());
-
-  // To find the subject enum decl for this switch statement; if failing,
-  // issue errors.
-  EnumDecl *SubjectED = nullptr;
-  if (auto SubjectTy = SwitchS->getSubjectExpr()->getType()) {
-    SubjectED = SubjectTy->getAnyNominal()->getAsEnumOrEnumExtensionContext();
-  }
-  if (!SubjectED) {
-    DiagEngine.diagnose(CS->getStartLoc(), diag::no_subject_enum);
-    return true;
-  }
-
+static bool performCasesExpansionInSwitchStmt(SwitchStmt *SwitchS,
+                                              DiagnosticEngine &DiagEngine,
+                                              SourceLoc ExpandedStmtLoc,
+                                              EditorConsumerInsertStream &OS
+                                              ) {
   // Assume enum elements are not handled in the switch statement.
+  auto EnumDecl = getEnumDeclFromSwitchStmt(SwitchS);
+  assert(EnumDecl);
   llvm::DenseSet<EnumElementDecl*> UnhandledElements;
-  SubjectED->getAllElements(UnhandledElements);
-  bool FoundDefault = false;
+  EnumDecl->getAllElements(UnhandledElements);
   for (auto Current : SwitchS->getCases()) {
-    if (Current == CS) {
-      FoundDefault = true;
+    if (Current->isDefault()) {
       continue;
     }
     // For each handled enum element, remove it from the bucket.
@@ -1671,26 +1963,117 @@ bool RefactoringActionExpandDefault::performChange() {
     }
   }
 
-  // If we've not seen the default statement inside the switch statement, issue
-  // error.
-  if (!FoundDefault) {
-    DiagEngine.diagnose(CS->getStartLoc(), diag::no_parent_switch);
-    return true;
-  }
-
   // If all enum elements are handled in the switch statement, issue error.
   if (UnhandledElements.empty()) {
-    DiagEngine.diagnose(CS->getStartLoc(), diag::no_remaining_cases);
+    DiagEngine.diagnose(ExpandedStmtLoc, diag::no_remaining_cases);
     return true;
   }
 
-  // Good to go, change the code!
-  SmallString<64> Buffer;
-  llvm::raw_svector_ostream OS(Buffer);
   printEnumElementsAsCases(UnhandledElements, OS);
-  EditConsumer.accept(SM, Lexer::getCharSourceRangeFromSourceRange(SM,
-    CS->getLabelItemsRange()), Buffer.str());
   return false;
+}
+
+// Finds SwitchStmt that contains given CaseStmt.
+static SwitchStmt* findEnclosingSwitchStmt(CaseStmt *CS,
+                                           SourceFile *SF,
+                                           DiagnosticEngine &DiagEngine) {
+  auto IsSwitch = [](ASTNode Node) {
+    return Node.is<Stmt*>() &&
+    Node.get<Stmt*>()->getKind() == StmtKind::Switch;
+  };
+  ContextFinder Finder(*SF, CS, IsSwitch);
+  Finder.resolve();
+
+  // If failed to find the switch statement, issue error.
+  if (Finder.getContexts().empty()) {
+    DiagEngine.diagnose(CS->getStartLoc(), diag::no_parent_switch);
+    return nullptr;
+  }
+  auto *SwitchS = static_cast<SwitchStmt*>(Finder.getContexts().back().
+                                           get<Stmt*>());
+  // Make sure that CaseStmt is included in switch that was found.
+  auto Cases = SwitchS->getCases();
+  auto Default = std::find(Cases.begin(), Cases.end(), CS);
+  if (Default == Cases.end()) {
+    DiagEngine.diagnose(CS->getStartLoc(), diag::no_parent_switch);
+    return nullptr;
+  }
+  return SwitchS;
+}
+
+bool RefactoringActionExpandDefault::
+isApplicable(ResolvedCursorInfo CursorInfo, DiagnosticEngine &Diag) {
+  auto Exit = [&](bool Applicable) {
+    if (!Applicable)
+      Diag.diagnose(SourceLoc(), diag::invalid_default_location);
+    return Applicable;
+  };
+  if (CursorInfo.Kind != CursorInfoKind::StmtStart)
+    return Exit(false);
+  if (auto *CS = dyn_cast<CaseStmt>(CursorInfo.TrailingStmt)) {
+    auto EnclosingSwitchStmt = findEnclosingSwitchStmt(CS,
+                                                       CursorInfo.SF,
+                                                       Diag);
+    if (!EnclosingSwitchStmt)
+      return false;
+    auto EnumD = getEnumDeclFromSwitchStmt(EnclosingSwitchStmt);
+    auto IsApplicable = CS->isDefault() && EnumD != nullptr;
+    return IsApplicable;
+  }
+  return Exit(false);
+}
+
+bool RefactoringActionExpandDefault::performChange() {
+  // If we've not seen the default statement inside the switch statement, issue
+  // error.
+  auto *CS = static_cast<CaseStmt*>(CursorInfo.TrailingStmt);
+  auto *SwitchS = findEnclosingSwitchStmt(CS, TheFile, DiagEngine);
+  assert(SwitchS);
+  EditorConsumerInsertStream OS(EditConsumer, SM,
+                                Lexer::getCharSourceRangeFromSourceRange(SM,
+                                  CS->getLabelItemsRange()));
+  return performCasesExpansionInSwitchStmt(SwitchS,
+                                           DiagEngine,
+                                           CS->getStartLoc(),
+                                           OS);
+}
+
+bool RefactoringActionExpandSwitchCases::
+isApplicable(ResolvedCursorInfo CursorInfo, DiagnosticEngine &DiagEngine) {
+  if (!CursorInfo.TrailingStmt)
+    return false;
+  if (auto *Switch = dyn_cast<SwitchStmt>(CursorInfo.TrailingStmt)) {
+    return getEnumDeclFromSwitchStmt(Switch);
+  }
+  return false;
+}
+
+bool RefactoringActionExpandSwitchCases::performChange() {
+  auto *SwitchS = dyn_cast<SwitchStmt>(CursorInfo.TrailingStmt);
+  assert(SwitchS);
+
+  auto InsertRange = CharSourceRange();
+  auto Cases = SwitchS->getCases();
+  auto Default = std::find_if(Cases.begin(), Cases.end(), [](CaseStmt *Stmt) {
+    return Stmt->isDefault();
+  });
+  if (Default != Cases.end()) {
+    auto DefaultRange = (*Default)->getLabelItemsRange();
+    InsertRange = Lexer::getCharSourceRangeFromSourceRange(SM, DefaultRange);
+  } else {
+    auto RBraceLoc = SwitchS->getRBraceLoc();
+    InsertRange = CharSourceRange(SM, RBraceLoc, RBraceLoc);
+  }
+  EditorConsumerInsertStream OS(EditConsumer, SM, InsertRange);
+  if (SM.getLineNumber(SwitchS->getLBraceLoc()) ==
+      SM.getLineNumber(SwitchS->getRBraceLoc())) {
+    OS << "\n";
+  }
+  auto Result = performCasesExpansionInSwitchStmt(SwitchS,
+                                           DiagEngine,
+                                           SwitchS->getStartLoc(),
+                                           OS);
+  return Result;
 }
 
 static Expr *findLocalizeTarget(ResolvedCursorInfo CursorInfo) {
@@ -1716,7 +2099,8 @@ static Expr *findLocalizeTarget(ResolvedCursorInfo CursorInfo) {
   return Walker.Target;
 }
 
-bool RefactoringActionLocalizeString::isApplicable(ResolvedCursorInfo Tok) {
+bool RefactoringActionLocalizeString::
+isApplicable(ResolvedCursorInfo Tok, DiagnosticEngine &Diag) {
   return findLocalizeTarget(Tok);
 }
 
@@ -1726,6 +2110,257 @@ bool RefactoringActionLocalizeString::performChange() {
     return true;
   EditConsumer.accept(SM, Target->getStartLoc(), "NSLocalizedString(");
   EditConsumer.insertAfter(SM, Target->getEndLoc(), ", comment: \"\")");
+  return false;
+}
+
+static CharSourceRange
+  findSourceRangeToWrapInCatch(ResolvedCursorInfo CursorInfo,
+                               SourceFile *TheFile,
+                               SourceManager &SM) {
+  Expr *E = CursorInfo.TrailingExpr;
+  if (!E)
+    return CharSourceRange();
+  auto Node = ASTNode(E);
+  auto NodeChecker = [](ASTNode N) { return N.isStmt(StmtKind::Brace); };
+  ContextFinder Finder(*TheFile, Node, NodeChecker);
+  Finder.resolve();
+  auto Contexts = Finder.getContexts();
+  if (Contexts.size() == 0)
+    return CharSourceRange();
+  auto TargetNode = Contexts.back();
+  BraceStmt *BStmt = dyn_cast<BraceStmt>(TargetNode.dyn_cast<Stmt*>());
+  auto ConvertToCharRange = [&SM](SourceRange SR) {
+    return Lexer::getCharSourceRangeFromSourceRange(SM, SR);
+  };
+  assert(BStmt);
+  auto ExprRange = ConvertToCharRange(E->getSourceRange());
+  // Check elements of the deepest BraceStmt, pick one that covers expression.
+  for (auto Elem: BStmt->getElements()) {
+    auto ElemRange = ConvertToCharRange(Elem.getSourceRange());
+    if (ElemRange.contains(ExprRange))
+      TargetNode = Elem;
+  }
+  return ConvertToCharRange(TargetNode.getSourceRange());
+}
+
+bool RefactoringActionConvertToDoCatch::
+isApplicable(ResolvedCursorInfo Tok, DiagnosticEngine &Diag) {
+  if (!Tok.TrailingExpr)
+    return false;
+  return isa<ForceTryExpr>(Tok.TrailingExpr);
+}
+
+bool RefactoringActionConvertToDoCatch::performChange() {
+  auto *TryExpr = dyn_cast<ForceTryExpr>(CursorInfo.TrailingExpr);
+  assert(TryExpr);
+  auto Range = findSourceRangeToWrapInCatch(CursorInfo, TheFile, SM);
+  if (!Range.isValid())
+    return true;
+  // Wrap given range in do catch block.
+  EditConsumer.accept(SM, Range.getStart(), "do {\n");
+  EditorConsumerInsertStream OS(EditConsumer, SM, Range.getEnd());
+  OS << "\n} catch {\n" << getCodePlaceholder() << "\n}";
+
+  // Delete ! from try! expression
+  auto ExclaimLen = getKeywordLen(tok::exclaim_postfix);
+  auto ExclaimRange = CharSourceRange(TryExpr->getExclaimLoc(), ExclaimLen);
+  EditConsumer.remove(SM, ExclaimRange);
+  return false;
+}
+
+/// Given a cursor position, this function tries to collect a number literal
+/// expression immediately following the cursor.
+static NumberLiteralExpr *getTrailingNumberLiteral(ResolvedCursorInfo Tok) {
+  // This cursor must point to the start of an expression.
+  if (Tok.Kind != CursorInfoKind::ExprStart)
+    return nullptr;
+  Expr *Parent = Tok.TrailingExpr;
+  assert(Parent);
+
+  // Check if an expression is a number literal.
+  auto IsLiteralNumber = [&](Expr *E) -> NumberLiteralExpr* {
+    if (auto *NL = dyn_cast<NumberLiteralExpr>(E)) {
+
+      // The sub-expression must have the same start loc with the outermost
+      // expression, i.e. the cursor position.
+      if (Parent->getStartLoc().getOpaquePointerValue() ==
+        E->getStartLoc().getOpaquePointerValue()) {
+        return NL;
+      }
+    }
+    return nullptr;
+  };
+  // For every sub-expression, try to find the literal expression that matches
+  // our criteria.
+  for (auto Pair: Parent->getDepthMap()) {
+    if (auto Result = IsLiteralNumber(Pair.getFirst())) {
+      return Result;
+    }
+  }
+  return nullptr;
+}
+
+static std::string insertUnderscore(StringRef Text) {
+  llvm::SmallString<64> Buffer;
+  llvm::raw_svector_ostream OS(Buffer);
+  for (auto It = Text.begin(); It != Text.end(); It++) {
+    unsigned Distance = It - Text.begin();
+    if (Distance && !(Distance % 3)) {
+      OS << '_';
+    }
+    OS << *It;
+  }
+  return OS.str().str();
+}
+
+static void insertUnderscoreInDigits(StringRef Digits,
+                                     llvm::raw_ostream &OS) {
+  std::string BeforePoint, AfterPoint;
+  std::tie(BeforePoint, AfterPoint) = Digits.split('.');
+
+  // Insert '_' for the part before the decimal point.
+  std::reverse(BeforePoint.begin(), BeforePoint.end());
+  BeforePoint = insertUnderscore(BeforePoint);
+  std::reverse(BeforePoint.begin(), BeforePoint.end());
+  OS << BeforePoint;
+
+  // Insert '_' for the part after the decimal point, if necessary.
+  if (!AfterPoint.empty()) {
+    OS << '.';
+    OS << insertUnderscore(AfterPoint);
+  }
+}
+
+bool RefactoringActionSimplifyNumberLiteral::
+isApplicable(ResolvedCursorInfo Tok, DiagnosticEngine &Diag) {
+  if (auto *Literal = getTrailingNumberLiteral(Tok)) {
+    llvm::SmallString<64> Buffer;
+    llvm::raw_svector_ostream OS(Buffer);
+    StringRef Digits = Literal->getDigitsText();
+    insertUnderscoreInDigits(Digits, OS);
+
+    // If inserting '_' results in a different digit sequence, this refactoring
+    // is applicable.
+    return OS.str() != Digits;
+  }
+  return false;
+}
+
+bool RefactoringActionSimplifyNumberLiteral::performChange() {
+  if (auto *Literal = getTrailingNumberLiteral(CursorInfo)) {
+
+    EditorConsumerInsertStream OS(EditConsumer, SM,
+                                  CharSourceRange(SM, Literal->getDigitsLoc(),
+                                  Lexer::getLocForEndOfToken(SM,
+                                    Literal->getEndLoc())));
+    StringRef Digits = Literal->getDigitsText();
+    insertUnderscoreInDigits(Digits, OS);
+    return false;
+  }
+  return true;
+}
+
+static CallExpr *findTrailingClosureTarget(SourceManager &SM,
+                                           ResolvedCursorInfo CursorInfo) {
+  if (CursorInfo.Kind == CursorInfoKind::StmtStart)
+    // StmtStart postion can't be a part of CallExpr.
+    return nullptr;
+
+  // Find inner most CallExpr
+  ContextFinder
+  Finder(*CursorInfo.SF, CursorInfo.Loc,
+         [](ASTNode N) {
+           return N.isStmt(StmtKind::Brace) || N.isExpr(ExprKind::Call);
+         });
+  Finder.resolve();
+  if (Finder.getContexts().empty()
+      || !Finder.getContexts().back().is<Expr*>())
+    return nullptr;
+  CallExpr *CE = cast<CallExpr>(Finder.getContexts().back().get<Expr*>());
+
+  // The last arugment is a closure?
+  Expr *Args = CE->getArg();
+  if (!Args)
+    return nullptr;
+  Expr *LastArg;
+  if (auto *TSE = dyn_cast<TupleShuffleExpr>(Args))
+    Args = TSE->getSubExpr();
+  if (auto *PE = dyn_cast<ParenExpr>(Args)) {
+    LastArg = PE->getSubExpr();
+  } else {
+    auto *TE = cast<TupleExpr>(Args);
+    if (TE->getNumElements() == 0)
+      return nullptr;
+    LastArg = TE->getElements().back();
+  }
+
+  if (auto *ICE = dyn_cast<ImplicitConversionExpr>(LastArg))
+    LastArg = ICE->getSyntacticSubExpr();
+
+  if (isa<ClosureExpr>(LastArg) || isa<CaptureListExpr>(LastArg))
+    return CE;
+  return nullptr;
+}
+
+bool RefactoringActionTrailingClosure::
+isApplicable(ResolvedCursorInfo CursorInfo, DiagnosticEngine &Diag) {
+  SourceManager &SM = CursorInfo.SF->getASTContext().SourceMgr;
+  return findTrailingClosureTarget(SM, CursorInfo);
+}
+
+bool RefactoringActionTrailingClosure::performChange() {
+  auto *CE = findTrailingClosureTarget(SM, CursorInfo);
+  if (!CE)
+    return true;
+  Expr *Args = CE->getArg();
+  if (auto *TSE = dyn_cast<TupleShuffleExpr>(Args))
+    Args = TSE;
+
+  Expr *ClosureArg = nullptr;
+  Expr *PrevArg = nullptr;
+  SourceLoc LPLoc, RPLoc;
+
+  if (auto *PE = dyn_cast<ParenExpr>(Args)) {
+    ClosureArg = PE->getSubExpr();
+    LPLoc = PE->getLParenLoc();
+    RPLoc = PE->getRParenLoc();
+  } else {
+    auto *TE = cast<TupleExpr>(Args);
+    auto NumArgs = TE->getNumElements();
+    if (NumArgs == 0)
+      return true;
+    LPLoc = TE->getLParenLoc();
+    RPLoc = TE->getRParenLoc();
+    ClosureArg = TE->getElement(NumArgs - 1);
+    if (NumArgs > 1)
+      PrevArg = TE->getElement(NumArgs - 2);
+  }
+  if (auto *ICE = dyn_cast<ImplicitConversionExpr>(ClosureArg))
+    ClosureArg = ICE->getSyntacticSubExpr();
+
+  if (LPLoc.isInvalid() || RPLoc.isInvalid())
+    return true;
+
+  // Replace:
+  //   * Open paren with ' ' if the closure is sole argument.
+  //   * Comma with ') ' otherwise.
+  if (PrevArg) {
+    CharSourceRange PreRange(
+        SM,
+        Lexer::getLocForEndOfToken(SM, PrevArg->getEndLoc()),
+        ClosureArg->getStartLoc());
+    EditConsumer.accept(SM, PreRange, ") ");
+  } else {
+    CharSourceRange PreRange(
+        SM, LPLoc, ClosureArg->getStartLoc());
+    EditConsumer.accept(SM, PreRange, " ");
+  }
+  // Remove original closing paren.
+  CharSourceRange PostRange(
+      SM,
+      Lexer::getLocForEndOfToken(SM, ClosureArg->getEndLoc()),
+      Lexer::getLocForEndOfToken(SM, RPLoc));
+  EditConsumer.remove(SM, PostRange);
   return false;
 }
 
@@ -1739,8 +2374,8 @@ static bool rangeStartMayNeedRename(ResolvedRangeInfo Info) {
           return true;
 
         // When callling an instance method inside another instance method,
-        // we have a dot sytnax call whose dot and base are both implicit. We
-        // need to whitelist the specific case here.
+        // we have a dot syntax call whose dot and base are both implicit. We
+        // need to explicitly allow the specific case here.
         if (auto *DSC = dyn_cast<DotSyntaxCallExpr>(CE->getFn())) {
           if (DSC->getBase()->isImplicit() &&
               DSC->getFn()->getStartLoc() == Info.TokensInRange.front().getLoc())
@@ -1759,6 +2394,7 @@ static bool rangeStartMayNeedRename(ResolvedRangeInfo Info) {
       return false;
     }
     case RangeKind::SingleDecl:
+    case RangeKind::MultiTypeMemberDecl:
     case RangeKind::SingleStatement:
     case RangeKind::MultiStatement:
     case RangeKind::Invalid:
@@ -1815,6 +2451,8 @@ struct swift::ide::FindRenameRangesAnnotatingConsumer::Implementation {
         return "keywordBase";
       case RefactoringRangeKind::ParameterName:
         return "param";
+      case RefactoringRangeKind::NoncollapsibleParameterName:
+        return "noncollapsibleparam";
       case RefactoringRangeKind::DeclArgumentLabel:
         return "arglabel";
       case RefactoringRangeKind::CallArgumentLabel:
@@ -1916,8 +2554,9 @@ collectAvailableRefactorings(SourceFile *SF,
       AllKinds.push_back(RenameOp.getValue());
     }
   }
+  DiagnosticEngine DiagEngine(SF->getASTContext().SourceMgr);
 #define CURSOR_REFACTORING(KIND, NAME, ID)                                     \
-  if (RefactoringAction##KIND::isApplicable(CursorInfo))                       \
+  if (RefactoringAction##KIND::isApplicable(CursorInfo, DiagEngine))           \
     AllKinds.push_back(RefactoringKind::KIND);
 #include "swift/IDE/RefactoringKinds.def"
 
@@ -1982,8 +2621,13 @@ refactorSwiftModule(ModuleDecl *M, RefactoringOptions Opts,
 
   switch (Opts.Kind) {
 #define SEMANTIC_REFACTORING(KIND, NAME, ID)                                   \
-    case RefactoringKind::KIND: return RefactoringAction##KIND(M, Opts,        \
-      EditConsumer, DiagConsumer).performChange();
+case RefactoringKind::KIND: {                                                  \
+      RefactoringAction##KIND Action(M, Opts, EditConsumer, DiagConsumer);     \
+      if (RefactoringKind::KIND == RefactoringKind::LocalRename ||             \
+          Action.isApplicable())                                               \
+        return Action.performChange();                                         \
+      return true;                                                             \
+  }
 #include "swift/IDE/RefactoringKinds.def"
     case RefactoringKind::GlobalRename:
     case RefactoringKind::FindGlobalRenameRanges:
@@ -2046,10 +2690,8 @@ resolveRenameLocations(ArrayRef<RenameLoc> RenameLocs, SourceFile &SF,
     });
   }
 
-  std::vector<Token> Tokens =
-      swift::tokenize(SF.getASTContext().LangOpts, SM, BufferID, 0, 0, true);
   NameMatcher Resolver(SF);
-  return Resolver.resolve(UnresolvedLocs, Tokens);
+  return Resolver.resolve(UnresolvedLocs, SF.getAllTokens());
 }
 
 int swift::ide::syntacticRename(SourceFile *SF, ArrayRef<RenameLoc> RenameLocs,

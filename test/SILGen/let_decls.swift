@@ -73,9 +73,9 @@ func test3() {
   
   // CHECK-NOT: destroy_value
 
-  // CHECK: [[USEFN:%[0-9]+]] = function_ref{{.*}}useAString
-  // CHECK-NEXT: [[BORROWED_STR:%.*]] = begin_borrow [[STR]]
+  // CHECK: [[BORROWED_STR:%.*]] = begin_borrow [[STR]]
   // CHECK-NEXT: [[STR_COPY:%.*]] = copy_value [[BORROWED_STR]]
+  // CHECK: [[USEFN:%[0-9]+]] = function_ref{{.*}}useAString
   // CHECK-NEXT: [[USE:%[0-9]+]] = apply [[USEFN]]([[STR_COPY]])
   // CHECK-NEXT: end_borrow [[BORROWED_STR]] from [[STR]]
   useAString(o)
@@ -98,10 +98,10 @@ func produceAddressOnlyStruct<T>(_ x : T) -> AddressOnlyStruct<T> {}
 func testAddressOnlyStructString<T>(_ a : T) -> String {
   return produceAddressOnlyStruct(a).str
   
-  // CHECK: [[PRODFN:%[0-9]+]] = function_ref @{{.*}}produceAddressOnlyStruct
   // CHECK: [[TMPSTRUCT:%[0-9]+]] = alloc_stack $AddressOnlyStruct<T>
   // CHECK: [[ARG:%.*]] = alloc_stack $T
   // CHECK: copy_addr [[FUNC_ARG]] to [initialization] [[ARG]]
+  // CHECK: [[PRODFN:%[0-9]+]] = function_ref @{{.*}}produceAddressOnlyStruct
   // CHECK: apply [[PRODFN]]<T>([[TMPSTRUCT]], [[ARG]])
   // CHECK-NEXT: dealloc_stack [[ARG]]
   // CHECK-NEXT: [[STRADDR:%[0-9]+]] = struct_element_addr [[TMPSTRUCT]] : $*AddressOnlyStruct<T>, #AddressOnlyStruct.str
@@ -115,9 +115,9 @@ func testAddressOnlyStructString<T>(_ a : T) -> String {
 func testAddressOnlyStructElt<T>(_ a : T) -> T {
   return produceAddressOnlyStruct(a).elt
   
-  // CHECK: [[PRODFN:%[0-9]+]] = function_ref @{{.*}}produceAddressOnlyStruct
   // CHECK: [[TMPSTRUCT:%[0-9]+]] = alloc_stack $AddressOnlyStruct<T>
   // CHECK: [[ARG:%.*]] = alloc_stack $T
+  // CHECK: [[PRODFN:%[0-9]+]] = function_ref @{{.*}}produceAddressOnlyStruct
   // CHECK: apply [[PRODFN]]<T>([[TMPSTRUCT]], [[ARG]])
   // CHECK-NEXT: dealloc_stack [[ARG]]
   // CHECK-NEXT: [[ELTADDR:%[0-9]+]] = struct_element_addr [[TMPSTRUCT]] : $*AddressOnlyStruct<T>, #AddressOnlyStruct.elt
@@ -153,7 +153,7 @@ struct GetOnlySubscriptStruct {
 func testGetOnlySubscript(_ x : GetOnlySubscriptStruct, idx : Int) -> Int {
   return x[idx]
   
-  // CHECK: [[SUBFN:%[0-9]+]] = function_ref @{{.*}}9subscript
+  // CHECK: [[SUBFN:%[0-9]+]] = function_ref @{{.*}}i
   // CHECK-NEXT: [[CALL:%[0-9]+]] = apply [[SUBFN]](
   // CHECK: return [[CALL]]
 }
@@ -192,7 +192,7 @@ struct GenericTestStruct<T> {
 
 // CHECK-LABEL: sil hidden @{{.*}}pass_address_only_rvalue_result
 // CHECK: bb0(%0 : @trivial $*T,
-// CHECK: [[FN:%[0-9]+]] = function_ref @{{.*}}GenericTestStructV9subscript{{.*}}fg
+// CHECK: [[FN:%[0-9]+]] = function_ref @{{.*}}GenericTestStructV{{.*}}ig
 // CHECK: apply [[FN]]<T>(%0,
 
 
@@ -211,7 +211,7 @@ func produceNMSubscriptableRValue() -> NonMutableSubscriptable {}
 // CHECK: bb0(%0 : @trivial $Int):
 // CHECK: [[FR1:%[0-9]+]] = function_ref @{{.*}}produceNMSubscriptableRValue
 // CHECK-NEXT: [[RES:%[0-9]+]] = apply [[FR1]]()
-// CHECK: [[GETFN:%[0-9]+]] = function_ref @_T09let_decls23NonMutableSubscriptableV9subscript{{[_0-9a-zA-Z]*}}fg
+// CHECK: [[GETFN:%[0-9]+]] = function_ref @_T09let_decls23NonMutableSubscriptableV{{[_0-9a-zA-Z]*}}ig
 // CHECK-NEXT: [[RES2:%[0-9]+]] = apply [[GETFN]](%0, [[RES]])
 // CHECK-NEXT: return [[RES2]]
 func test_nm_subscript_get(_ a : Int) -> Int {
@@ -222,7 +222,7 @@ func test_nm_subscript_get(_ a : Int) -> Int {
 // CHECK: bb0(%0 : @trivial $Int):
 // CHECK: [[FR1:%[0-9]+]] = function_ref @{{.*}}produceNMSubscriptableRValue
 // CHECK-NEXT: [[RES:%[0-9]+]] = apply [[FR1]]()
-// CHECK: [[SETFN:%[0-9]+]] = function_ref @_T09let_decls23NonMutableSubscriptableV9subscript{{[_0-9a-zA-Z]*}}fs
+// CHECK: [[SETFN:%[0-9]+]] = function_ref @_T09let_decls23NonMutableSubscriptableV{{[_0-9a-zA-Z]*}}is
 // CHECK-NEXT: [[RES2:%[0-9]+]] = apply [[SETFN]](%0, %0, [[RES]])
 func test_nm_subscript_set(_ a : Int) {
   produceNMSubscriptableRValue()[a] = a
@@ -248,13 +248,13 @@ func test_weird_property(_ v : WeirdPropertyTest, i : Int) -> Int {
   // The setter isn't mutating, so we need to load the box.
   // CHECK: [[READ:%.*]] = begin_access [read] [unknown] [[PB]]
   // CHECK: [[VVAL:%[0-9]+]] = load [trivial] [[READ]]
-  // CHECK: [[SETFN:%[0-9]+]] = function_ref @_T09let_decls17WeirdPropertyTestV1pSifs
+  // CHECK: [[SETFN:%[0-9]+]] = function_ref @_T09let_decls17WeirdPropertyTestV1pSivs
   // CHECK: apply [[SETFN]](%1, [[VVAL]])
   v.p = i
   
   // The getter is mutating, so it takes the box address.
   // CHECK: [[WRITE:%.*]] = begin_access [modify] [unknown] [[PB]]
-  // CHECK: [[GETFN:%[0-9]+]] = function_ref @_T09let_decls17WeirdPropertyTestV1pSifg
+  // CHECK: [[GETFN:%[0-9]+]] = function_ref @_T09let_decls17WeirdPropertyTestV1pSivg
   // CHECK-NEXT: [[RES:%[0-9]+]] = apply [[GETFN]]([[WRITE]])
   // CHECK: return [[RES]]
   return v.p
@@ -377,10 +377,12 @@ func member_ref_abstraction_change(_ x: GenericFunctionStruct<Int, Int>) -> (Int
 }
 
 // CHECK-LABEL: sil hidden @{{.*}}call_auto_closure
-// CHECK: bb0([[CLOSURE:%.*]] : @owned $@callee_owned () -> Bool):
+// CHECK: bb0([[CLOSURE:%.*]] : @owned $@noescape @callee_guaranteed () -> Bool):
 // CHECK:   [[BORROWED_CLOSURE:%.*]] = begin_borrow [[CLOSURE]]
 // CHECK:   [[CLOSURE_COPY:%.*]] = copy_value [[BORROWED_CLOSURE]]
-// CHECK:   apply [[CLOSURE_COPY]]() : $@callee_owned () -> Bool
+// CHECK:   [[BORROW:%.*]] =  begin_borrow [[CLOSURE_COPY]]
+// CHECK:   apply [[BORROW]]() : $@noescape @callee_guaranteed () -> Bool
+// CHECK:   destroy_value [[CLOSURE_COPY]]
 // CHECK:   end_borrow [[BORROWED_CLOSURE]] from [[CLOSURE]]
 // CHECK:   destroy_value [[CLOSURE]]
 // CHECK: } // end sil function '{{.*}}call_auto_closure{{.*}}'
@@ -496,7 +498,7 @@ var addressOnlyGetOnlyGlobalProperty : SimpleProtocol { get {} }
 // CHECK-LABEL: sil hidden @_T09let_decls018testAddressOnlyGetE14GlobalPropertyAA14SimpleProtocol_pyF
 // CHECK: bb0(%0 : @trivial $*SimpleProtocol):
 // CHECK-NEXT:   // function_ref
-// CHECK-NEXT:  %1 = function_ref @_T09let_decls014addressOnlyGetD14GlobalPropertyAA14SimpleProtocol_pfg
+// CHECK-NEXT:  %1 = function_ref @_T09let_decls014addressOnlyGetD14GlobalPropertyAA14SimpleProtocol_pvg
 // CHECK-NEXT:  %2 = apply %1(%0) : $@convention(thin) () -> @out SimpleProtocol
 // CHECK-NEXT:  %3 = tuple ()
 // CHECK-NEXT:  return %3 : $()

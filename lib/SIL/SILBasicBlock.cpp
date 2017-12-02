@@ -95,6 +95,14 @@ void SILBasicBlock::remove(SILInstruction *I) {
   InstList.remove(I);
 }
 
+void SILBasicBlock::eraseInstructions() {
+ for (auto It = begin(); It != end();) {
+    auto *Inst = &*It++;
+    Inst->replaceAllUsesOfAllResultsWithUndef();
+    Inst->eraseFromParent();
+  }
+}
+
 /// Returns the iterator following the erased instruction.
 SILBasicBlock::iterator SILBasicBlock::erase(SILInstruction *I) {
   // Notify the delete handlers that this instruction is going away.
@@ -247,6 +255,14 @@ void SILBasicBlock::moveAfter(SILBasicBlock *After) {
   auto InsertPt = std::next(SILFunction::iterator(After));
   auto &BlkList = getParent()->getBlocks();
   BlkList.splice(InsertPt, BlkList, this);
+}
+
+void SILBasicBlock::moveTo(SILBasicBlock::iterator To, SILInstruction *I) {
+  assert(I->getParent() != this && "Must move from different basic block");
+  InstList.splice(To, I->getParent()->InstList, I);
+  ScopeCloner ScopeCloner(*Parent);
+  SILBuilder B(*Parent);
+  I->setDebugScope(B, ScopeCloner.getOrCreateClonedScope(I->getDebugScope()));
 }
 
 void

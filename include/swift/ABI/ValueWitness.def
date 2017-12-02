@@ -74,6 +74,7 @@
 ///     TYPE_TYPE - a pointer to type metadata
 ///     SIZE_TYPE - size_t
 ///     INT_TYPE - int
+///     UINT_TYPE - unsigned int
 ///     VOID_TYPE - void
 ///   Defaults to VALUE_WITNESS.
 ///   FIXME: The 'copy' witnesses should be using immutable types but aren't.
@@ -109,8 +110,7 @@
 
 ///   T *(*initializeBufferWithCopyOfBuffer)(B *dest, B *src, M *self);
 /// Given an invalid buffer, initialize it as a copy of the
-/// object in the source buffer.  This can be decomposed as:
-///   initializeWithCopy(self->allocateBuffer(dest, self), self->projectBuffer(src), self)
+/// object in the source buffer.
 FUNCTION_VALUE_WITNESS(initializeBufferWithCopyOfBuffer,
                        InitializeBufferWithCopyOfBuffer,
                        MUTABLE_VALUE_TYPE,
@@ -174,60 +174,32 @@ FUNCTION_VALUE_WITNESS(assignWithTake,
 
 ///   T *(*initializeBufferWithTakeOfBuffer)(B *dest, B *src, M *self);
 /// Given an invalid buffer, initialize it by taking the value out of
-/// the source buffer.  This can be (inefficiently) decomposed as:
-///   initializeWithTake(self->allocateBuffer(dest, self), self->projectBuffer(src), self)
-///   deallocateBuffer(src, self)
+/// the source buffer.
 FUNCTION_VALUE_WITNESS(initializeBufferWithTakeOfBuffer,
                        InitializeBufferWithTakeOfBuffer,
                        MUTABLE_VALUE_TYPE,
                        (MUTABLE_BUFFER_TYPE, MUTABLE_BUFFER_TYPE, TYPE_TYPE))
 
-///   void (*destroyArray)(T *object, size_t n, witness_t *self);
-///
-/// Given a valid array of n objects of this type, destroy the object, leaving
-/// the array invalid. This is useful when generically destroying an array of
-/// objects to avoid calling the scalar 'destroy' witness in a loop.
-FUNCTION_VALUE_WITNESS(destroyArray,
-                       DestroyArray,
+/// int (*getEnumTagSinglePayload)(const T* enum, UINT_TYPE emptyCases)
+/// Given an instance of valid single payload enum with a payload of this
+/// witness table's type (e.g Optional<ThisType>) , get the tag of the enum.
+FUNCTION_VALUE_WITNESS(getEnumTagSinglePayload,
+                       GetEnumTagSinglePayload,
+                       INT_TYPE,
+                       (IMMUTABLE_VALUE_TYPE, UINT_TYPE, TYPE_TYPE))
+
+/// void (*storeEnumTagSinglePayload)(T* enum, INT_TYPE whichCase,
+///                                   UINT_TYPE emptyCases)
+/// Given uninitialized memory for an instance of a single payload enum with a
+/// payload of this witness table's type (e.g Optional<ThisType>), store the
+/// tag.
+FUNCTION_VALUE_WITNESS(storeEnumTagSinglePayload,
+                       StoreEnumTagSinglePayload,
                        VOID_TYPE,
-                       (MUTABLE_VALUE_TYPE, SIZE_TYPE, TYPE_TYPE))
-
-///   T *(*initializeArrayWithCopy)(T *dest, T *src, size_t n, M *self);
-///
-/// Given an invalid array of n objects of this type, initialize the objects
-/// as a copy of the source array.  Returns the dest array.
-FUNCTION_VALUE_WITNESS(initializeArrayWithCopy,
-                       InitializeArrayWithCopy,
-                       MUTABLE_VALUE_TYPE,
-                       (MUTABLE_VALUE_TYPE, MUTABLE_VALUE_TYPE,
-                        SIZE_TYPE, TYPE_TYPE))
-
-///   T *(*initializeArrayWithTakeFrontToBack)(T *dest, T *src, size_t n, M *self);
-///
-/// Given an invalid array of n objects of this type, initialize the objects
-/// by taking them from the source array in front-to-back order.
-/// The source array becomes invalid.
-/// Returns the dest array.
-FUNCTION_VALUE_WITNESS(initializeArrayWithTakeFrontToBack,
-                       InitializeArrayWithTakeFrontToBack,
-                       MUTABLE_VALUE_TYPE,
-                       (MUTABLE_VALUE_TYPE, MUTABLE_VALUE_TYPE,
-                        SIZE_TYPE, TYPE_TYPE))
-
-///   T *(*initializeArrayWithTakeBackToFront)(T *dest, T *src, size_t n, M *self);
-///
-/// Given an invalid array of n objects of this type, initialize the objects
-/// by taking them from the source array in back-to-front order.
-/// The source array becomes invalid.
-/// Returns the dest array.
-FUNCTION_VALUE_WITNESS(initializeArrayWithTakeBackToFront,
-                       InitializeArrayWithTakeBackToFront,
-                       MUTABLE_VALUE_TYPE,
-                       (MUTABLE_VALUE_TYPE, MUTABLE_VALUE_TYPE,
-                        SIZE_TYPE, TYPE_TYPE))
+                       (MUTABLE_VALUE_TYPE, INT_TYPE, UINT_TYPE, TYPE_TYPE))
 
 END_VALUE_WITNESS_RANGE(RequiredValueWitnessFunction,
-                        InitializeArrayWithTakeBackToFront)
+                        StoreEnumTagSinglePayload)
 
 ///   size_t size;
 ///

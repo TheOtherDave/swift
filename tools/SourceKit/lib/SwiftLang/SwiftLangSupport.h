@@ -17,6 +17,7 @@
 #include "SwiftInterfaceGenContext.h"
 #include "SourceKit/Core/LangSupport.h"
 #include "SourceKit/Support/Concurrency.h"
+#include "SourceKit/Support/Statistic.h"
 #include "SourceKit/Support/ThreadSafeRefCntPtr.h"
 #include "SourceKit/Support/Tracing.h"
 #include "swift/Basic/ThreadSafeRefCounted.h"
@@ -250,6 +251,12 @@ public:
                         const swift::DiagnosticInfo &Info) override;
 };
 
+struct SwiftStatistics {
+#define SWIFT_STATISTIC(VAR, UID, DESC)                                        \
+  Statistic VAR{UIdent{"source.statistic." #UID}, DESC};
+#include "SwiftStatistics.def"
+};
+
 class SwiftLangSupport : public LangSupport {
   SourceKit::Context &SKCtx;
   std::string RuntimeResourcePath;
@@ -260,6 +267,7 @@ class SwiftLangSupport : public LangSupport {
   ThreadSafeRefCntPtr<SwiftPopularAPI> PopularAPI;
   CodeCompletion::SessionCacheMap CCSessions;
   ThreadSafeRefCntPtr<SwiftCustomCompletions> CustomCompletions;
+  SwiftStatistics Stats;
 
 public:
   explicit SwiftLangSupport(SourceKit::Context &SKCtx);
@@ -276,6 +284,8 @@ public:
   IntrusiveRefCntPtr<SwiftCompletionCache> getCodeCompletionCache() {
     return CCCache;
   }
+
+  SwiftStatistics &getStatistics() { return Stats; }
 
   static SourceKit::UIdent getUIDForDecl(const swift::Decl *D,
                                          bool IsRef = false);
@@ -304,6 +314,8 @@ public:
   static SourceKit::UIdent getUIDForRegionType(swift::ide::RegionType Type);
 
   static SourceKit::UIdent getUIDForRefactoringRangeKind(swift::ide::RefactoringRangeKind Kind);
+
+  static Optional<UIdent> getUIDForDeclAttribute(const swift::DeclAttribute *Attr);
 
   static std::vector<UIdent> UIDsFromDeclAttributes(const swift::DeclAttributes &Attrs);
 
@@ -489,6 +501,8 @@ public:
 
   void findModuleGroups(StringRef ModuleName, ArrayRef<const char *> Args,
                std::function<void(ArrayRef<StringRef>, StringRef Error)> Receiver) override;
+
+  void getStatistics(StatisticsReceiver) override;
 
 private:
   swift::SourceFile *getSyntacticSourceFile(llvm::MemoryBuffer *InputBuf,

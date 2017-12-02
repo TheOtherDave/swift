@@ -2,7 +2,7 @@
 protocol EmptyProtocol { }
 
 protocol DefinitionsInProtocols {
-  init() {} // expected-error {{protocol initializers may not have bodies}}
+  init() {} // expected-error {{protocol initializers must not have bodies}}
   deinit {} // expected-error {{deinitializers may only be declared within a class}}
 }
 
@@ -207,6 +207,12 @@ protocol GetATuple {
 struct IntStringGetter : GetATuple {
   typealias Tuple = (i: Int, s: String)
   func getATuple() -> Tuple {}
+}
+
+protocol ClassConstrainedAssocType {
+  associatedtype T : class
+  // expected-error@-1 {{'class' constraint can only appear on protocol declarations}}
+  // expected-note@-2 {{did you mean to write an 'AnyObject' constraint?}}{{22-27=AnyObject}}
 }
 
 //===----------------------------------------------------------------------===//
@@ -460,7 +466,7 @@ protocol ShouldntCrash {
 
 // rdar://problem/18168866
 protocol FirstProtocol {
-    weak var delegate : SecondProtocol? { get } // expected-error{{'weak' may not be applied to non-class-bound 'SecondProtocol'; consider adding a protocol conformance that has a class bound}}
+    weak var delegate : SecondProtocol? { get } // expected-error{{'weak' must not be applied to non-class-bound 'SecondProtocol'; consider adding a protocol conformance that has a class bound}}
 }
 
 protocol SecondProtocol {
@@ -497,10 +503,10 @@ class C4 : P4 { // expected-error {{type 'C4' does not conform to protocol 'P4'}
 protocol LetThereBeCrash {
   let x: Int
   // expected-error@-1 {{immutable property requirement must be declared as 'var' with a '{ get }' specifier}}
-  // expected-note@-2 {{change 'let' to 'var' to make it mutable}}
+  // expected-note@-2 {{declared here}}
 }
 
 extension LetThereBeCrash {
   init() { x = 1 }
-  // expected-error@-1 {{cannot assign to property: 'x' is a 'let' constant}}
+  // expected-error@-1 {{'let' property 'x' may not be initialized directly; use "self.init(...)" or "self = ..." instead}}
 }

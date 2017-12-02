@@ -162,6 +162,18 @@ static void validateArgs(DiagnosticEngine &diags, const ArgList &Args) {
                    "-warnings-as-errors", "-suppress-warnings");
   }
 
+  // Check for conflicting profiling flags
+  const Arg *ProfileGenerate = Args.getLastArg(options::OPT_profile_generate);
+  const Arg *ProfileUse = Args.getLastArg(options::OPT_profile_use);
+  if (ProfileGenerate && ProfileUse)
+    diags.diagnose(SourceLoc(), diag::error_conflicting_options,
+                   "-profile-generate", "-profile-use");
+
+  // Check if the profdata is missing
+  if (ProfileUse && !llvm::sys::fs::exists(ProfileUse->getValue()))
+    diags.diagnose(SourceLoc(), diag::error_profile_missing,
+                  ProfileUse->getValue());
+
   // Check for missing debug option when verifying debug info.
   if (Args.hasArg(options::OPT_verify_debug_info)) {
     bool hasDebugOption = true;
@@ -211,6 +223,9 @@ makeToolChain(Driver &driver, const llvm::Triple &target) {
     break;
   case llvm::Triple::Win32:
     return llvm::make_unique<toolchains::Cygwin>(driver, target);
+    break;
+  case llvm::Triple::Haiku:
+    return llvm::make_unique<toolchains::GenericUnix>(driver, target);
     break;
   default:
     return nullptr;
@@ -911,9 +926,6 @@ static bool checkInputExistence(const Driver &D, const DerivedArgList &Args,
 void Driver::buildInputs(const ToolChain &TC,
                          const DerivedArgList &Args,
                          InputFileList &Inputs) const {
-  types::ID InputType = types::TY_Nothing;
-  Arg *InputTypeArg = nullptr;
-
   llvm::StringMap<StringRef> SourceFileNames;
 
   for (Arg *A : Args) {
@@ -921,29 +933,19 @@ void Driver::buildInputs(const ToolChain &TC,
       StringRef Value = A->getValue();
       types::ID Ty = types::TY_INVALID;
 
-      if (InputType == types::TY_Nothing) {
-        // If there was an explicit arg for this, claim it.
-        if (InputTypeArg)
-          InputTypeArg->claim();
-
-        // stdin must be handled specially.
-        if (Value.equals("-")) {
-          // By default, treat stdin as Swift input.
-          // FIXME: should we limit this inference to specific modes?
-          Ty = types::TY_Swift;
-        } else {
-          // Otherwise lookup by extension.
-          Ty = TC.lookupTypeForExtension(llvm::sys::path::extension(Value));
-
-          if (Ty == types::TY_INVALID) {
-            // FIXME: should we adjust this inference in certain modes?
-            Ty = types::TY_Object;
-          }
-        }
+      // stdin must be handled specially.
+      if (Value.equals("-")) {
+        // By default, treat stdin as Swift input.
+        Ty = types::TY_Swift;
       } else {
-        assert(InputTypeArg && "InputType set w/o InputTypeArg");
-        InputTypeArg->claim();
-        Ty = InputType;
+        // Otherwise lookup by extension.
+        Ty = TC.lookupTypeForExtension(llvm::sys::path::extension(Value));
+
+        if (Ty == types::TY_INVALID) {
+          // By default, treat inputs with no extension, or with an
+          // extension that isn't recognized, as object files.
+          Ty = types::TY_Object;
+        }
       }
 
       if (checkInputExistence(*this, Args, Diags, Value))
@@ -958,8 +960,6 @@ void Driver::buildInputs(const ToolChain &TC,
         }
       }
     }
-
-    // FIXME: add -x support (or equivalent)
   }
 }
 
@@ -1143,12 +1143,10 @@ void Driver::buildOutputInfo(const ToolChain &TC, const DerivedArgList &Args,
       OI.CompilerMode = OutputInfo::Mode::SingleCompile;
       break;
 
-    // BEGIN APPLE-ONLY OUTPUT ACTIONS
     case options::OPT_index_file:
       OI.CompilerMode = OutputInfo::Mode::SingleCompile;
       OI.CompilerOutputType = types::TY_IndexData;
       break;
-    // END APPLE-ONLY OUTPUT ACTIONS
 
     case options::OPT_update_code:
       OI.CompilerOutputType = types::TY_Remapping;
@@ -1416,14 +1414,22 @@ void Driver::buildActions(SmallVectorImpl<const Action *> &TopLevelActions,
       }
       case types::TY_SwiftModuleFile:
       case types::TY_SwiftModuleDocFile:
-        // Module inputs are okay if generating a module.
-        if (OI.ShouldGenerateModule) {
+        if (OI.ShouldGenerateModule && !OI.shouldLink()) {
+          // When generating a .swiftmodule as a top-level output (as opposed
+          // to, for example, linking an image), treat .swiftmodule files as
+          // inputs to a MergeModule action.
           AllModuleInputs.push_back(Current);
           break;
+        } else if (OI.shouldLink()) {
+          // Otherwise, if linking, pass .swiftmodule files as inputs to the
+          // linker, so that their debug info is available.
+          AllLinkerInputs.push_back(Current);
+          break;
+        } else {
+          Diags.diagnose(SourceLoc(), diag::error_unexpected_input_file,
+                         InputArg->getValue());
+          continue;
         }
-        Diags.diagnose(SourceLoc(), diag::error_unexpected_input_file,
-                       InputArg->getValue());
-        continue;
       case types::TY_AutolinkFile:
       case types::TY_Object:
         // Object inputs are only okay if linking.
@@ -1448,6 +1454,7 @@ void Driver::buildActions(SmallVectorImpl<const Action *> &TopLevelActions,
       case types::TY_ImportedModules:
       case types::TY_TBD:
       case types::TY_ModuleTrace:
+      case types::TY_OptRecord:
         // We could in theory handle assembly or LLVM input, but let's not.
         // FIXME: What about LTO?
         Diags.diagnose(SourceLoc(), diag::error_unexpected_input_file,
@@ -1566,13 +1573,18 @@ void Driver::buildActions(SmallVectorImpl<const Action *> &TopLevelActions,
     auto *LinkAction = C.createAction<LinkJobAction>(AllLinkerInputs,
                                                      OI.LinkAction);
 
-    if (TC.getTriple().getObjectFormat() == llvm::Triple::ELF ||
-        TC.getTriple().isOSCygMing()) {
-      // On ELF platforms there's no built in autolinking mechanism, so we
-      // pull the info we need from the .o files directly and pass them as an
-      // argument input file to the linker.
+    // On ELF platforms there's no built in autolinking mechanism, so we
+    // pull the info we need from the .o files directly and pass them as an
+    // argument input file to the linker.
+    SmallVector<const Action *, 2> AutolinkExtractInputs;
+    for (const Action *A : AllLinkerInputs)
+      if (A->getType() == types::TY_Object)
+        AutolinkExtractInputs.push_back(A);
+    if (!AutolinkExtractInputs.empty() &&
+        (TC.getTriple().getObjectFormat() == llvm::Triple::ELF ||
+         TC.getTriple().isOSCygMing())) {
       auto *AutolinkExtractAction =
-          C.createAction<AutolinkExtractJobAction>(AllLinkerInputs);
+          C.createAction<AutolinkExtractJobAction>(AutolinkExtractInputs);
       // Takes the same inputs as the linker...
       // ...and gives its output to the linker.
       LinkAction->addInput(AutolinkExtractAction);
@@ -1728,6 +1740,7 @@ static StringRef getOutputFilename(Compilation &C,
                                    const JobAction *JA,
                                    const OutputInfo &OI,
                                    const TypeToPathMap *OutputMap,
+                                   const llvm::Triple &Triple,
                                    const llvm::opt::DerivedArgList &Args,
                                    bool AtTopLevel,
                                    StringRef BaseInput,
@@ -1816,10 +1829,17 @@ static StringRef getOutputFilename(Compilation &C,
       BaseName = llvm::sys::path::stem(BaseInput);
     if (auto link = dyn_cast<LinkJobAction>(JA)) {
       if (link->getKind() == LinkKind::DynamicLibrary) {
-        // FIXME: This should be target-specific.
-        Buffer = "lib";
+        if (Triple.isOSWindows())
+          Buffer = "";
+        else
+          Buffer = "lib";
         Buffer.append(BaseName);
-        Buffer.append(LTDL_SHLIB_EXT);
+        if (Triple.isOSDarwin())
+          Buffer.append(".dylib");
+        else if (Triple.isOSWindows())
+          Buffer.append(".dll");
+        else
+          Buffer.append(".so");
         return Buffer.str();
       }
     }
@@ -2032,9 +2052,9 @@ Job *Driver::buildJobsForAction(Compilation &C, const JobAction *JA,
       const TypeToPathMap *OMForInput = nullptr;
       if (OFM)
         OMForInput = OFM->getOutputMapForInput(Input);
-      
-      OutputFile = getOutputFilename(C, JA, OI, OMForInput, C.getArgs(),
-                                     AtTopLevel, Input, InputJobs,
+
+      OutputFile = getOutputFilename(C, JA, OI, OMForInput, TC.getTriple(),
+                                     C.getArgs(), AtTopLevel, Input, InputJobs,
                                      Diags, Buf);
       Output->addPrimaryOutput(OutputFile, Input);
     };
@@ -2050,9 +2070,9 @@ Job *Driver::buildJobsForAction(Compilation &C, const JobAction *JA,
     }
   } else {
     // The common case: there is a single output file.
-    OutputFile = getOutputFilename(C, JA, OI, OutputMap, C.getArgs(),
-                                   AtTopLevel, BaseInput, InputJobs,
-                                   Diags, Buf);
+    OutputFile = getOutputFilename(C, JA, OI, OutputMap, TC.getTriple(),
+                                   C.getArgs(), AtTopLevel, BaseInput,
+                                   InputJobs, Diags, Buf);
     Output->addPrimaryOutput(OutputFile, BaseInput);
   }
 
@@ -2224,6 +2244,19 @@ Job *Driver::buildJobsForAction(Compilation &C, const JobAction *JA,
         Output->setAdditionalOutputForType(types::TY_TBD, filename);
       }
     }
+  }
+
+  if (C.getArgs().hasArg(options::OPT_save_optimization_record,
+                         options::OPT_save_optimization_record_path)) {
+    if (OI.CompilerMode == OutputInfo::Mode::SingleCompile) {
+      auto filename = *getOutputFilenameFromPathArgOrAsTopLevel(
+          OI, C.getArgs(), options::OPT_save_optimization_record_path,
+          types::TY_OptRecord, /*TreatAsTopLevelOutput=*/true, "opt.yaml", Buf);
+
+      Output->setAdditionalOutputForType(types::TY_OptRecord, filename);
+    } else
+      // FIXME: We should use the OutputMap in this case.
+      Diags.diagnose({}, diag::warn_opt_remark_disabled);
   }
 
   // Choose the Objective-C header output path.

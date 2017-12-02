@@ -38,12 +38,10 @@ static bool inheritsConformanceTo(ClassDecl *target, ProtocolDecl *proto) {
   if (!target->hasSuperclass())
     return false;
 
-  auto &C = target->getASTContext();
   auto *superclassDecl = target->getSuperclassDecl();
   auto *superclassModule = superclassDecl->getModuleContext();
   return (bool)superclassModule->lookupConformance(target->getSuperclass(),
-                                                   proto,
-                                                   C.getLazyResolver());
+                                                   proto);
 }
 
 /// Returns whether the superclass of the given class conforms to Encodable.
@@ -100,22 +98,7 @@ static CodableConformanceType typeConformsToCodable(TypeChecker &tc,
     // Implicitly unwrapped optionals need to be unwrapped;
     // ImplicitlyUnwrappedOptional does not need to conform to Codable directly
     // -- only its inner type does.
-    if (nominalTypeDecl == tc.Context.getImplicitlyUnwrappedOptionalDecl() ||
-        // FIXME: Remove the following when conditional conformance lands.
-        // Some generic types in the stdlib currently conform to Codable even
-        // when the type they are generic on does not [Optional, Array, Set,
-        // Dictionary].  For synthesizing conformance, we don't want to
-        // consider these types as Codable if the nested type is not Codable.
-        // Look through the generic type parameters of these types recursively
-        // to avoid synthesizing code that will crash at runtime.
-        //
-        // We only want to look through generic params for these types; other
-        // types may validly conform to Codable even if their generic param
-        // types do not.
-        nominalTypeDecl == tc.Context.getOptionalDecl() ||
-        nominalTypeDecl == tc.Context.getArrayDecl() ||
-        nominalTypeDecl == tc.Context.getSetDecl() ||
-        nominalTypeDecl == tc.Context.getDictionaryDecl()) {
+    if (nominalTypeDecl == tc.Context.getImplicitlyUnwrappedOptionalDecl()) {
       for (auto paramType : genericType->getGenericArgs()) {
         if (typeConformsToCodable(tc, context, paramType, proto) != Conforms)
           return DoesNotConform;
@@ -246,11 +229,19 @@ validateCodingKeysEnum(TypeChecker &tc, EnumDecl *codingKeysDecl,
   if (!properties.empty() &&
       proto->isSpecificProtocol(KnownProtocolKind::Decodable)) {
     for (auto it = properties.begin(); it != properties.end(); ++it) {
-      if (it->second->getParentInitializer() != nullptr) {
-        // Var has a default value.
-        continue;
+      // If the var is default initializable, then it need not have an explicit
+      // initial value.
+      auto *varDecl = it->second;
+      if (auto pbd = varDecl->getParentPatternBinding()) {
+        if (pbd->isDefaultInitializable())
+          continue;
       }
 
+      if (varDecl->getParentInitializer())
+        continue;
+
+      // The var was not default initializable, and did not have an explicit
+      // initial value.
       propertiesAreValid = false;
       tc.diagnose(it->second->getLoc(), diag::codable_non_decoded_property_here,
                   proto->getDeclaredType(), it->first);
@@ -789,8 +780,7 @@ static FuncDecl *deriveEncodable_encode(TypeChecker &tc, Decl *parentDecl,
   }
 
   encodeDecl->setInterfaceType(interfaceType);
-  encodeDecl->setAccess(std::max(target->getFormalAccess(),
-                                 AccessLevel::Internal));
+  encodeDecl->setAccess(target->getFormalAccess());
 
   // If the type was not imported, the derived conformance is either from the
   // type itself or an extension, in which case we will emit the declaration
@@ -1136,8 +1126,7 @@ static ValueDecl *deriveDecodable_init(TypeChecker &tc, Decl *parentDecl,
 
   initDecl->setInterfaceType(interfaceType);
   initDecl->setInitializerInterfaceType(initializerType);
-  initDecl->setAccess(std::max(target->getFormalAccess(),
-                               AccessLevel::Internal));
+  initDecl->setAccess(target->getFormalAccess());
 
   // If the type was not imported, the derived conformance is either from the
   // type itself or an extension, in which case we will emit the declaration

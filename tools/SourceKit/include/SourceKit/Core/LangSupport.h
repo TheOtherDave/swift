@@ -218,7 +218,7 @@ public:
                                          StringRef RuntimeName,
                                          StringRef SelectorName,
                                          ArrayRef<StringRef> InheritedTypes,
-                                         ArrayRef<UIdent> Attrs) = 0;
+                                         ArrayRef<std::tuple<UIdent, unsigned, unsigned>> Attrs) = 0;
 
   virtual bool endDocumentSubStructure() = 0;
 
@@ -250,6 +250,9 @@ public:
   virtual bool valueForOption(UIdent Key, bool &Val) = 0;
   virtual bool valueForOption(UIdent Key, StringRef &Val) = 0;
 };
+
+struct Statistic;
+typedef std::function<void(ArrayRef<Statistic *> stats)> StatisticsReceiver;
 
 struct RefactoringInfo {
   UIdent Kind;
@@ -626,6 +629,8 @@ public:
                           StringRef ModuleName,
                           ArrayRef<const char *> Args,
                           DocInfoConsumer &Consumer) = 0;
+
+  virtual void getStatistics(StatisticsReceiver) = 0;
 };
 
 } // namespace SourceKit

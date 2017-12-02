@@ -18,6 +18,7 @@
 #include "swift/SIL/FormalLinkage.h"
 #include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILModule.h"
+#include "swift/Strings.h"
 #include "Linker.h"
 #include "swift/SIL/SILVisitor.h"
 #include "swift/SIL/SILValue.h"
@@ -26,6 +27,7 @@
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/YAMLTraits.h"
 #include <functional>
 using namespace swift;
 using namespace Lowering;
@@ -86,7 +88,8 @@ SILModule::SILModule(ModuleDecl *SwiftModule, SILOptions &Options,
                      const DeclContext *associatedDC, bool wholeModule)
     : TheSwiftModule(SwiftModule), AssociatedDeclContext(associatedDC),
       Stage(SILStage::Raw), Callback(new SILModule::SerializationCallback()),
-      wholeModule(wholeModule), Options(Options), Types(*this) {}
+      wholeModule(wholeModule), Options(Options), serialized(false),
+      SerializeSILAction(), Types(*this) {}
 
 SILModule::~SILModule() {
   // Decrement ref count for each SILGlobalVariable with static initializers.
@@ -229,25 +232,22 @@ void SILModule::deleteWitnessTable(SILWitnessTable *Wt) {
   witnessTables.erase(Wt);
 }
 
-SILFunction *SILModule::getOrCreateFunction(SILLocation loc,
-                                            StringRef name,
-                                            SILLinkage linkage,
-                                            CanSILFunctionType type,
-                                            IsBare_t isBareSILFunction,
-                                            IsTransparent_t isTransparent,
-                                            IsSerialized_t isSerialized,
-                                            IsThunk_t isThunk,
-                                            SubclassScope subclassScope) {
+SILFunction *SILModule::getOrCreateFunction(
+    SILLocation loc, StringRef name, SILLinkage linkage,
+    CanSILFunctionType type, IsBare_t isBareSILFunction,
+    IsTransparent_t isTransparent, IsSerialized_t isSerialized,
+    ProfileCounter entryCount, IsThunk_t isThunk, SubclassScope subclassScope) {
+  assert(!type->isNoEscape() && "Function decls always have escaping types.");
   if (auto fn = lookUpFunction(name)) {
     assert(fn->getLoweredFunctionType() == type);
-    assert(fn->getLinkage() == linkage ||
-           stripExternalFromLinkage(fn->getLinkage()) == linkage);
+    assert(stripExternalFromLinkage(fn->getLinkage()) ==
+           stripExternalFromLinkage(linkage));
     return fn;
   }
 
-  auto fn = SILFunction::create(*this, linkage, name, type, nullptr,
-                                loc, isBareSILFunction, isTransparent,
-                                isSerialized, isThunk, subclassScope);
+  auto fn = SILFunction::create(*this, linkage, name, type, nullptr, loc,
+                                isBareSILFunction, isTransparent, isSerialized,
+                                entryCount, isThunk, subclassScope);
   fn->setDebugScope(new (*this) SILDebugScope(loc, fn));
   return fn;
 }
@@ -280,9 +280,36 @@ static bool verifySILSelfParameterType(SILDeclRef DeclRef,
           PInfo.isGuaranteed() || PInfo.isIndirectMutating();
 }
 
+static void addFunctionAttributes(SILFunction *F, DeclAttributes &Attrs,
+                                  SILModule &M) {
+  for (auto *A : Attrs.getAttributes<SemanticsAttr>())
+    F->addSemanticsAttr(cast<SemanticsAttr>(A)->Value);
+
+  // Propagate @_specialize.
+  for (auto *A : Attrs.getAttributes<SpecializeAttr>()) {
+    auto *SA = cast<SpecializeAttr>(A);
+    auto kind = SA->getSpecializationKind() ==
+                        SpecializeAttr::SpecializationKind::Full
+                    ? SILSpecializeAttr::SpecializationKind::Full
+                    : SILSpecializeAttr::SpecializationKind::Partial;
+    F->addSpecializeAttr(SILSpecializeAttr::create(
+        M, SA->getRequirements(), SA->isExported(), kind));
+  }
+
+  if (auto *OA = Attrs.getAttribute<OptimizeAttr>()) {
+    F->setOptimizationMode(OA->getMode());
+  }
+
+  // @_silgen_name and @_cdecl functions may be called from C code somewhere.
+  if (Attrs.hasAttribute<SILGenNameAttr>() ||
+      Attrs.hasAttribute<CDeclAttr>())
+    F->setHasCReferences(true);
+}
+
 SILFunction *SILModule::getOrCreateFunction(SILLocation loc,
                                             SILDeclRef constant,
-                                            ForDefinition_t forDefinition) {
+                                            ForDefinition_t forDefinition,
+                                            ProfileCounter entryCount) {
 
   auto name = constant.mangle();
   auto constantType = Types.getConstantType(constant).castTo<SILFunctionType>();
@@ -320,11 +347,10 @@ SILFunction *SILModule::getOrCreateFunction(SILLocation loc,
   else if (constant.isAlwaysInline())
     inlineStrategy = AlwaysInline;
 
-  auto *F = SILFunction::create(*this, linkage, name,
-                                constantType, nullptr,
-                                None, IsNotBare, IsTrans, IsSer, IsNotThunk,
-                                constant.getSubclassScope(),
-                                inlineStrategy, EK);
+  auto *F =
+      SILFunction::create(*this, linkage, name, constantType, nullptr, None,
+                          IsNotBare, IsTrans, IsSer, entryCount, IsNotThunk,
+                          constant.getSubclassScope(), inlineStrategy, EK);
   F->setDebugScope(new (*this) SILDebugScope(loc, F));
 
   F->setGlobalInit(constant.isGlobal());
@@ -334,19 +360,12 @@ SILFunction *SILModule::getOrCreateFunction(SILLocation loc,
     if (constant.isForeign && decl->hasClangNode())
       F->setClangNodeOwner(decl);
 
-    auto Attrs = decl->getAttrs();
-    for (auto *A : Attrs.getAttributes<SemanticsAttr>())
-      F->addSemanticsAttr(cast<SemanticsAttr>(A)->Value);
-
-    for (auto *A : Attrs.getAttributes<SpecializeAttr>()) {
-      auto *SA = cast<SpecializeAttr>(A);
-      auto kind = SA->getSpecializationKind() ==
-                          SpecializeAttr::SpecializationKind::Full
-                      ? SILSpecializeAttr::SpecializationKind::Full
-                      : SILSpecializeAttr::SpecializationKind::Partial;
-      F->addSpecializeAttr(SILSpecializeAttr::create(
-          *this, SA->getRequirements(), SA->isExported(), kind));
+    if (auto *FDecl = dyn_cast<FuncDecl>(decl)) {
+      if (auto *StorageDecl = FDecl->getAccessorStorageDecl())
+        // Add attributes for e.g. computed properties.
+        addFunctionAttributes(F, StorageDecl->getAttrs(), *this);
     }
+    addFunctionAttributes(F, decl->getAttrs(), *this);
   }
 
   // If this function has a self parameter, make sure that it has a +0 calling
@@ -364,30 +383,26 @@ SILFunction *SILModule::getOrCreateFunction(SILLocation loc,
   return F;
 }
 
-
-SILFunction *SILModule::getOrCreateSharedFunction(SILLocation loc,
-                                                  StringRef name,
-                                                  CanSILFunctionType type,
-                                                  IsBare_t isBareSILFunction,
-                                                  IsTransparent_t isTransparent,
-                                                  IsSerialized_t isSerialized,
-                                                  IsThunk_t isThunk) {
-  return getOrCreateFunction(loc, name, SILLinkage::Shared,
-                             type, isBareSILFunction, isTransparent, isSerialized,
-                             isThunk, SubclassScope::NotApplicable);
+SILFunction *SILModule::getOrCreateSharedFunction(
+    SILLocation loc, StringRef name, CanSILFunctionType type,
+    IsBare_t isBareSILFunction, IsTransparent_t isTransparent,
+    IsSerialized_t isSerialized, ProfileCounter entryCount, IsThunk_t isThunk) {
+  return getOrCreateFunction(loc, name, SILLinkage::Shared, type,
+                             isBareSILFunction, isTransparent, isSerialized,
+                             entryCount, isThunk, SubclassScope::NotApplicable);
 }
 
 SILFunction *SILModule::createFunction(
     SILLinkage linkage, StringRef name, CanSILFunctionType loweredType,
     GenericEnvironment *genericEnv, Optional<SILLocation> loc,
     IsBare_t isBareSILFunction, IsTransparent_t isTrans,
-    IsSerialized_t isSerialized, IsThunk_t isThunk, SubclassScope subclassScope,
-    Inline_t inlineStrategy, EffectsKind EK, SILFunction *InsertBefore,
-    const SILDebugScope *DebugScope) {
+    IsSerialized_t isSerialized, ProfileCounter entryCount, IsThunk_t isThunk,
+    SubclassScope subclassScope, Inline_t inlineStrategy, EffectsKind EK,
+    SILFunction *InsertBefore, const SILDebugScope *DebugScope) {
   return SILFunction::create(*this, linkage, name, loweredType, genericEnv, loc,
-                             isBareSILFunction, isTrans, isSerialized, isThunk,
-                             subclassScope, inlineStrategy, EK, InsertBefore,
-                             DebugScope);
+                             isBareSILFunction, isTrans, isSerialized,
+                             entryCount, isThunk, subclassScope, inlineStrategy,
+                             EK, InsertBefore, DebugScope);
 }
 
 const IntrinsicInfo &SILModule::getIntrinsicInfo(Identifier ID) {
@@ -510,8 +525,7 @@ SILFunction *SILModule::findFunction(StringRef Name, SILLinkage Linkage) {
   // compilation, simply convert it into an external declaration,
   // so that a compiled version from the shared library is used.
   if (F->isDefinition() &&
-      F->getModule().getOptions().Optimization <
-          SILOptions::SILOptMode::Optimize) {
+      !F->getModule().getOptions().shouldOptimize()) {
     F->convertToDeclaration();
   }
   if (F->isExternalDeclaration())
@@ -734,9 +748,9 @@ removeDeleteNotificationHandler(DeleteNotificationHandler* Handler) {
   NotificationHandlers.remove(Handler);
 }
 
-void SILModule::notifyDeleteHandlers(ValueBase *V) {
+void SILModule::notifyDeleteHandlers(SILNode *node) {
   for (auto *Handler : NotificationHandlers) {
-    Handler->handleDeleteNotification(V);
+    Handler->handleDeleteNotification(node);
   }
 }
 
@@ -757,4 +771,37 @@ bool SILModule::isNoReturnBuiltinOrIntrinsic(Identifier Name) {
   case BuiltinValueKind::ErrorInMain:
     return true;
   }
+}
+
+/// Returns true if it is the OnoneSupport module.
+bool SILModule::isOnoneSupportModule() const {
+  return getSwiftModule()->getName().str() == SWIFT_ONONE_SUPPORT;
+}
+
+/// Returns true if it is the optimized OnoneSupport module.
+bool SILModule::isOptimizedOnoneSupportModule() const {
+  return getOptions().shouldOptimize() && isOnoneSupportModule();
+}
+
+void SILModule::setSerializeSILAction(SILModule::ActionCallback Action) {
+  assert(!SerializeSILAction && "Serialization action can be set only once");
+  SerializeSILAction = Action;
+}
+
+SILModule::ActionCallback SILModule::getSerializeSILAction() const {
+  return SerializeSILAction;
+}
+
+void SILModule::serialize() {
+  assert(SerializeSILAction && "Serialization action should be set");
+  assert(!isSerialized() && "The module was serialized already");
+  SerializeSILAction();
+  setSerialized();
+}
+
+void SILModule::setOptRecordStream(
+    std::unique_ptr<llvm::yaml::Output> &&Stream,
+    std::unique_ptr<llvm::raw_ostream> &&RawStream) {
+  OptRecordStream = std::move(Stream);
+  OptRecordRawStream = std::move(RawStream);
 }
