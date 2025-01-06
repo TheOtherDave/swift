@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -typecheck -verify %s
+// RUN: %target-typecheck-verify-swift
 // REQUIRES: objc_interop
 
 import Foundation
@@ -13,6 +13,7 @@ class Foo: NSObject {
   @objc func method(x: Any) -> Any { return x }
 
   @objc func indirectAny(x: UnsafePointer<Any>) {} // expected-error{{type of the parameter cannot be represented in Objective-C}}
+  // expected-note@-1 {{Swift structs cannot be represented in Objective-C}}
 
   @objc func throwingMethod(x: Any) throws -> Any { return x }
 

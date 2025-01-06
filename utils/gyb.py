@@ -1,24 +1,15 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # GYB: Generate Your Boilerplate (improved names welcome; at least
 # this one's short).  See -h output for instructions
 
-from __future__ import print_function
-
+import io
 import os
 import re
-try:
-    from cStringIO import StringIO
-except ImportError:
-    from io import StringIO
+import sys
 import textwrap
 import tokenize
-
 from bisect import bisect
-
-try:
-    basestring
-except NameError:
-    basestring = str
+from io import StringIO
 
 
 def get_line_starts(s):
@@ -48,7 +39,7 @@ def split_lines(s):
     If the lines are later concatenated, the result is s, possibly
     with a single appended newline.
     """
-    return [l + '\n' for l in s.split('\n')]
+    return [line + '\n' for line in s.split('\n')]
 
 
 # text on a line up to the first '$$', '${', or '%%'
@@ -59,7 +50,7 @@ linesClose = r'[\ \t]* end [\ \t]* (?: \# .* )? $'
 
 # Note: Where "# Absorb" appears below, the regexp attempts to eat up
 # through the end of ${...} and %{...}% constructs.  In reality we
-# handle this with the Python tokenizer, which avoids mis-detections
+# handle this with the Python tokenizer, which avoids misdetections
 # due to nesting, comments and strings.  This extra absorption in the
 # regexp facilitates testing the regexp on its own, by preventing the
 # interior of some of these constructs from being treated as literal
@@ -99,7 +90,7 @@ tokenize_re = re.compile(
   )
 ''', re.VERBOSE | re.MULTILINE)
 
-gyb_block_close = re.compile('\}%[ \t]*\n?')
+gyb_block_close = re.compile(r'\}%[ \t]*\n?')
 
 
 def token_pos_to_index(token_pos, start, line_starts):
@@ -395,8 +386,10 @@ class ParseContext(object):
 
     def __init__(self, filename, template=None):
         self.filename = os.path.abspath(filename)
+        if sys.platform == 'win32':
+            self.filename = '/'.join(self.filename.split(os.sep))
         if template is None:
-            with open(filename) as f:
+            with io.open(os.path.normpath(filename), encoding='utf-8') as f:
                 self.template = f.read()
         else:
             self.template = template
@@ -550,7 +543,8 @@ class ParseContext(object):
         self.token_kind = None
 
 
-_default_line_directive = '// ###sourceLocation'
+_default_line_directive = \
+    '// ###sourceLocation(file: "%(file)s", line: %(line)d)'
 
 
 class ExecutionContext(object):
@@ -572,8 +566,9 @@ class ExecutionContext(object):
                 # We can only insert the line directive at a line break
                 if len(self.result_text) == 0 \
                    or self.result_text[-1].endswith('\n'):
-                    self.result_text.append('%s(file: "%s", line: %d)\n' % (
-                        self.line_directive, file, line + 1))
+                    substitutions = {'file': file, 'line': line + 1}
+                    format_str = self.line_directive + '\n'
+                    self.result_text.append(format_str % substitutions)
                 # But if the new text contains any line breaks, we can create
                 # one
                 elif '\n' in text:
@@ -724,13 +719,15 @@ class Code(ASTNode):
         # If we got a result, the code was an expression, so append
         # its value
         if result is not None \
-                or (isinstance(result, basestring) and result != ''):
+                or (isinstance(result, str) and result != ''):
             from numbers import Number, Integral
             result_string = None
             if isinstance(result, Number) and not isinstance(result, Integral):
                 result_string = repr(result)
-            else:
+            elif isinstance(result, Integral) or isinstance(result, list):
                 result_string = str(result)
+            else:
+                result_string = result
             context.append_text(
                 result_string, self.filename, self.start_line_number)
 
@@ -741,13 +738,13 @@ class Code(ASTNode):
             s = indent + 'Code: {' + source_lines[0] + '}'
         else:
             s = indent + 'Code:\n' + indent + '{\n' + '\n'.join(
-                indent + 4 * ' ' + l for l in source_lines
+                indent + 4 * ' ' + line for line in source_lines
             ) + '\n' + indent + '}'
         return s + self.format_children(indent)
 
 
 def expand(filename, line_directive=_default_line_directive, **local_bindings):
-    r"""Return the contents of the givepn template file, executed with the given
+    r"""Return the contents of the given template file, executed with the given
     local bindings.
 
     >>> from tempfile import NamedTemporaryFile
@@ -756,8 +753,8 @@ def expand(filename, line_directive=_default_line_directive, **local_bindings):
     >>> # manually handle closing and deleting this file to allow us to open
     >>> # the file by its name across all platforms.
     >>> f = NamedTemporaryFile(delete=False)
-    >>> f.write(
-    ... r'''---
+    >>> _ = f.write(
+    ... br'''---
     ... % for i in range(int(x)):
     ... a pox on ${i} for epoxy
     ... % end
@@ -770,9 +767,12 @@ def expand(filename, line_directive=_default_line_directive, **local_bindings):
     ... ''')
     >>> f.flush()
     >>> result = expand(
-    ...   f.name, line_directive='//#sourceLocation', x=2
+    ...     f.name,
+    ...     line_directive='//#sourceLocation(file: "%(file)s", ' + \
+    ...                    'line: %(line)d)',
+    ...     x=2
     ... ).replace(
-    ...   '"%s"' % f.name, '"dummy.file"')
+    ...   '"%s"' % f.name.replace('\\', '/'), '"dummy.file"')
     >>> print(result, end='')
     //#sourceLocation(file: "dummy.file", line: 1)
     ---
@@ -793,7 +793,7 @@ def expand(filename, line_directive=_default_line_directive, **local_bindings):
     >>> f.close()
     >>> os.remove(f.name)
     """
-    with open(filename) as f:
+    with io.open(filename, encoding='utf-8') as f:
         t = parse_template(filename, f.read())
         d = os.getcwd()
         os.chdir(os.path.dirname(os.path.abspath(filename)))
@@ -1060,7 +1060,7 @@ def execute_template(
     Keyword arguments become local variable bindings in the execution context
 
     >>> root_directory = os.path.abspath('/')
-    >>> file_name = root_directory + 'dummy.file'
+    >>> file_name = (root_directory + 'dummy.file').replace('\\', '/')
     >>> ast = parse_template(file_name, text=
     ... '''Nothing
     ... % if x:
@@ -1070,7 +1070,9 @@ def execute_template(
     ... % else:
     ... THIS SHOULD NOT APPEAR IN THE OUTPUT
     ... ''')
-    >>> out = execute_template(ast, line_directive='//#sourceLocation', x=1)
+    >>> out = execute_template(ast,
+    ... line_directive='//#sourceLocation(file: "%(file)s", line: %(line)d)',
+    ... x=1)
     >>> out = out.replace(file_name, "DUMMY-FILE")
     >>> print(out, end="")
     //#sourceLocation(file: "DUMMY-FILE", line: 1)
@@ -1090,12 +1092,31 @@ def execute_template(
     ... % end
     ... ${a}
     ... ''')
-    >>> out = execute_template(ast, line_directive='//#sourceLocation', x=1)
+    >>> out = execute_template(ast,
+    ... line_directive='//#sourceLocation(file: "%(file)s", line: %(line)d)',
+    ... x=1)
     >>> out = out.replace(file_name, "DUMMY-FILE")
     >>> print(out, end="")
     //#sourceLocation(file: "DUMMY-FILE", line: 1)
     Nothing
     //#sourceLocation(file: "DUMMY-FILE", line: 6)
+    [0, 1, 2]
+
+    >>> ast = parse_template(file_name, text=
+    ... '''Nothing
+    ... % a = []
+    ... % for x in range(3):
+    ... %    a.append(x)
+    ... % end
+    ... ${a}
+    ... ''')
+    >>> out = execute_template(ast,
+    ...         line_directive='#line %(line)d "%(file)s"', x=1)
+    >>> out = out.replace(file_name, "DUMMY-FILE")
+    >>> print(out, end="")
+    #line 1 "DUMMY-FILE"
+    Nothing
+    #line 6 "DUMMY-FILE"
     [0, 1, 2]
     """
     execution_context = ExecutionContext(
@@ -1105,16 +1126,6 @@ def execute_template(
 
 
 def main():
-    """
-    Lint this file.
-    >>> import sys
-    >>> gyb_path = os.path.realpath(__file__).replace('.pyc', '.py')
-    >>> sys.path.append(os.path.dirname(gyb_path))
-    >>> import python_lint
-    >>> python_lint.lint([gyb_path], verbose=False)
-    0
-    """
-
     import argparse
     import sys
 
@@ -1187,12 +1198,12 @@ def main():
         help='''Bindings to be set in the template's execution context''')
 
     parser.add_argument(
-        'file', type=argparse.FileType(),
+        'file', type=str,
         help='Path to GYB template file (defaults to stdin)', nargs='?',
-        default=sys.stdin)
+        default='-')
     parser.add_argument(
-        '-o', dest='target', type=argparse.FileType('w'),
-        help='Output file (defaults to stdout)', default=sys.stdout)
+        '-o', dest='target', type=str,
+        help='Output file (defaults to stdout)', default='-')
     parser.add_argument(
         '--test', action='store_true',
         default=False, help='Run a self-test')
@@ -1203,8 +1214,17 @@ def main():
         '--dump', action='store_true',
         default=False, help='Dump the parsed template to stdout')
     parser.add_argument(
-        '--line-directive', default='// ###sourceLocation',
-        help='Line directive prefix; empty => no line markers')
+        '--line-directive',
+        default=_default_line_directive,
+        help='''
+             Line directive format string, which will be
+             provided 2 substitutions, `%%(line)d` and `%%(file)s`.
+
+             Example: `#sourceLocation(file: "%%(file)s", line: %%(line)d)`
+
+             The default works automatically with the `line-directive` tool,
+             which see for more information.
+             ''')
 
     args = parser.parse_args(sys.argv[1:])
 
@@ -1215,15 +1235,27 @@ def main():
             sys.exit(1)
 
     bindings = dict(x.split('=', 1) for x in args.defines)
-    ast = parse_template(args.file.name, args.file.read())
+    if args.file == '-':
+        ast = parse_template('stdin', sys.stdin.read())
+    else:
+        with io.open(os.path.normpath(args.file), 'r', encoding='utf-8') as f:
+            ast = parse_template(args.file, f.read())
     if args.dump:
         print(ast)
+
     # Allow the template to open files and import .py files relative to its own
     # directory
-    os.chdir(os.path.dirname(os.path.abspath(args.file.name)))
+    saved_cwd = os.getcwd()
+    os.chdir(os.path.dirname(os.path.abspath(args.file)))
     sys.path = ['.'] + sys.path
+    result_text = execute_template(ast, args.line_directive, **bindings)
 
-    args.target.write(execute_template(ast, args.line_directive, **bindings))
+    if args.target == '-':
+        sys.stdout.write(result_text)
+    else:
+        os.chdir(saved_cwd)
+        with io.open(args.target, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(result_text)
 
 
 if __name__ == '__main__':

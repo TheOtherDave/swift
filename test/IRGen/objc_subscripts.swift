@@ -1,66 +1,77 @@
-// RUN: %target-swift-frontend -assume-parsing-unqualified-ownership-sil -primary-file %s -emit-ir -disable-objc-attr-requires-foundation-module | %FileCheck %s
+// RUN: %target-swift-frontend -primary-file %s -emit-ir -enable-objc-interop -disable-objc-attr-requires-foundation-module | %FileCheck %s -check-prefix=CHECK -check-prefix=CHECK-%target-ptrauth
 
-// REQUIRES: CPU=x86_64
-// REQUIRES: objc_interop
+// REQUIRES: PTRSIZE=64
 
 // CHECK: @_INSTANCE_METHODS__TtC15objc_subscripts10SomeObject = 
-// CHECK:   private constant { i32, i32, [5 x { i8*, i8*, i8* }] } 
-// CHECK:   { i32 24, i32 5, [5 x { i8*, i8*, i8* }] 
+// CHECK:   internal constant { i32, i32, [5 x { ptr, ptr, ptr }] } 
+// CHECK:   { i32 24, i32 5, [5 x { ptr, ptr, ptr }] 
 // CHECK:     [
-// CHECK:       { i8*, i8*, i8* } 
+// CHECK:       { ptr, ptr, ptr } 
 // CHECK:         { 
-// CHECK:           i8* getelementptr inbounds ([26 x i8], [26 x i8]* @"\01L_selector_data(objectAtIndexedSubscript:)", i64 0, i64 0), 
-// CHECK:           i8* null, 
-// CHECK:           i8* bitcast ([[OPAQUE0:%.*]]* ([[OPAQUE1:%.*]]*, i8*, i64)* @_T015objc_subscripts10SomeObjectCACSicigTo to i8*)
+// CHECK:           ptr @"\01L_selector_data(objectAtIndexedSubscript:)", 
+// CHECK:           ptr @".str.10.@24@0:8q16",
+// CHECK-noptrauth: ptr @"$s15objc_subscripts10SomeObjectCyACSicigTo"
+// CHECK-ptrauth:   ptr @"$s15objc_subscripts10SomeObjectCyACSicigTo.ptrauth"
 // CHECK:         }, 
-// CHECK:       { i8*, i8*, i8* } 
+// CHECK:       { ptr, ptr, ptr } 
 // CHECK:         { 
-// CHECK:           i8* getelementptr inbounds ([30 x i8], [30 x i8]* @"\01L_selector_data(setObject:atIndexedSubscript:)", i64 0, i64 0), 
-// CHECK:           i8* null, 
-// CHECK:           i8* bitcast (void ([[OPAQUE2:%.*]]*, i8*, [[OPAQUE3:%.*]]*, i64)* @_T015objc_subscripts10SomeObjectCACSicisTo to i8*)
+// CHECK:           ptr @"\01L_selector_data(setObject:atIndexedSubscript:)", 
+// CHECK:           ptr @".str.13.v32@0:8@16q24",
+// CHECK-noptrauth: ptr @"$s15objc_subscripts10SomeObjectCyACSicisTo"
+// CHECK-ptrauth:   ptr @"$s15objc_subscripts10SomeObjectCyACSicisTo.ptrauth"
 // CHECK:         },
-// CHECK:       { i8*, i8*, i8* } 
+// CHECK:       { ptr, ptr, ptr } 
 // CHECK:         { 
-// CHECK:           i8* getelementptr inbounds ([25 x i8], [25 x i8]* @"\01L_selector_data(objectForKeyedSubscript:)", i64 0, i64 0), 
-// CHECK:           i8* null, 
-// CHECK:           i8* bitcast (i64 ([[OPAQUE4:%.*]]*, i8*, [[OPAQUE5:%.*]]*)* @_T015objc_subscripts10SomeObjectCSiACcigTo to i8*)
+// CHECK:           ptr @"\01L_selector_data(objectForKeyedSubscript:)", 
+// CHECK:           ptr @".str.10.q24@0:8@16",
+// CHECK-noptrauth: ptr @"$s15objc_subscripts10SomeObjectCySiACcigTo"
+// CHECK-ptrauth:   ptr @"$s15objc_subscripts10SomeObjectCySiACcigTo.ptrauth"
 // CHECK:         }, 
-// CHECK:       { i8*, i8*, i8* } 
+// CHECK:       { ptr, ptr, ptr } 
 // CHECK:         { 
-// CHECK:           i8* getelementptr inbounds ([29 x i8], [29 x i8]* @"\01L_selector_data(setObject:forKeyedSubscript:)", i64 0, i64 0), 
-// CHECK:           i8* null, 
-// CHECK:           i8* bitcast (void ([[OPAQUE6:%.*]]*, i8*, i64, [[OPAQUE7:%.*]]*)* @_T015objc_subscripts10SomeObjectCSiACcisTo to i8*)
+// CHECK:           ptr @"\01L_selector_data(setObject:forKeyedSubscript:)", 
+// CHECK:           ptr @".str.13.v32@0:8q16@24",
+// CHECK-noptrauth: ptr @"$s15objc_subscripts10SomeObjectCySiACcisTo"
+// CHECK-ptrauth:   ptr @"$s15objc_subscripts10SomeObjectCySiACcisTo.ptrauth"
 // CHECK:         },
-// CHECK:       { i8*, i8*, i8* } 
-// CHECK:         { i8* getelementptr inbounds ([5 x i8], [5 x i8]* @"\01L_selector_data(init)", i64 0, i64 0), i8* getelementptr inbounds ([8 x i8], [8 x i8]* @{{[0-9]+}}, i64 0, i64 0), i8* bitcast ([[OPAQUE8:%.*]]* ([[OPAQUE9:%.*]]*, i8*)* @_T015objc_subscripts10SomeObjectCACycfcTo to i8*) }
+// CHECK:       { ptr, ptr, ptr } 
+// CHECK:         {
+// CHECK:           ptr @"\01L_selector_data(init)",
+// CHECK:           ptr @".str.7.@16@0:8",
+// CHECK-noptrauth: ptr @"$s15objc_subscripts10SomeObjectCACycfcTo"
+// CHECK-ptrauth:   ptr @"$s15objc_subscripts10SomeObjectCACycfcTo.ptrauth"
+// CHECK:         }
 // CHECK:    ]
-// CHECK:  }, section "__DATA, __objc_const", align 8
+// CHECK:  }
 
 @objc class SomeObject {
-  subscript (i : Int) -> SomeObject {
-    // CHECK: define internal [[OPAQUE0:%.*]]* @_T015objc_subscripts10SomeObjectCACSicigTo([[OPAQUE1]]*, i8*, i64) unnamed_addr
+  @objc subscript (i : Int) -> SomeObject {
+    // CHECK-noptrauth: define internal ptr @"$s15objc_subscripts10SomeObjectCyACSicigTo"(ptr %0, ptr %1, i64 %2) {{[#0-9]*}} {
+    // CHECK-ptrauth:   define internal ptr @"$s15objc_subscripts10SomeObjectCyACSicigTo"(ptr %0, ptr %1, i64 %2) {{[#0-9]*}} {
     get {
-      // CHECK: call swiftcc %T15objc_subscripts10SomeObjectC* @_T015objc_subscripts10SomeObjectCACSicig
+      // CHECK: call swiftcc ptr @"$s15objc_subscripts10SomeObjectCyACSicig"
       return self
     }
 
-    // CHECK-LABEL: define internal void @_T015objc_subscripts10SomeObjectCACSicisTo
+    // CHECK-LABEL: define internal void @"$s15objc_subscripts10SomeObjectCyACSicisTo"
     set {
-      // CHECK: swiftcc void @_T015objc_subscripts10SomeObjectCACSicis
+      // CHECK: swiftcc void @"$s15objc_subscripts10SomeObjectCyACSicis"
     }
   }
 
-  subscript (s : SomeObject) -> Int {
-  // CHECK-LABEL: define internal i64 @_T015objc_subscripts10SomeObjectCSiACcigTo
+  @objc subscript (s : SomeObject) -> Int {
+  // CHECK-LABEL: define internal i64 @"$s15objc_subscripts10SomeObjectCySiACcigTo"
     get {
-      // CHECK: call swiftcc i64 @_T015objc_subscripts10SomeObjectCSiACcig
+      // CHECK: call swiftcc i64 @"$s15objc_subscripts10SomeObjectCySiACcig"
       return 5
     }
 
-    // CHECK-LABEL: define internal void @_T015objc_subscripts10SomeObjectCSiACcisTo
+    // CHECK-LABEL: define internal void @"$s15objc_subscripts10SomeObjectCySiACcisTo"
     set {
-      // CHECK: call swiftcc void @_T015objc_subscripts10SomeObjectCSiACcis
+      // CHECK: call swiftcc void @"$s15objc_subscripts10SomeObjectCySiACcis"
     }
   }
+
+  @objc init() {}
 }
 

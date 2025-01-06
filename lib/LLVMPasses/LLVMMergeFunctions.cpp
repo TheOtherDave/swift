@@ -28,25 +28,26 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/Basic/Assertions.h"
 #include "swift/LLVMPasses/Passes.h"
-#include "llvm/Transforms/IPO.h"
-#include "llvm/Transforms/Utils/FunctionComparator.h"
+#include "clang/AST/StableHash.h"
+#include "clang/Basic/PointerAuthOptions.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/FoldingSet.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/Statistic.h"
-#include "llvm/ADT/Hashing.h"
 #include "llvm/IR/Attributes.h"
-#include "llvm/IR/CallSite.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/GlobalPtrAuthInfo.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/StructuralHash.h"
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/IR/ValueMap.h"
 #include "llvm/Pass.h"
@@ -54,6 +55,9 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/IPO.h"
+#include "llvm/Transforms/Utils/FunctionComparator.h"
 #include <vector>
 
 using namespace llvm;
@@ -75,7 +79,7 @@ static cl::opt<unsigned> FunctionMergeThreshold(
     "swiftmergefunc-threshold",
     cl::desc("Functions larger than the threshold are considered for merging."
              "'0' disables function merging at all."),
-    cl::init(30), cl::Hidden);
+    cl::init(15), cl::Hidden);
 
 namespace {
 
@@ -110,6 +114,34 @@ static bool isEligibleForConstantSharing(const Instruction *I) {
   }
 }
 
+/// Returns true if the \opIdx operand of \p CI is the callee operand.
+static bool isCalleeOperand(const CallInst *CI, unsigned opIdx) {
+  return &CI->getCalledOperandUse() == &CI->getOperandUse(opIdx);
+}
+
+static bool canParameterizeCallOperand(const CallInst *CI, unsigned opIdx) {
+  if (CI->isInlineAsm())
+    return false;
+
+  Function *Callee = CI->getCalledOperand() ?
+      dyn_cast_or_null<Function>(CI->getCalledOperand()->stripPointerCasts()) :
+      nullptr;
+  if (Callee) {
+    if (Callee->isIntrinsic())
+      return false;
+    // objc_msgSend stubs must be called, and can't have their address taken.
+    if (Callee->getName().starts_with("objc_msgSend$"))
+      return false;
+  }
+  if (isCalleeOperand(CI, opIdx) &&
+      CI->getOperandBundle(LLVMContext::OB_ptrauth).has_value()) {
+    // The operand is the callee and it has already been signed. Ignore this
+    // because we cannot add another ptrauth bundle to the call instruction.
+    return false;
+  }
+  return true;
+}
+
 int SwiftFunctionComparator::
 cmpOperandsIgnoringConsts(const Instruction *L, const Instruction *R,
                           unsigned opIdx) {
@@ -127,18 +159,9 @@ cmpOperandsIgnoringConsts(const Instruction *L, const Instruction *R,
     return Res;
 
   if (const auto *CL = dyn_cast<CallInst>(L)) {
-    if (CL->isInlineAsm())
+    if (!canParameterizeCallOperand(CL, opIdx) ||
+        !canParameterizeCallOperand(cast<CallInst>(R), opIdx)) {
       return Res;
-    if (Function *CalleeL = CL->getCalledFunction()) {
-      if (CalleeL->isIntrinsic())
-        return Res;
-    }
-    const CallInst *CR = cast<CallInst>(R);
-    if (CR->isInlineAsm())
-      return Res;
-    if (Function *CalleeR = CR->getCalledFunction()) {
-      if (CalleeR->isIntrinsic())
-        return Res;
     }
   }
 
@@ -214,22 +237,17 @@ namespace {
 /// parameter. The original functions are replaced by thunks which call the
 /// merged function with the specific argument constants.
 ///
-class SwiftMergeFunctions : public ModulePass {
+class SwiftMergeFunctions {
 public:
-  static char ID;
-  SwiftMergeFunctions()
-    : ModulePass(ID), FnTree(FunctionNodeCmp(&GlobalNumbers)) {
-  }
+  SwiftMergeFunctions() : FnTree(FunctionNodeCmp(&GlobalNumbers)) {}
 
-  bool runOnModule(Module &M) override;
+  SwiftMergeFunctions(bool ptrAuthEnabled, unsigned ptrAuthKey)
+      : FnTree(FunctionNodeCmp(&GlobalNumbers)), ptrAuthOptionsSet(true),
+        ptrAuthEnabled(ptrAuthEnabled), ptrAuthKey(ptrAuthKey) {}
+
+  bool runOnModule(Module &M);
 
 private:
-  enum {
-    /// The maximum number of parameters added to a merged functions. This
-    /// roughly corresponds to the number of differing constants.
-    maxAddedParams = 4
-  };
-
   struct FunctionEntry;
 
   /// Describes the set of functions which are considered as "equivalent" (i.e.
@@ -240,11 +258,12 @@ private:
     FunctionEntry *First;
 
     /// A very cheap hash, used to early exit if functions do not match.
-    FunctionComparator::FunctionHash Hash;
+    llvm::IRHash Hash;
+
   public:
     // Note the hash is recalculated potentially multiple times, but it is cheap.
     EquivalenceClass(FunctionEntry *First)
-      : First(First), Hash(FunctionComparator::functionHash(*First->F)) {
+        : First(First), Hash(llvm::StructuralHash(*First->F)) {
       assert(!First->Next);
     }
   };
@@ -263,7 +282,7 @@ private:
       return FCmp.compareIgnoringConsts() == -1;
     }
   };
-  typedef std::set<EquivalenceClass, FunctionNodeCmp> FnTreeType;
+  using FnTreeType = std::set<EquivalenceClass, FunctionNodeCmp>;
 
   /// 
   struct FunctionEntry {
@@ -312,7 +331,7 @@ private:
     /// Advances the current instruction to the next instruction.
     void nextInst() {
       assert(CurrentInst);
-      if (isa<TerminatorInst>(CurrentInst)) {
+      if (CurrentInst->isTerminator()) {
         auto BlockIter = std::next(CurrentInst->getParent()->getIterator());
         if (BlockIter == F->end()) {
           CurrentInst = nullptr;
@@ -322,6 +341,14 @@ private:
         return;
       }
       CurrentInst = &*std::next(CurrentInst->getIterator());
+    }
+
+    /// Returns true if the operand \p OpIdx of the current instruction is the
+    /// callee of a call, which needs to be signed if passed as a parameter.
+    bool needsPointerSigning(unsigned OpIdx) const {
+      if (auto *CI = dyn_cast<CallInst>(CurrentInst))
+        return isCalleeOperand(CI, OpIdx);
+      return false;
     }
 
     Function *F;
@@ -334,7 +361,7 @@ private:
     int NumParamsNeeded;
   };
 
-  typedef SmallVector<FunctionInfo, 8> FunctionInfos;
+  using FunctionInfos = SmallVector<FunctionInfo, 8>;
 
   /// Describes a parameter which we create to parameterize the merged function.
   struct ParamInfo {
@@ -345,12 +372,25 @@ private:
     /// All uses of the parameter in the merged function.
     SmallVector<OpLocation, 16> Uses;
 
+    /// The discriminator for pointer signing.
+    /// Only not null if needsPointerSigning is true.
+    ConstantInt *discriminator = nullptr;
+
+    /// True if the value is a callee function, which needs to be signed if
+    /// passed as a parameter.
+    bool needsPointerSigning = false;
+
     /// Checks if this parameter can be used to describe an operand in all
     /// functions of the equivalence class. Returns true if all values match
     /// the specific instruction operands in all functions.
-    bool matches(const FunctionInfos &FInfos, unsigned OpIdx) const {
+    bool matches(const FunctionInfos &FInfos, unsigned OpIdx,
+                 bool ptrAuthEnabled) const {
       unsigned NumFuncs = FInfos.size();
       assert(Values.size() == NumFuncs);
+      if (ptrAuthEnabled &&
+          needsPointerSigning != FInfos[0].needsPointerSigning(OpIdx)) {
+        return false;
+      }
       for (unsigned Idx = 0; Idx < NumFuncs; ++Idx) {
         const FunctionInfo &FI = FInfos[Idx];
         Constant *C = cast<Constant>(FI.CurrentInst->getOperand(OpIdx));
@@ -359,9 +399,32 @@ private:
       }
       return true;
     }
+    
+    /// Computes the discriminator for pointer signing.
+    void computeDiscriminator(LLVMContext &Context) {
+      assert(needsPointerSigning);
+      assert(!discriminator);
+      
+      /// Get a hash from the concatenated function names.
+      /// The hash is deterministic, because the order of values depends on the
+      /// order of functions in the module, which is itself deterministic.
+      /// Note that the hash is not part of the ABI, because it's purly used
+      /// for pointer authentication between a module-private caller-callee
+      /// pair.
+      std::string concatenatedCalleeNames;
+      for (Constant *value : Values) {
+        if (auto *GO = dyn_cast<GlobalObject>(value))
+          concatenatedCalleeNames += GO->getName();
+      }
+      uint64_t rawHash = clang::getStableStringHash(concatenatedCalleeNames);
+      IntegerType *discrTy = Type::getInt64Ty(Context);
+      discriminator = ConstantInt::get(discrTy, (rawHash % 0xFFFF) + 1);
+    }
   };
 
-  typedef SmallVector<ParamInfo, maxAddedParams> ParamInfos;
+  using ParamInfos = SmallVector<ParamInfo, 16>;
+
+  Module *module = nullptr;
 
   GlobalNumberState GlobalNumbers;
 
@@ -374,6 +437,20 @@ private:
   FnTreeType FnTree;
 
   ValueMap<Function*, FunctionEntry *> FuncEntries;
+
+  // Maps a function-pointer / discriminator pair to a corresponding global in
+  // the llvm.ptrauth section.
+  // This map is used as a cache to not create ptrauth globals twice.
+  DenseMap<std::pair<Constant *, ConstantInt *>, Constant *> ptrAuthGlobals;
+
+  /// If true, ptrAuthEnabled and ptrAuthKey are valid.
+  bool ptrAuthOptionsSet = false;
+
+  /// True if the architecture has pointer authentication enabled.
+  bool ptrAuthEnabled = false;
+  
+  /// The key for pointer authentication.
+  unsigned ptrAuthKey = 0;
 
   FunctionEntry *getEntry(Function *F) const {
     return FuncEntries.lookup(F);
@@ -389,7 +466,7 @@ private:
   }
 
   /// Checks the rules of order relation introduced among functions set.
-  /// Returns true, if sanity check has been passed, and false if failed.
+  /// Returns true, if soundness check has been passed, and false if failed.
   bool doSanityCheck(std::vector<WeakTrackingVH> &Worklist);
 
   /// Updates the numUnhandledCallees of all user functions of the equivalence
@@ -400,12 +477,18 @@ private:
 
   FunctionInfo removeFuncWithMostParams(FunctionInfos &FInfos);
 
-  bool deriveParams(ParamInfos &Params, FunctionInfos &FInfos);
+  bool deriveParams(ParamInfos &Params, FunctionInfos &FInfos,
+                    unsigned maxParams);
+
+  bool numOperandsDiffer(FunctionInfos &FInfos);
 
   bool constsDiffer(const FunctionInfos &FInfos, unsigned OpIdx);
 
   bool tryMapToParameter(FunctionInfos &FInfos, unsigned OpIdx,
-                         ParamInfos &Params);
+                         ParamInfos &Params, unsigned maxParams);
+
+  void replaceCallWithAddedPtrAuth(CallInst *origCall, Value *newCallee,
+                                   ConstantInt *discriminator);
 
   void mergeWithParams(const FunctionInfos &FInfos, ParamInfos &Params);
 
@@ -414,25 +497,65 @@ private:
   void writeThunk(Function *ToFunc, Function *Thunk,
                   const ParamInfos &Params, unsigned FuncIdx);
 
+  bool isPtrAuthEnabled() const {
+    assert(ptrAuthOptionsSet);
+    return ptrAuthEnabled;
+  }
+
+  ConstantInt *getPtrAuthKey() {
+    assert(isPtrAuthEnabled());
+    return ConstantInt::get(Type::getInt32Ty(module->getContext()), ptrAuthKey);
+  }
+
+  /// Returns the value of function \p FuncIdx, and signes it if required.
+  Constant *getSignedValue(const ParamInfo &PI, unsigned FuncIdx) {
+    Constant *value = PI.Values[FuncIdx];
+    if (!PI.needsPointerSigning)
+      return value;
+
+    auto lookupKey = std::make_pair(value, PI.discriminator);
+    Constant *&ptrAuthGlobal = ptrAuthGlobals[lookupKey];
+    if (!ptrAuthGlobal) {
+      ptrAuthGlobal = GlobalPtrAuthInfo::create(*module, value,
+                             getPtrAuthKey(),
+                             ConstantInt::get(PI.discriminator->getType(), 0),
+                             PI.discriminator);
+    }
+    return ptrAuthGlobal;
+  }
+
   /// Replace all direct calls of Old with calls of New. Will bitcast New if
   /// necessary to make types match.
   bool replaceDirectCallers(Function *Old, Function *New,
                             const ParamInfos &Params, unsigned FuncIdx);
 };
 
+class LegacySwiftMergeFunctions : public ModulePass {
+public:
+  static char ID;
+  SwiftMergeFunctions impl;
+
+  LegacySwiftMergeFunctions() : ModulePass(ID) {}
+
+  LegacySwiftMergeFunctions(bool ptrAuthEnabled, unsigned ptrAuthKey)
+      : ModulePass(ID), impl(ptrAuthEnabled, ptrAuthKey) {}
+  bool runOnModule(Module &M) override { return impl.runOnModule(M); }
+};
+
 } // end anonymous namespace
 
-char SwiftMergeFunctions::ID = 0;
-INITIALIZE_PASS_BEGIN(SwiftMergeFunctions,
-                      "swift-merge-functions", "Swift merge function pass",
-                      false, false)
-INITIALIZE_PASS_END(SwiftMergeFunctions,
-                    "swift-merge-functions", "Swift merge function pass",
-                    false, false)
+char LegacySwiftMergeFunctions::ID = 0;
+INITIALIZE_PASS_BEGIN(LegacySwiftMergeFunctions, "swift-merge-functions",
+                      "Swift merge function pass", false, false)
+INITIALIZE_PASS_END(LegacySwiftMergeFunctions, "swift-merge-functions",
+                    "Swift merge function pass", false, false)
 
-llvm::ModulePass *swift::createSwiftMergeFunctionsPass() {
-  initializeSwiftMergeFunctionsPass(*llvm::PassRegistry::getPassRegistry());
-  return new SwiftMergeFunctions();
+llvm::ModulePass *
+swift::createLegacySwiftMergeFunctionsPass(bool ptrAuthEnabled,
+                                           unsigned ptrAuthKey) {
+  initializeLegacySwiftMergeFunctionsPass(
+      *llvm::PassRegistry::getPassRegistry());
+  return new LegacySwiftMergeFunctions(ptrAuthEnabled, ptrAuthKey);
 }
 
 bool SwiftMergeFunctions::doSanityCheck(std::vector<WeakTrackingVH> &Worklist) {
@@ -460,8 +583,8 @@ bool SwiftMergeFunctions::doSanityCheck(std::vector<WeakTrackingVH> &Worklist) {
         if (Res1 != -Res2) {
           dbgs() << "MERGEFUNC-SANITY: Non-symmetric; triple: " << TripleNumber
                  << "\n";
-          F1->dump();
-          F2->dump();
+          LLVM_DEBUG(F1->dump());
+          LLVM_DEBUG(F2->dump());
           Valid = false;
         }
 
@@ -498,9 +621,9 @@ bool SwiftMergeFunctions::doSanityCheck(std::vector<WeakTrackingVH> &Worklist) {
                    << TripleNumber << "\n";
             dbgs() << "Res1, Res3, Res4: " << Res1 << ", " << Res3 << ", "
                    << Res4 << "\n";
-            F1->dump();
-            F2->dump();
-            F3->dump();
+            LLVM_DEBUG(F1->dump());
+            LLVM_DEBUG(F2->dump());
+            LLVM_DEBUG(F3->dump());
             Valid = false;
           }
         }
@@ -513,6 +636,42 @@ bool SwiftMergeFunctions::doSanityCheck(std::vector<WeakTrackingVH> &Worklist) {
   return true;
 }
 
+/// Returns true if functions containing calls to \p F may be merged together.
+static bool mayMergeCallsToFunction(Function &F) {
+  StringRef Name = F.getName();
+
+  // Calls to dtrace probes must generate unique patchpoints.
+  if (Name.starts_with("__dtrace"))
+    return false;
+
+  return true;
+}
+
+/// Returns the benefit, which is approximately the size of the function.
+/// Return 0, if the function should not be merged.
+static unsigned getBenefit(Function *F) {
+  unsigned Benefit = 0;
+
+  // We don't want to merge very small functions, because the overhead of
+  // adding creating thunks and/or adding parameters to the call sites
+  // outweighs the benefit.
+  for (BasicBlock &BB : *F) {
+    for (Instruction &I : BB) {
+      if (CallBase *CB = dyn_cast<CallBase>(&I)) {
+        Function *Callee = CB->getCalledFunction();
+        if (Callee && !mayMergeCallsToFunction(*Callee))
+          return 0;
+        if (!Callee || !Callee->isIntrinsic()) {
+          Benefit += 5;
+          continue;
+        }
+      }
+      Benefit += 1;
+    }
+  }
+  return Benefit;
+}
+
 /// Returns true if function \p F is eligible for merging.
 static bool isEligibleFunction(Function *F) {
   if (F->isDeclaration())
@@ -523,24 +682,11 @@ static bool isEligibleFunction(Function *F) {
 
   if (F->getFunctionType()->isVarArg())
     return false;
-  
-  unsigned Benefit = 0;
 
-  // We don't want to merge very small functions, because the overhead of
-  // adding creating thunks and/or adding parameters to the call sites
-  // outweighs the benefit.
-  for (BasicBlock &BB : *F) {
-    for (Instruction &I : BB) {
-      if (CallSite CS = CallSite(&I)) {
-        Function *Callee = CS.getCalledFunction();
-        if (!Callee || !Callee->isIntrinsic()) {
-          Benefit += 5;
-          continue;
-        }
-      }
-      Benefit += 1;
-    }
-  }
+  if (F->getCallingConv() == CallingConv::SwiftTail)
+    return false;
+  
+  unsigned Benefit = getBenefit(F);
   if (Benefit < FunctionMergeThreshold)
     return false;
   
@@ -552,25 +698,33 @@ bool SwiftMergeFunctions::runOnModule(Module &M) {
   if (FunctionMergeThreshold == 0)
     return false;
 
+  module = &M;
+
+  if (!ptrAuthOptionsSet) {
+    // If invoked from IRGen in the compiler, those options are already set.
+    // If invoked from swift-llvm-opt, derive the options from the target triple.
+    Triple triple(M.getTargetTriple());
+    ptrAuthEnabled = (triple.getSubArch() == Triple::AArch64SubArch_arm64e);
+    ptrAuthKey = (unsigned)clang::PointerAuthSchema::ARM8_3Key::ASIA;
+    ptrAuthOptionsSet = true;
+  }
+
   bool Changed = false;
 
   // All functions in the module, ordered by hash. Functions with a unique
   // hash value are easily eliminated.
-  std::vector<std::pair<FunctionComparator::FunctionHash, Function *>>
-    HashedFuncs;
+  std::vector<std::pair<IRHash, Function *>> HashedFuncs;
 
   for (Function &Func : M) {
     if (isEligibleFunction(&Func)) {
-      HashedFuncs.push_back({FunctionComparator::functionHash(Func), &Func});
+      HashedFuncs.push_back({llvm::StructuralHash(Func), &Func});
     }
   }
 
   std::stable_sort(
       HashedFuncs.begin(), HashedFuncs.end(),
-      [](const std::pair<FunctionComparator::FunctionHash, Function *> &a,
-         const std::pair<FunctionComparator::FunctionHash, Function *> &b) {
-        return a.first < b.first;
-      });
+      [](const std::pair<IRHash, Function *> &a,
+         const std::pair<IRHash, Function *> &b) { return a.first < b.first; });
 
   std::vector<FunctionEntry> FuncEntryStorage;
   FuncEntryStorage.reserve(HashedFuncs.size());
@@ -595,9 +749,9 @@ bool SwiftMergeFunctions::runOnModule(Module &M) {
     std::vector<WeakTrackingVH> Worklist;
     Deferred.swap(Worklist);
 
-    DEBUG(dbgs() << "======\nbuild tree: worklist-size=" << Worklist.size() <<
-                    '\n');
-    DEBUG(doSanityCheck(Worklist));
+    LLVM_DEBUG(dbgs() << "======\nbuild tree: worklist-size="
+                      << Worklist.size() << '\n');
+    LLVM_DEBUG(doSanityCheck(Worklist));
 
     SmallVector<FunctionEntry *, 8> FuncsToMerge;
 
@@ -616,10 +770,10 @@ bool SwiftMergeFunctions::runOnModule(Module &M) {
 
       if (Result.second) {
         assert(Eq.First == FE);
-        DEBUG(dbgs() << "  new in tree: " << F->getName() << '\n');
+        LLVM_DEBUG(dbgs() << "  new in tree: " << F->getName() << '\n');
       } else {
         assert(Eq.First != FE);
-        DEBUG(dbgs() << "  add to existing: " << F->getName() << '\n');
+        LLVM_DEBUG(dbgs() << "  add to existing: " << F->getName() << '\n');
         // Add the function to the existing equivalence class.
         FE->Next = Eq.First->Next;
         Eq.First->Next = FE;
@@ -629,7 +783,8 @@ bool SwiftMergeFunctions::runOnModule(Module &M) {
           FuncsToMerge.push_back(Eq.First);
       }
     }
-    DEBUG(dbgs() << "merge functions: tree-size=" << FnTree.size() << '\n');
+    LLVM_DEBUG(dbgs() << "merge functions: tree-size=" << FnTree.size()
+                      << '\n');
 
     // Figure out the leaf functions. We want to do the merging in bottom-up
     // call order. This ensures that we don't parameterize on callee function
@@ -666,6 +821,7 @@ bool SwiftMergeFunctions::runOnModule(Module &M) {
   FnTree.clear();
   GlobalNumbers.clear();
   FuncEntries.clear();
+  ptrAuthGlobals.clear();
 
   return Changed;
 }
@@ -709,12 +865,17 @@ bool SwiftMergeFunctions::tryMergeEquivalenceClass(FunctionEntry *FirstInClass) 
   bool Changed = false;
   int Try = 0;
 
+  unsigned Benefit = getBenefit(FirstInClass->F);
+  
+  // The bigger the function, the more parameters are allowed.
+  unsigned maxParams = std::max(4u, Benefit / 100);
+
   // We need multiple tries if there are some functions in FInfos which differ
   // too much from the first function in FInfos. But we limit the number of
   // tries to a small number, because this is quadratic.
   while (FInfos.size() >= 2 && Try++ < 4) {
     ParamInfos Params;
-    bool Merged = deriveParams(Params, FInfos);
+    bool Merged = deriveParams(Params, FInfos, maxParams);
     if (Merged) {
       mergeWithParams(FInfos, Params);
       Changed = true;
@@ -753,7 +914,8 @@ removeFuncWithMostParams(FunctionInfos &FInfos) {
 /// Returns true on success, i.e. the functions in \p FInfos can be merged with
 /// the parameters returned in \p Params.
 bool SwiftMergeFunctions::deriveParams(ParamInfos &Params,
-                                       FunctionInfos &FInfos) {
+                                       FunctionInfos &FInfos,
+                                       unsigned maxParams) {
   for (FunctionInfo &FI : FInfos)
     FI.init();
 
@@ -762,13 +924,27 @@ bool SwiftMergeFunctions::deriveParams(ParamInfos &Params,
   // Iterate over all instructions synchronously in all functions.
   do {
     if (isEligibleForConstantSharing(FirstFI.CurrentInst)) {
+
+      // Here we handle a rare corner case which needs to be explained:
+      // Usually the number of operands match, because otherwise the functions
+      // in FInfos would not be in the same equivalence class. There is only one
+      // exception to that: If the current instruction is a call to a function,
+      // which was merged in the previous iteration (in tryMergeEquivalenceClass)
+      // then the call could be replaced and has more arguments than the
+      // original call.
+      if (numOperandsDiffer(FInfos)) {
+        assert(isa<CallInst>(FirstFI.CurrentInst) &&
+               "only calls are expected to differ in number of operands");
+        return false;
+      }
+
       for (unsigned OpIdx = 0, NumOps = FirstFI.CurrentInst->getNumOperands();
            OpIdx != NumOps; ++OpIdx) {
 
         if (constsDiffer(FInfos, OpIdx)) {
           // This instruction has operands which differ in at least some
           // functions. So we need to parameterize it.
-          if (!tryMapToParameter(FInfos, OpIdx, Params)) {
+          if (!tryMapToParameter(FInfos, OpIdx, Params, maxParams)) {
             // We ran out of parameters.
             return false;
           }
@@ -781,6 +957,16 @@ bool SwiftMergeFunctions::deriveParams(ParamInfos &Params,
   } while (FirstFI.CurrentInst);
 
   return true;
+}
+
+/// Returns true if the number of operands of the current instruction differs.
+bool SwiftMergeFunctions::numOperandsDiffer(FunctionInfos &FInfos) {
+  unsigned numOps = FInfos[0].CurrentInst->getNumOperands();
+  for (const FunctionInfo &FI : ArrayRef<FunctionInfo>(FInfos).drop_front(1)) {
+    if (FI.CurrentInst->getNumOperands() != numOps)
+      return true;
+  }
+  return false;
 }
 
 /// Returns true if the \p OpIdx's constant operand in the current instruction
@@ -807,12 +993,13 @@ bool SwiftMergeFunctions::constsDiffer(const FunctionInfos &FInfos,
 /// Returns true if a parameter could be created or found without exceeding the
 /// maximum number of parameters.
 bool SwiftMergeFunctions::tryMapToParameter(FunctionInfos &FInfos,
-                                            unsigned OpIdx, ParamInfos &Params) {
+                                            unsigned OpIdx, ParamInfos &Params,
+                                            unsigned maxParams) {
   ParamInfo *Matching = nullptr;
   // Try to find an existing parameter which exactly matches the differing
   // operands of the current instruction.
   for (ParamInfo &PI : Params) {
-    if (PI.matches(FInfos, OpIdx)) {
+    if (PI.matches(FInfos, OpIdx, isPtrAuthEnabled())) {
       Matching = &PI;
       break;
     }
@@ -820,7 +1007,7 @@ bool SwiftMergeFunctions::tryMapToParameter(FunctionInfos &FInfos,
   if (!Matching) {
     // We need a new parameter.
     // Check if we are within the limit.
-    if (Params.size() >= maxAddedParams)
+    if (Params.size() >= maxParams)
       return false;
 
     Params.resize(Params.size() + 1);
@@ -833,10 +1020,37 @@ bool SwiftMergeFunctions::tryMapToParameter(FunctionInfos &FInfos,
       if (C != FirstC)
         FI.NumParamsNeeded += 1;
     }
+    if (isPtrAuthEnabled())
+      Matching->needsPointerSigning = FInfos[0].needsPointerSigning(OpIdx);
   }
   /// Remember where the parameter is needed when we build our merged function.
   Matching->Uses.push_back({FInfos[0].CurrentInst, OpIdx});
   return true;
+}
+
+/// Copy \p origCall with a \p newCalle and add a ptrauth bundle with \p
+/// discriminator.
+void SwiftMergeFunctions::replaceCallWithAddedPtrAuth(CallInst *origCall,
+                                    Value *newCallee,
+                                    ConstantInt *discriminator) {
+  SmallVector<llvm::OperandBundleDef, 4> bundles;
+  origCall->getOperandBundlesAsDefs(bundles);
+  ConstantInt *key = getPtrAuthKey();
+  llvm::Value *bundleArgs[] = { key, discriminator };
+  bundles.emplace_back("ptrauth", bundleArgs);
+
+  SmallVector<llvm::Value *, 4> copiedArgs;
+  for (Value *op : origCall->args()) {
+    copiedArgs.push_back(op);
+  }
+
+  auto *newCall = CallInst::Create(origCall->getFunctionType(),
+    newCallee, copiedArgs, bundles, origCall->getName(), origCall);
+  newCall->setAttributes(origCall->getAttributes());
+  newCall->setTailCallKind(origCall->getTailCallKind());
+  newCall->setCallingConv(origCall->getCallingConv());
+  origCall->replaceAllUsesWith(newCall);
+  origCall->eraseFromParent();
 }
 
 /// Merge all functions in \p FInfos by creating thunks which call the single
@@ -865,6 +1079,7 @@ void SwiftMergeFunctions::mergeWithParams(const FunctionInfos &FInfos,
   Function *NewFunction = Function::Create(funcType,
                                            FirstF->getLinkage(),
                                            FirstF->getName() + "Tm");
+  NewFunction->setIsNewDbgInfoFormat(FirstF->IsNewDbgInfoFormat);
   NewFunction->copyAttributesFrom(FirstF);
   // NOTE: this function is not externally available, do ensure that we reset
   // the DLL storage
@@ -875,32 +1090,50 @@ void SwiftMergeFunctions::mergeWithParams(const FunctionInfos &FInfos,
   FirstF->getParent()->getFunctionList().insert(
                         std::next(FInfos[1].F->getIterator()), NewFunction);
   
-  DEBUG(dbgs() << "  Merge into " << NewFunction->getName() << '\n');
+  LLVM_DEBUG(dbgs() << "  Merge into " << NewFunction->getName() << '\n');
 
   // Move the body of FirstF into the NewFunction.
-  NewFunction->getBasicBlockList().splice(NewFunction->begin(),
-                                          FirstF->getBasicBlockList());
-
+  NewFunction->splice(NewFunction->begin(), FirstF);
   auto NewArgIter = NewFunction->arg_begin();
   for (Argument &OrigArg : FirstF->args()) {
     Argument &NewArg = *NewArgIter++;
     OrigArg.replaceAllUsesWith(&NewArg);
   }
+  unsigned numOrigArgs = FirstF->arg_size();
 
   SmallPtrSet<Function *, 8> SelfReferencingFunctions;
 
   // Replace all differing operands with a parameter.
-  for (const ParamInfo &PI : Params) {
-    Argument *NewArg = &*NewArgIter++;
-    for (const OpLocation &OL : PI.Uses) {
-      OL.I->setOperand(OL.OpIndex, NewArg);
-    }
-    ParamTypes.push_back(PI.Values[0]->getType());
+  for (unsigned paramIdx = 0; paramIdx < Params.size(); ++paramIdx) {
+    const ParamInfo &PI = Params[paramIdx];
+    Argument *NewArg = NewFunction->getArg(numOrigArgs + paramIdx);
 
+    if (!PI.needsPointerSigning) {
+      for (const OpLocation &OL : PI.Uses) {
+        OL.I->setOperand(OL.OpIndex, NewArg);
+      }
+    }
     // Collect all functions which are referenced by any parameter.
     for (Value *V : PI.Values) {
       if (auto *F = dyn_cast<Function>(V))
         SelfReferencingFunctions.insert(F);
+    }
+  }
+
+  // Replace all differing operands, which need pointer signing, with a
+  // parameter.
+  // We need to do that after all other parameters, because here we replace
+  // call instructions, which must be live in case it has another constant to
+  // be replaced.
+  for (unsigned paramIdx = 0; paramIdx < Params.size(); ++paramIdx) {
+    ParamInfo &PI = Params[paramIdx];
+    if (PI.needsPointerSigning) {
+      PI.computeDiscriminator(NewFunction->getContext());
+      for (const OpLocation &OL : PI.Uses) {
+        auto *origCall = cast<CallInst>(OL.I);
+        Argument *newCallee = NewFunction->getArg(numOrigArgs + paramIdx);
+        replaceCallWithAddedPtrAuth(origCall, newCallee, PI.discriminator);
+      }
     }
   }
 
@@ -917,7 +1150,7 @@ void SwiftMergeFunctions::mergeWithParams(const FunctionInfos &FInfos,
       assert(!isInEquivalenceClass(&*Iter->second));
       Iter->second->F = nullptr;
       FuncEntries.erase(Iter);
-      DEBUG(dbgs() << "    Erase " << OrigFunc->getName() << '\n');
+      LLVM_DEBUG(dbgs() << "    Erase " << OrigFunc->getName() << '\n');
       OrigFunc->eraseFromParent();
     } else {
       // Otherwise we need a thunk which calls the merged function.
@@ -937,7 +1170,8 @@ void SwiftMergeFunctions::removeEquivalenceClassFromTree(FunctionEntry *FE) {
   FunctionEntry *Unlink = Iter->First;
   Unlink->numUnhandledCallees = 0;
   while (Unlink) {
-    DEBUG(dbgs() << "    remove from tree: " << Unlink->F->getName() << '\n');
+    LLVM_DEBUG(dbgs() << "    remove from tree: " << Unlink->F->getName()
+                      << '\n');
     if (!Unlink->isMerged)
       Deferred.emplace_back(Unlink->F);
     Unlink->TreeIter = FnTree.end();
@@ -953,18 +1187,20 @@ void SwiftMergeFunctions::removeEquivalenceClassFromTree(FunctionEntry *FE) {
 // Selects proper bitcast operation,
 // but a bit simpler then CastInst::getCastOpcode.
 static Value *createCast(IRBuilder<> &Builder, Value *V, Type *DestTy) {
+  if (V->getType() == DestTy)
+    return V;
+
   Type *SrcTy = V->getType();
   if (SrcTy->isStructTy()) {
     assert(DestTy->isStructTy());
     assert(SrcTy->getStructNumElements() == DestTy->getStructNumElements());
     Value *Result = UndefValue::get(DestTy);
     for (unsigned int I = 0, E = SrcTy->getStructNumElements(); I < E; ++I) {
-      Value *Element = createCast(
-          Builder, Builder.CreateExtractValue(V, makeArrayRef(I)),
-          DestTy->getStructElementType(I));
+      Value *Element =
+          createCast(Builder, Builder.CreateExtractValue(V, llvm::ArrayRef(I)),
+                     DestTy->getStructElementType(I));
 
-      Result =
-          Builder.CreateInsertValue(Result, Element, makeArrayRef(I));
+      Result = Builder.CreateInsertValue(Result, Element, llvm::ArrayRef(I));
     }
     return Result;
   }
@@ -1001,13 +1237,18 @@ void SwiftMergeFunctions::writeThunk(Function *ToFunc, Function *Thunk,
   // Add new arguments defined by Params.
   for (const ParamInfo &PI : Params) {
     assert(ParamIdx < ToFuncTy->getNumParams());
-    Args.push_back(createCast(Builder, PI.Values[FuncIdx],
+    Constant *param = getSignedValue(PI, FuncIdx);
+    Args.push_back(createCast(Builder, param,
                    ToFuncTy->getParamType(ParamIdx)));
     ++ParamIdx;
   }
 
   CallInst *CI = Builder.CreateCall(ToFunc, Args);
-  CI->setTailCall();
+  bool isSwiftTailCall =
+   ToFunc->getCallingConv() == CallingConv::SwiftTail &&
+   Thunk->getCallingConv() == CallingConv::SwiftTail;
+  CI->setTailCallKind(
+    isSwiftTailCall ? llvm::CallInst::TCK_MustTail : llvm::CallInst::TCK_Tail);
   CI->setCallingConv(ToFunc->getCallingConv());
   CI->setAttributes(ToFunc->getAttributes());
   if (Thunk->getReturnType()->isVoidTy()) {
@@ -1016,7 +1257,7 @@ void SwiftMergeFunctions::writeThunk(Function *ToFunc, Function *Thunk,
     Builder.CreateRet(createCast(Builder, CI, Thunk->getReturnType()));
   }
 
-  DEBUG(dbgs() << "    writeThunk: " << Thunk->getName() << '\n');
+  LLVM_DEBUG(dbgs() << "    writeThunk: " << Thunk->getName() << '\n');
   ++NumSwiftThunksWritten;
 }
 
@@ -1039,7 +1280,7 @@ bool SwiftMergeFunctions::replaceDirectCallers(Function *Old, Function *New,
       removeEquivalenceClassFromTree(FE);
     
     auto *CI = dyn_cast<CallInst>(I);
-    if (!CI || CI->getCalledValue() != Old) {
+    if (!CI || CI->getCalledOperand() != Old) {
       AllReplaced = false;
       continue;
     }
@@ -1062,8 +1303,8 @@ bool SwiftMergeFunctions::replaceDirectCallers(Function *Old, Function *New,
     unsigned ParamIdx = 0;
     
     // Add the existing parameters.
-    for (Value *OldArg : CI->arg_operands()) {
-      NewArgAttrs.push_back(NewPAL.getParamAttributes(ParamIdx));
+    for (Value *OldArg : CI->args()) {
+      NewArgAttrs.push_back(NewPAL.getParamAttrs(ParamIdx));
       NewArgs.push_back(OldArg);
       OldParamTypes.push_back(OldArg->getType());
       ++ParamIdx;
@@ -1071,7 +1312,7 @@ bool SwiftMergeFunctions::replaceDirectCallers(Function *Old, Function *New,
     // Add the new parameters.
     for (const ParamInfo &PI : Params) {
       assert(ParamIdx < NewFuncTy->getNumParams());
-      Constant *ArgValue = PI.Values[FuncIdx];
+      Constant *ArgValue = getSignedValue(PI, FuncIdx);
       assert(ArgValue != Old &&
         "should not try to replace all callers of self referencing functions");
       NewArgs.push_back(ArgValue);
@@ -1085,17 +1326,29 @@ bool SwiftMergeFunctions::replaceDirectCallers(Function *Old, Function *New,
                         cast<PointerType>(New->getType())->getAddressSpace());
 
     Value *Callee = ConstantExpr::getBitCast(New, FPtrType);
-    CallInst *NewCI = Builder.CreateCall(Callee, NewArgs);
+    CallInst *NewCI = Builder.CreateCall(FType, Callee, NewArgs);
     NewCI->setCallingConv(CI->getCallingConv());
     // Don't transfer attributes from the function to the callee. Function
     // attributes typically aren't relevant to the calling convention or ABI.
-    NewCI->setAttributes(AttributeList::get(Context, /*FnAttrs=*/AttributeSet(),
-                                            NewPAL.getRetAttributes(),
-                                            NewArgAttrs));
-    CI->replaceAllUsesWith(NewCI);
+    auto newAttrList = AttributeList::get(Context, /*FnAttrs=*/AttributeSet(),
+                                            NewPAL.getRetAttrs(),
+                                            NewArgAttrs);
+    NewCI->setAttributes(newAttrList);
+    Value *retVal = createCast(Builder, NewCI, CI->getType());
+    CI->replaceAllUsesWith(retVal);
     CI->eraseFromParent();
   }
   assert(Old->use_empty() && "should have replaced all uses of old function");
   return Old->hasLocalLinkage();
 }
 
+PreservedAnalyses SwiftMergeFunctionsPass::run(Module &M,
+                                               ModuleAnalysisManager &AM) {
+  SwiftMergeFunctions helper(ptrAuthEnabled, ptrAuthKey);
+  bool changed = helper.runOnModule(M);
+
+  if (!changed)
+    return PreservedAnalyses::all();
+
+  return PreservedAnalyses::none();
+}

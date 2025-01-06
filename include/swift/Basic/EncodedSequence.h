@@ -25,7 +25,7 @@
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/PrefixMap.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/Support/Host.h"
+#include "llvm/TargetParser/Host.h"
 #include "llvm/Support/TrailingObjects.h"
 #include <climits>
 
@@ -38,7 +38,7 @@ public:
   /// used to access the Data field, so either this type needs to have
   /// equivalent aliasing power to 'char' or that constraint must be
   /// expressible in some other way.
-  typedef unsigned char Chunk;
+  using Chunk = unsigned char;
 
 private:
   enum {

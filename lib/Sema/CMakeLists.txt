@@ -1,65 +1,103 @@
 
-if (SWIFT_FORCE_OPTIMIZED_TYPECHECKER)
-  set(EXTRA_TYPECHECKER_FLAGS "FORCE_BUILD_OPTIMIZED")
-endif()
-
-add_swift_library(swiftSema STATIC
+add_swift_host_library(swiftSema STATIC
+  AssociatedTypeInference.cpp
+  BuilderTransform.cpp
+  Comment.cpp
   CSApply.cpp
   CSBindings.cpp
-  CSDiag.cpp
+  CSSyntacticElement.cpp
   CSGen.cpp
-  CSPropagate.cpp
   CSRanking.cpp
   CSSimplify.cpp
   CSSolver.cpp
-  CalleeCandidateInfo.cpp
+  CSStep.cpp
+  CSTrail.cpp
+  CSFix.cpp
+  CSOptimizer.cpp
+  CSDiagnostics.cpp
   CodeSynthesis.cpp
+  CodeSynthesisDistributedActor.cpp
+  ConstantnessSemaDiagnostics.cpp
   Constraint.cpp
   ConstraintGraph.cpp
   ConstraintLocator.cpp
   ConstraintSystem.cpp
+  CompletionContextFinder.cpp
+  DebuggerTestingTransform.cpp
+  DerivedConformanceActor.cpp
+  DerivedConformanceDistributedActor.cpp
+  DerivedConformanceAdditiveArithmetic.cpp
+  DerivedConformanceCaseIterable.cpp
   DerivedConformanceCodable.cpp
   DerivedConformanceCodingKey.cpp
+  DerivedConformanceDifferentiable.cpp
   DerivedConformanceEquatableHashable.cpp
+  DerivedConformanceComparable.cpp
   DerivedConformanceError.cpp
   DerivedConformanceRawRepresentable.cpp
   DerivedConformances.cpp
-  ITCDecl.cpp
-  ITCNameLookup.cpp
-  ITCType.cpp
+  ImportResolution.cpp
   InstrumenterSupport.cpp
-  IterativeTypeChecker.cpp
+  LookupVisibleDecls.cpp
   MiscDiagnostics.cpp
-  NameBinding.cpp
+  OpenedExistentials.cpp
   PCMacro.cpp
   PlaygroundTransform.cpp
+  PreCheckTarget.cpp
   ResilienceDiagnostics.cpp
   SourceLoader.cpp
+  SyntacticElementTarget.cpp
+  TypeOfReference.cpp
+  TypeCheckAccess.cpp
   TypeCheckAttr.cpp
   TypeCheckAvailability.cpp
+  TypeCheckBitwise.cpp
   TypeCheckCaptures.cpp
   TypeCheckCircularity.cpp
+  TypeCheckCodeCompletion.cpp
+  TypeCheckConcurrency.cpp
+  TypeCheckDistributed.cpp
   TypeCheckConstraints.cpp
   TypeCheckDecl.cpp
-  TypeCheckError.cpp
+  TypeCheckDeclObjC.cpp
+  TypeCheckDeclOverride.cpp
+  TypeCheckDeclPrimary.cpp
+  TypeCheckEffects.cpp
   TypeCheckExpr.cpp
   TypeCheckExprObjC.cpp
   TypeCheckGeneric.cpp
+  TypeCheckInvertible.cpp
+  TypeCheckMacros.cpp
   TypeCheckNameLookup.cpp
   TypeCheckPattern.cpp
+  TypeCheckPropertyWrapper.cpp
   TypeCheckProtocol.cpp
-  TypeCheckREPL.cpp
-  TypeCheckRequest.cpp
+  TypeCheckRegex.cpp
+  TypeCheckRequestFunctions.cpp
   TypeCheckStmt.cpp
+  TypeCheckStorage.cpp
   TypeCheckSwitchStmt.cpp
   TypeCheckType.cpp
+  TypeCheckUnsafe.cpp
   TypeChecker.cpp
-  DEPENDS
-    swift-syntax-generated-headers
-  LINK_LIBRARIES
-    swiftParse
-    swiftAST
-    swiftSerialization
-  ${EXTRA_TYPECHECKER_FLAGS}
-)
+  IDETypeCheckingRequests.cpp)
+if(SWIFT_FORCE_OPTIMIZED_TYPECHECKER)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+    target_compile_options(swiftSema PRIVATE /O2 /Ob2)
+  else()
+    target_compile_options(swiftSema PRIVATE -O3)
+  endif()
+endif()
 
+target_link_libraries(swiftSema PRIVATE
+  swiftAST
+  swiftParse
+  swiftSerialization)
+
+if (SWIFT_BUILD_SWIFT_SYNTAX)
+  target_link_libraries(swiftSema PRIVATE
+    swiftASTGen
+    swiftMacroEvaluation)
+endif()
+
+set_swift_llvm_is_available(swiftSema)

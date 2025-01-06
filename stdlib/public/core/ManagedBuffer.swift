@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2024 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -12,8 +12,10 @@
 
 import SwiftShims
 
-@_inlineable // FIXME(sil-serialize-all)
-@_versioned // FIXME(sil-serialize-all)
+@usableFromInline
+internal typealias _HeapObject = SwiftShims.HeapObject
+
+@usableFromInline
 @_silgen_name("swift_bufferAllocate")
 internal func _swift_bufferAllocate(
   bufferType type: AnyClass,
@@ -32,19 +34,58 @@ internal func _swift_bufferAllocate(
 /// any live elements in the `deinit` of a subclass.
 /// - Note: Subclasses must not have any stored properties; any storage
 ///   needed should be included in `Header`.
-@_fixed_layout // FIXME(sil-serialize-all)
-open class ManagedBuffer<Header, Element> {
+@_fixed_layout
+open class ManagedBuffer<Header, Element: ~Copyable> {
+  /// The stored `Header` instance.
+  ///
+  /// During instance creation, in particular during
+  /// `ManagedBuffer.create`'s call to initialize, `ManagedBuffer`'s
+  /// `header` property is as-yet uninitialized, and therefore
+  /// reading the `header` property during `ManagedBuffer.create` is undefined.
+  @_preInverseGenerics
+  public final var header: Header
 
+  #if $Embedded
+  // In embedded mode this initializer has to be public, otherwise derived
+  // classes cannot be specialized.
+  @_preInverseGenerics
+  public init(_doNotCallMe: ()) {
+    _internalInvariantFailure("Only initialize these by calling create")
+  }
+  #else
+  // This is really unfortunate. In Swift 5.0, the method descriptor for this
+  // initializer was public and subclasses would "inherit" it, referencing its
+  // method descriptor from their class override table.
+  @_preInverseGenerics
+  @usableFromInline
+  internal init(_doNotCallMe: ()) {
+    _internalInvariantFailure("Only initialize these by calling create")
+  }
+  #endif
+
+  @_preInverseGenerics
+  @inlinable
+  deinit {}
+}
+
+@available(*, unavailable)
+extension ManagedBuffer: Sendable where Element: ~Copyable {}
+
+extension ManagedBuffer where Element: ~Copyable {
   /// Create a new instance of the most-derived class, calling
   /// `factory` on the partially-constructed object to generate
   /// an initial `Header`.
-  @_inlineable // FIXME(sil-serialize-all)
+  @_preInverseGenerics
+  @inlinable
+  #if $Embedded
+  // Transparent in Embedded Swift to avoid needing "self" as a metatype. By
+  // inlining into the caller, we'll know the concrete type instead.
+  @_transparent
+  #endif
   public final class func create(
     minimumCapacity: Int,
-    makingHeaderWith factory: (
-      ManagedBuffer<Header, Element>) throws -> Header
+    makingHeaderWith factory: (ManagedBuffer<Header, Element>) throws -> Header
   ) rethrows -> ManagedBuffer<Header, Element> {
-
     let p = Builtin.allocWithTailElems_1(
          self,
          minimumCapacity._builtinWordValue, Element.self)
@@ -54,7 +95,7 @@ open class ManagedBuffer<Header, Element> {
     // The _fixLifetime is not really needed, because p is used afterwards.
     // But let's be conservative and fix the lifetime after we use the
     // headerAddress.
-    _fixLifetime(p) 
+    _fixLifetime(p)
     return p
   }
 
@@ -63,38 +104,43 @@ open class ManagedBuffer<Header, Element> {
   /// This header may be nontrivial to compute; it is usually a good
   /// idea to store this information in the "header" area when
   /// an instance is created.
-  @_inlineable // FIXME(sil-serialize-all)
+  @_preInverseGenerics
+  @inlinable
+  @available(OpenBSD, unavailable, message: "malloc_size is unavailable.")
   public final var capacity: Int {
     let storageAddr = UnsafeMutableRawPointer(Builtin.bridgeToRawPointer(self))
-    let endAddr = storageAddr + _stdlib_malloc_size(storageAddr)
+    let endAddr = storageAddr + _swift_stdlib_malloc_size(storageAddr)
     let realCapacity = endAddr.assumingMemoryBound(to: Element.self) -
       firstElementAddress
     return realCapacity
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
+  @_preInverseGenerics
+  @inlinable
   internal final var firstElementAddress: UnsafeMutablePointer<Element> {
-    return UnsafeMutablePointer(Builtin.projectTailElems(self,
-                                                         Element.self))
+    return UnsafeMutablePointer(
+      Builtin.projectTailElems(self, Element.self))
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
+  @_preInverseGenerics
+  @inlinable
   internal final var headerAddress: UnsafeMutablePointer<Header> {
     return UnsafeMutablePointer<Header>(Builtin.addressof(&header))
   }
+}
 
+extension ManagedBuffer where Element: ~Copyable {
   /// Call `body` with an `UnsafeMutablePointer` to the stored
   /// `Header`.
   ///
   /// - Note: This pointer is valid only for the duration of the
   ///   call to `body`.
-  @_inlineable // FIXME(sil-serialize-all)
-  public final func withUnsafeMutablePointerToHeader<R>(
-    _ body: (UnsafeMutablePointer<Header>) throws -> R
-  ) rethrows -> R {
-    return try withUnsafeMutablePointers { (v, _) in return try body(v) }
+  @_alwaysEmitIntoClient
+  @inline(__always)
+  public final func withUnsafeMutablePointerToHeader<E: Error, R: ~Copyable>(
+    _ body: (UnsafeMutablePointer<Header>) throws(E) -> R
+  ) throws(E) -> R {
+    try withUnsafeMutablePointers { (v, _) throws(E) in try body(v) }
   }
 
   /// Call `body` with an `UnsafeMutablePointer` to the `Element`
@@ -102,11 +148,12 @@ open class ManagedBuffer<Header, Element> {
   ///
   /// - Note: This pointer is valid only for the duration of the
   ///   call to `body`.
-  @_inlineable // FIXME(sil-serialize-all)
-  public final func withUnsafeMutablePointerToElements<R>(
-    _ body: (UnsafeMutablePointer<Element>) throws -> R
-  ) rethrows -> R {
-    return try withUnsafeMutablePointers { return try body($1) }
+  @_alwaysEmitIntoClient
+  @inline(__always)
+  public final func withUnsafeMutablePointerToElements<E: Error, R: ~Copyable>(
+    _ body: (UnsafeMutablePointer<Element>) throws(E) -> R
+  ) throws(E) -> R {
+    try withUnsafeMutablePointers { (_, v) throws(E) in try body(v) }
   }
 
   /// Call `body` with `UnsafeMutablePointer`s to the stored `Header`
@@ -114,29 +161,47 @@ open class ManagedBuffer<Header, Element> {
   ///
   /// - Note: These pointers are valid only for the duration of the
   ///   call to `body`.
-  @_inlineable // FIXME(sil-serialize-all)
-  public final func withUnsafeMutablePointers<R>(
-    _ body: (UnsafeMutablePointer<Header>, UnsafeMutablePointer<Element>) throws -> R
-  ) rethrows -> R {
+  @_alwaysEmitIntoClient
+  @inline(__always)
+  public final func withUnsafeMutablePointers<E: Error, R: ~Copyable>(
+    _ body: (
+      UnsafeMutablePointer<Header>, UnsafeMutablePointer<Element>
+    ) throws(E) -> R
+  ) throws(E) -> R {
     defer { _fixLifetime(self) }
     return try body(headerAddress, firstElementAddress)
   }
+}
 
-  /// The stored `Header` instance.
-  ///
-  /// During instance creation, in particular during
-  /// `ManagedBuffer.create`'s call to initialize, `ManagedBuffer`'s
-  /// `header` property is as-yet uninitialized, and therefore
-  /// reading the `header` property during `ManagedBuffer.create` is undefined.
-  public final var header: Header
+extension ManagedBuffer {
+  @_spi(SwiftStdlibLegacyABI) @available(swift, obsoleted: 1)
+  @_silgen_name("$ss13ManagedBufferC32withUnsafeMutablePointerToHeaderyqd__qd__SpyxGKXEKlF")
+  @usableFromInline
+  internal final func __legacy_withUnsafeMutablePointerToHeader<R>(
+    _ body: (UnsafeMutablePointer<Header>) throws -> R
+  ) rethrows -> R {
+    return try withUnsafeMutablePointers { (v, _) in return try body(v) }
+  }
 
-  //===--- internal/private API -------------------------------------------===//
+  @_spi(SwiftStdlibLegacyABI) @available(swift, obsoleted: 1)
+  @_silgen_name("$ss13ManagedBufferC34withUnsafeMutablePointerToElementsyqd__qd__Spyq_GKXEKlF")
+  @usableFromInline
+  internal final func __legacy_withUnsafeMutablePointerToElements<R>(
+    _ body: (UnsafeMutablePointer<Element>) throws -> R
+  ) rethrows -> R {
+    return try withUnsafeMutablePointers { return try body($1) }
+  }
 
-  /// Make ordinary initialization unavailable
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
-  internal init(_doNotCallMe: ()) {
-    _sanityCheckFailure("Only initialize these by calling create")
+  @_spi(SwiftStdlibLegacyABI) @available(swift, obsoleted: 1)
+  @_silgen_name("$ss13ManagedBufferC25withUnsafeMutablePointersyqd__qd__SpyxG_Spyq_GtKXEKlF")
+  @usableFromInline
+  internal final func __legacy_withUnsafeMutablePointers<R>(
+    _ body: (
+      UnsafeMutablePointer<Header>, UnsafeMutablePointer<Element>
+    ) throws -> R
+  ) rethrows -> R {
+    defer { _fixLifetime(self) }
+    return try body(headerAddress, firstElementAddress)
   }
 }
 
@@ -144,10 +209,10 @@ open class ManagedBuffer<Header, Element> {
 /// `Header` and contiguous storage for an arbitrary number of
 /// `Element` instances stored in that buffer.
 ///
-/// For most purposes, the `ManagedBuffer` class works fine for this
-/// purpose, and can simply be used on its own.  However, in cases
+/// For most purposes, the `ManagedBuffer` class can be used on its own.
+/// However, in cases
 /// where objects of various different classes must serve as storage,
-/// `ManagedBufferPointer` is needed.
+/// you need to also use `ManagedBufferPointer`.
 ///
 /// A valid buffer class is non-`@objc`, with no declared stored
 ///   properties.  Its `deinit` must destroy its
@@ -175,8 +240,15 @@ open class ManagedBuffer<Header, Element> {
 ///        }
 ///      }
 ///
-@_fixed_layout
-public struct ManagedBufferPointer<Header, Element> : Equatable {
+@frozen
+public struct ManagedBufferPointer<
+  Header,
+  Element: ~Copyable
+>: Copyable {
+
+  @_preInverseGenerics
+  @usableFromInline
+  internal var _nativeBuffer: Builtin.NativeObject
 
   /// Create with new storage containing an initial `Header` and space
   /// for at least `minimumCapacity` `element`s.
@@ -193,7 +265,9 @@ public struct ManagedBufferPointer<Header, Element> : Equatable {
   ///   `bufferClass` is a non-`@objc` class with no declared stored
   ///   properties.  The `deinit` of `bufferClass` must destroy its
   ///   stored `Header` and any constructed `Element`s.
-  @_inlineable // FIXME(sil-serialize-all)
+  @_preInverseGenerics
+  @inlinable
+  @available(OpenBSD, unavailable, message: "malloc_size is unavailable.")
   public init(
     bufferClass: AnyClass,
     minimumCapacity: Int,
@@ -205,28 +279,30 @@ public struct ManagedBufferPointer<Header, Element> : Equatable {
 
     // initialize the header field
     try withUnsafeMutablePointerToHeader {
-      $0.initialize(to: 
+      $0.initialize(to:
         try factory(
           self.buffer,
           {
             ManagedBufferPointer(unsafeBufferObject: $0).capacity
           }))
     }
-    // FIXME: workaround for <rdar://problem/18619176>.  If we don't
-    // access header somewhere, its addressor gets linked away
-    _ = header
   }
 
   /// Manage the given `buffer`.
   ///
   /// - Precondition: `buffer` is an instance of a non-`@objc` class whose
   ///   `deinit` destroys its stored `Header` and any constructed `Element`s.
-  @_inlineable // FIXME(sil-serialize-all)
+  @_preInverseGenerics
+  @inlinable
   public init(unsafeBufferObject buffer: AnyObject) {
+    #if !$Embedded
     ManagedBufferPointer._checkValidBufferClass(type(of: buffer))
+    #endif
 
     self._nativeBuffer = Builtin.unsafeCastToNativeObject(buffer)
   }
+
+  //===--- internal/private API -------------------------------------------===//
 
   /// Internal version for use by _ContiguousArrayBuffer where we know that we
   /// have a valid buffer class.
@@ -236,86 +312,15 @@ public struct ManagedBufferPointer<Header, Element> : Equatable {
   /// _debugPreconditions in _checkValidBufferClass for any array. Since we know
   /// for the _ContiguousArrayBuffer that this check must always succeed we omit
   /// it in this specialized constructor.
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned
+  @_preInverseGenerics
+  @inlinable
   internal init(_uncheckedUnsafeBufferObject buffer: AnyObject) {
-    ManagedBufferPointer._sanityCheckValidBufferClass(type(of: buffer))
+    #if !$Embedded
+    ManagedBufferPointer._internalInvariantValidBufferClass(type(of: buffer))
+    #endif
+
     self._nativeBuffer = Builtin.unsafeCastToNativeObject(buffer)
   }
-
-  /// The stored `Header` instance.
-  @_inlineable // FIXME(sil-serialize-all)
-  public var header: Header {
-    addressWithNativeOwner {
-      return (UnsafePointer(_headerPointer), _nativeBuffer)
-    }
-    mutableAddressWithNativeOwner {
-      return (_headerPointer, _nativeBuffer)
-    }
-  }
-
-  /// Returns the object instance being used for storage.
-  @_inlineable // FIXME(sil-serialize-all)
-  public var buffer: AnyObject {
-    return Builtin.castFromNativeObject(_nativeBuffer)
-  }
-
-  /// The actual number of elements that can be stored in this object.
-  ///
-  /// This value may be nontrivial to compute; it is usually a good
-  /// idea to store this information in the "header" area when
-  /// an instance is created.
-  @_inlineable // FIXME(sil-serialize-all)
-  public var capacity: Int {
-    return (_capacityInBytes &- _My._elementOffset) / MemoryLayout<Element>.stride
-  }
-
-  /// Call `body` with an `UnsafeMutablePointer` to the stored
-  /// `Header`.
-  ///
-  /// - Note: This pointer is valid only
-  ///   for the duration of the call to `body`.
-  @_inlineable // FIXME(sil-serialize-all)
-  public func withUnsafeMutablePointerToHeader<R>(
-    _ body: (UnsafeMutablePointer<Header>) throws -> R
-  ) rethrows -> R {
-    return try withUnsafeMutablePointers { (v, _) in return try body(v) }
-  }
-
-  /// Call `body` with an `UnsafeMutablePointer` to the `Element`
-  /// storage.
-  ///
-  /// - Note: This pointer is valid only for the duration of the
-  ///   call to `body`.
-  @_inlineable // FIXME(sil-serialize-all)
-  public func withUnsafeMutablePointerToElements<R>(
-    _ body: (UnsafeMutablePointer<Element>) throws -> R
-  ) rethrows -> R {
-    return try withUnsafeMutablePointers { return try body($1) }
-  }
-
-  /// Call `body` with `UnsafeMutablePointer`s to the stored `Header`
-  /// and raw `Element` storage.
-  ///
-  /// - Note: These pointers are valid only for the duration of the
-  ///   call to `body`.
-  @_inlineable // FIXME(sil-serialize-all)
-  public func withUnsafeMutablePointers<R>(
-    _ body: (UnsafeMutablePointer<Header>, UnsafeMutablePointer<Element>) throws -> R
-  ) rethrows -> R {
-    defer { _fixLifetime(_nativeBuffer) }
-    return try body(_headerPointer, _elementPointer)
-  }
-
-  /// Returns `true` iff `self` holds the only strong reference to its buffer.
-  ///
-  /// See `isUniquelyReferenced` for details.
-  @_inlineable // FIXME(sil-serialize-all)
-  public mutating func isUniqueReference() -> Bool {
-    return _isUnique(&_nativeBuffer)
-  }
-
-  //===--- internal/private API -------------------------------------------===//
 
   /// Create with new storage containing space for an initial `Header`
   /// and at least `minimumCapacity` `element`s.
@@ -328,8 +333,8 @@ public struct ManagedBufferPointer<Header, Element> : Equatable {
   ///   `bufferClass` is a non-`@objc` class with no declared stored
   ///   properties.  The `deinit` of `bufferClass` must destroy its
   ///   stored `Header` and any constructed `Element`s.
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
+  @_preInverseGenerics
+  @inlinable
   internal init(
     bufferClass: AnyClass,
     minimumCapacity: Int
@@ -345,24 +350,25 @@ public struct ManagedBufferPointer<Header, Element> : Equatable {
 
   /// Internal version for use by _ContiguousArrayBuffer.init where we know that
   /// we have a valid buffer class and that the capacity is >= 0.
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned
+  @_preInverseGenerics
+  @inlinable
   internal init(
     _uncheckedBufferClass: AnyClass,
     minimumCapacity: Int
   ) {
-    ManagedBufferPointer._sanityCheckValidBufferClass(_uncheckedBufferClass, creating: true)
-    _sanityCheck(
+    ManagedBufferPointer._internalInvariantValidBufferClass(
+      _uncheckedBufferClass, creating: true)
+    _internalInvariant(
       minimumCapacity >= 0,
       "ManagedBufferPointer must have non-negative capacity")
 
-    let totalSize = _My._elementOffset
+    let totalSize = ManagedBufferPointer._elementOffset
       +  minimumCapacity * MemoryLayout<Element>.stride
 
     let newBuffer: AnyObject = _swift_bufferAllocate(
       bufferType: _uncheckedBufferClass,
       size: totalSize,
-      alignmentMask: _My._alignmentMask)
+      alignmentMask: ManagedBufferPointer._alignmentMask)
 
     self._nativeBuffer = Builtin.unsafeCastToNativeObject(newBuffer)
   }
@@ -371,16 +377,137 @@ public struct ManagedBufferPointer<Header, Element> : Equatable {
   ///
   /// - Note: It is an error to use the `header` property of the resulting
   ///   instance unless it has been initialized.
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned
+  @_preInverseGenerics
+  @inlinable
   internal init(_ buffer: ManagedBuffer<Header, Element>) {
     _nativeBuffer = Builtin.unsafeCastToNativeObject(buffer)
   }
+}
 
-  internal typealias _My = ManagedBufferPointer
+@available(*, unavailable)
+extension ManagedBufferPointer: Sendable where Element: ~Copyable {}
 
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
+extension ManagedBufferPointer where Element: ~Copyable {
+  /// The stored `Header` instance.
+  @_preInverseGenerics
+  @inlinable
+  public var header: Header {
+    _read {
+      yield _headerPointer.pointee
+    }
+    _modify {
+      yield &_headerPointer.pointee
+    }
+  }
+}
+
+extension ManagedBufferPointer where Element: ~Copyable {
+  /// Returns the object instance being used for storage.
+  @_preInverseGenerics
+  @inlinable
+  public var buffer: AnyObject {
+    return Builtin.castFromNativeObject(_nativeBuffer)
+  }
+
+  /// The actual number of elements that can be stored in this object.
+  ///
+  /// This value may be nontrivial to compute; it is usually a good
+  /// idea to store this information in the "header" area when
+  /// an instance is created.
+  @_preInverseGenerics
+  @inlinable
+  @available(OpenBSD, unavailable, message: "malloc_size is unavailable.")
+  public var capacity: Int {
+    return (
+      _capacityInBytes &- ManagedBufferPointer._elementOffset
+    ) / MemoryLayout<Element>.stride
+  }
+
+  /// Call `body` with an `UnsafeMutablePointer` to the stored
+  /// `Header`.
+  ///
+  /// - Note: This pointer is valid only
+  ///   for the duration of the call to `body`.
+  @_alwaysEmitIntoClient
+  public func withUnsafeMutablePointerToHeader<E: Error, R: ~Copyable>(
+    _ body: (UnsafeMutablePointer<Header>) throws(E) -> R
+  ) throws(E) -> R {
+    try withUnsafeMutablePointers { (v, _) throws(E) in try body(v) }
+  }
+
+  /// Call `body` with an `UnsafeMutablePointer` to the `Element`
+  /// storage.
+  ///
+  /// - Note: This pointer is valid only for the duration of the
+  ///   call to `body`.
+  @_alwaysEmitIntoClient
+  public func withUnsafeMutablePointerToElements<E: Error, R: ~Copyable>(
+    _ body: (UnsafeMutablePointer<Element>) throws(E) -> R
+  ) throws(E) -> R {
+    try withUnsafeMutablePointers { (_, v) throws(E) in try body(v) }
+  }
+
+  /// Call `body` with `UnsafeMutablePointer`s to the stored `Header`
+  /// and raw `Element` storage.
+  ///
+  /// - Note: These pointers are valid only for the duration of the
+  ///   call to `body`.
+  @_alwaysEmitIntoClient
+  public func withUnsafeMutablePointers<E: Error, R: ~Copyable>(
+    _ body: (
+      UnsafeMutablePointer<Header>, UnsafeMutablePointer<Element>
+    ) throws(E) -> R
+  ) throws(E) -> R {
+    defer { _fixLifetime(_nativeBuffer) }
+    return try body(_headerPointer, _elementPointer)
+  }
+
+  /// Returns `true` if `self` holds the only strong reference to its
+  /// buffer; otherwise, returns `false`.
+  ///
+  /// See `isKnownUniquelyReferenced` for details.
+  @_preInverseGenerics
+  @inlinable
+  public mutating func isUniqueReference() -> Bool {
+    return _isUnique(&_nativeBuffer)
+  }
+}
+
+extension ManagedBufferPointer {
+  @_spi(SwiftStdlibLegacyABI) @available(swift, obsoleted: 1)
+  @_silgen_name("$ss20ManagedBufferPointerV017withUnsafeMutableC8ToHeaderyqd__qd__SpyxGKXEKlF")
+  @usableFromInline
+  internal func withUnsafeMutablePointerToHeader<R>(
+    _ body: (UnsafeMutablePointer<Header>) throws -> R
+  ) rethrows -> R {
+    try withUnsafeMutablePointers { (v, _) in try body(v) }
+  }
+
+  @_spi(SwiftStdlibLegacyABI) @available(swift, obsoleted: 1)
+  @_silgen_name("$ss20ManagedBufferPointerV017withUnsafeMutableC10ToElementsyqd__qd__Spyq_GKXEKlF")
+  @usableFromInline
+  internal func withUnsafeMutablePointerToElements<R>(
+    _ body: (UnsafeMutablePointer<Element>) throws -> R
+  ) rethrows -> R {
+    try withUnsafeMutablePointers { (_, v) in try body(v) }
+  }
+
+  @_spi(SwiftStdlibLegacyABI) @available(swift, obsoleted: 1)
+  @_silgen_name("$ss20ManagedBufferPointerV25withUnsafeMutablePointersyqd__qd__SpyxG_Spyq_GtKXEKlF")
+  @usableFromInline
+  internal func withUnsafeMutablePointers<R>(
+    _ body: (
+      UnsafeMutablePointer<Header>, UnsafeMutablePointer<Element>
+    ) throws -> R
+  ) rethrows -> R {
+    defer { _fixLifetime(_nativeBuffer) }
+    return try body(_headerPointer, _elementPointer)
+  }
+}
+
+extension ManagedBufferPointer where Element: ~Copyable {
+  @_preInverseGenerics
+  @inlinable
   internal static func _checkValidBufferClass(
     _ bufferClass: AnyClass, creating: Bool = false
   ) {
@@ -398,12 +525,12 @@ public struct ManagedBufferPointer<Header, Element> : Equatable {
     )
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
-  internal static func _sanityCheckValidBufferClass(
+  @_preInverseGenerics
+  @inlinable
+  internal static func _internalInvariantValidBufferClass(
     _ bufferClass: AnyClass, creating: Bool = false
   ) {
-    _sanityCheck(
+    _internalInvariant(
       _class_getInstancePositiveExtentSize(bufferClass) == MemoryLayout<_HeapObject>.size
       || (
         (!creating || bufferClass is ManagedBuffer<Header, Element>.Type)
@@ -411,15 +538,17 @@ public struct ManagedBufferPointer<Header, Element> : Equatable {
           == _headerOffset + MemoryLayout<Header>.size),
       "ManagedBufferPointer buffer class has illegal stored properties"
     )
-    _sanityCheck(
+    _internalInvariant(
       _usesNativeSwiftReferenceCounting(bufferClass),
       "ManagedBufferPointer buffer class must be non-@objc"
     )
   }
+}
 
+extension ManagedBufferPointer where Element: ~Copyable {
   /// The required alignment for allocations of this type, minus 1
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
+  @_preInverseGenerics
+  @inlinable
   internal static var _alignmentMask: Int {
     return max(
       MemoryLayout<_HeapObject>.alignment,
@@ -427,22 +556,23 @@ public struct ManagedBufferPointer<Header, Element> : Equatable {
   }
 
   /// The actual number of bytes allocated for this object.
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
+  @_preInverseGenerics
+  @inlinable
+  @available(OpenBSD, unavailable, message: "malloc_size is unavailable.")
   internal var _capacityInBytes: Int {
-    return _stdlib_malloc_size(_address)
+    return _swift_stdlib_malloc_size(_address)
   }
 
   /// The address of this instance in a convenient pointer-to-bytes form
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
+  @_preInverseGenerics
+  @inlinable
   internal var _address: UnsafeMutableRawPointer {
     return UnsafeMutableRawPointer(Builtin.bridgeToRawPointer(_nativeBuffer))
   }
 
   /// Offset from the allocated storage for `self` to the stored `Header`
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
+  @_preInverseGenerics
+  @inlinable
   internal static var _headerOffset: Int {
     _onFastPath()
     return _roundUp(
@@ -453,44 +583,44 @@ public struct ManagedBufferPointer<Header, Element> : Equatable {
   /// An **unmanaged** pointer to the storage for the `Header`
   /// instance.  Not safe to use without _fixLifetime calls to
   /// guarantee it doesn't dangle
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
+  @_preInverseGenerics
+  @inlinable
   internal var _headerPointer: UnsafeMutablePointer<Header> {
     _onFastPath()
-    return (_address + _My._headerOffset).assumingMemoryBound(
+    return (_address + ManagedBufferPointer._headerOffset).assumingMemoryBound(
       to: Header.self)
   }
 
   /// An **unmanaged** pointer to the storage for `Element`s.  Not
   /// safe to use without _fixLifetime calls to guarantee it doesn't
   /// dangle.
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
+  @_preInverseGenerics
+  @inlinable
   internal var _elementPointer: UnsafeMutablePointer<Element> {
     _onFastPath()
-    return (_address + _My._elementOffset).assumingMemoryBound(
+    return (_address + ManagedBufferPointer._elementOffset).assumingMemoryBound(
       to: Element.self)
   }
 
   /// Offset from the allocated storage for `self` to the `Element` storage
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
+  @_preInverseGenerics
+  @inlinable
   internal static var _elementOffset: Int {
     _onFastPath()
     return _roundUp(
       _headerOffset + MemoryLayout<Header>.size,
       toAlignment: MemoryLayout<Element>.alignment)
   }
-  
-  @_inlineable // FIXME(sil-serialize-all)
+}
+
+extension ManagedBufferPointer: Equatable {
+  @inlinable
   public static func == (
-    lhs: ManagedBufferPointer, rhs: ManagedBufferPointer
+    lhs: ManagedBufferPointer,
+    rhs: ManagedBufferPointer
   ) -> Bool {
     return lhs._address == rhs._address
   }
-
-  @_versioned // FIXME(sil-serialize-all)
-  internal var _nativeBuffer: Builtin.NativeObject
 }
 
 // FIXME: when our calling convention changes to pass self at +0,
@@ -506,6 +636,32 @@ public struct ManagedBufferPointer<Header, Element> : Equatable {
 ///
 ///     mutating func update(withValue value: T) {
 ///         if !isKnownUniquelyReferenced(&myStorage) {
+///             myStorage = self.copiedStorage()
+///         }
+///         myStorage.update(withValue: value)
+///     }
+///
+/// Use care when calling `isKnownUniquelyReferenced(_:)` from within a Boolean
+/// expression. In debug builds, an instance in the left-hand side of a `&&`
+/// or `||` expression may still be referenced when evaluating the right-hand
+/// side, inflating the instance's reference count. For example, this version
+/// of the `update(withValue)` method will re-copy `myStorage` on every call:
+///
+///     // Copies too frequently:
+///     mutating func badUpdate(withValue value: T) {
+///         if myStorage.shouldCopy || !isKnownUniquelyReferenced(&myStorage) {
+///             myStorage = self.copiedStorage()
+///         }
+///         myStorage.update(withValue: value)
+///     }
+///
+/// To avoid this behavior, swap the call `isKnownUniquelyReferenced(_:)` to
+/// the left-hand side or store the result of the first expression in a local
+/// constant:
+///
+///     mutating func goodUpdate(withValue value: T) {
+///         let shouldCopy = myStorage.shouldCopy
+///         if shouldCopy || !isKnownUniquelyReferenced(&myStorage) {
 ///             myStorage = self.copiedStorage()
 ///         }
 ///         myStorage.update(withValue: value)
@@ -528,17 +684,19 @@ public struct ManagedBufferPointer<Header, Element> : Equatable {
 ///   `object`; the use of `inout` is an implementation artifact.
 /// - Returns: `true` if `object` is known to have a single strong reference;
 ///   otherwise, `false`.
-@_inlineable
-public func isKnownUniquelyReferenced<T : AnyObject>(_ object: inout T) -> Bool
+@inlinable
+public func isKnownUniquelyReferenced<T: AnyObject>(_ object: inout T) -> Bool
 {
   return _isUnique(&object)
 }
 
-@_inlineable
-@_versioned
-internal func _isKnownUniquelyReferencedOrPinned<T : AnyObject>(_ object: inout T) -> Bool {
-  return _isUniqueOrPinned(&object)
+#if $Embedded
+@inlinable
+public func isKnownUniquelyReferenced(_ object: inout Builtin.NativeObject) -> Bool
+{
+  return _isUnique(&object)
 }
+#endif
 
 /// Returns a Boolean value indicating whether the given object is known to
 /// have a single strong reference.
@@ -570,8 +728,8 @@ internal func _isKnownUniquelyReferencedOrPinned<T : AnyObject>(_ object: inout 
 ///   `object`; the use of `inout` is an implementation artifact.
 /// - Returns: `true` if `object` is known to have a single strong reference;
 ///   otherwise, `false`. If `object` is `nil`, the return value is `false`.
-@_inlineable
-public func isKnownUniquelyReferenced<T : AnyObject>(
+@inlinable
+public func isKnownUniquelyReferenced<T: AnyObject>(
   _ object: inout T?
 ) -> Bool {
   return _isUnique(&object)

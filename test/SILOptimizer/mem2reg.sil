@@ -1,7 +1,37 @@
-// RUN: %target-sil-opt -assume-parsing-unqualified-ownership-sil -enable-sil-verify-all %s -mem2reg | %FileCheck %s
+// RUN: %target-sil-opt -sil-print-types -enable-sil-verify-all %s -mem2reg | %FileCheck %s
 
 import Builtin
 import Swift
+import _Concurrency
+
+//////////////////
+// Declarations //
+//////////////////
+
+class Klass {}
+
+struct SmallCodesizeStruct {
+  var cls1 : Klass
+  var cls2 : Klass
+}
+
+struct LargeCodesizeStruct {
+  var s1: SmallCodesizeStruct
+  var s2: SmallCodesizeStruct
+  var s3: SmallCodesizeStruct
+  var s4: SmallCodesizeStruct
+  var s5: SmallCodesizeStruct
+}
+
+struct EmptyStruct {}
+struct Pair<T, U> {
+  var t: T
+  var u: U
+}
+
+///////////
+// Tests //
+///////////
 
 // CHECK-LABEL: sil @store_only_allocas
 // CHECK-NOT: alloc_stack
@@ -155,16 +185,16 @@ bb0(%0 : $*()):
   return %3 : $()
 }
 
-// CHECK-LABEL: sil @mem2reg_debug_value_addr
+// CHECK-LABEL: sil @mem2reg_debug_value
 // CHECK-NOT: alloc_stack
-// CHECK-NOT: debug_value_addr
+// CHECK-NOT: debug_value {{.*}} expr op_deref
 // CHECK: debug_value %0
 // CHECK: return
-sil @mem2reg_debug_value_addr : $@convention(thin) (Int) -> Int {
+sil @mem2reg_debug_value : $@convention(thin) (Int) -> Int {
 bb0(%0 : $Int):
   %1 = alloc_stack $Int
   store %0 to %1 : $*Int
-  debug_value_addr %1 : $*Int
+  debug_value %1 : $*Int, expr op_deref
   %2 = load %1 : $*Int
   dealloc_stack %1 : $*Int
   return %2 : $Int
@@ -275,7 +305,7 @@ bb2:
 
 // CHECK: bb3([[ARG:%.*]] : $@callee_owned () -> Int):
 bb3:
-// CHECK-NOT: load [[STACK]]
+// CHECK-NOT: load
   %13 = load %1 : $*@callee_owned () -> Int
 // CHECK: strong_retain [[ARG]]
   strong_retain %13 : $@callee_owned () -> Int
@@ -288,10 +318,10 @@ bb3:
   //       block.
 // CHECK: bb4
 bb4:
-// CHECK-NOT: destroy_addr [[STACK]]
+// CHECK-NOT: destroy_addr
 // CHECK: strong_release [[ARG]]
   destroy_addr %1 : $*@callee_owned () -> Int
-// CHECK-NOT: dealloc_stack [[STACK]]
+// CHECK-NOT: dealloc_stack
   dealloc_stack %1 : $*@callee_owned () -> Int
 // CHECK: return [[RESULT]]
   return %15 : $Int
@@ -304,8 +334,8 @@ sil @no_real_uses : $@convention(thin) () -> () {
 bb0:
   // CHECK-NOT: alloc_stack
   %0 = alloc_stack $Builtin.Int32
-  // CHECK-NOT: debug_value_addr
-  debug_value_addr %0 : $*Builtin.Int32, let, name "x", argno 1
+  // CHECK-NOT: debug_value {{.*}} expr op_deref
+  debug_value %0 : $*Builtin.Int32, let, name "x", argno 1, expr op_deref
   // CHECK-NOT: dealloc_stack
   dealloc_stack %0 : $*Builtin.Int32
   // CHECK: [[VAL:%.*]] = tuple ()
@@ -345,7 +375,7 @@ sil @dead_use : $@convention(thin) () -> () {
 
 // CHECK-LABEL: sil @dont_crash_on_dead_arg_use
 // CHECK: bb0{{.*}}:
-// CHECK-NEXT: tuple ()
+// CHECK:      tuple ()
 // CHECK-NEXT: return
 sil @dont_crash_on_dead_arg_use : $@convention(thin) (@inout Int64) -> () {
 bb0(%0 : $*Int64):
@@ -355,4 +385,196 @@ bb0(%0 : $*Int64):
   dealloc_stack %2 : $*Int64
   %4 = tuple ()
   return %4 : $()
+}
+
+// Make sure that we do expand destroy_addr appropriately for code-size
+// trade-offs.
+// CHECK-LABEL: sil @large_struct_test : $@convention(thin) (@owned LargeCodesizeStruct) -> () {
+// CHECK: bb0([[ARG0:%.*]] : $LargeCodesizeStruct):
+// CHECK:   release_value [[ARG0]]
+// CHECK: } // end sil function 'large_struct_test'
+sil @large_struct_test : $@convention(thin) (@owned LargeCodesizeStruct) -> () {
+bb0(%0 : $LargeCodesizeStruct):
+  %1 = alloc_stack $LargeCodesizeStruct
+  store %0 to %1 : $*LargeCodesizeStruct
+  destroy_addr %1 : $*LargeCodesizeStruct
+  dealloc_stack %1 : $*LargeCodesizeStruct
+  %7 = tuple ()
+  return %7 : $()
+}
+
+// CHECK-LABEL: sil @small_struct_test : $@convention(thin) (@owned SmallCodesizeStruct) -> () {
+// CHECK: bb0([[ARG0:%.*]] : $SmallCodesizeStruct):
+// CHECK:   [[ARG0cls1:%.*]] = struct_extract [[ARG0]]
+// CHECK:   strong_release [[ARG0cls1]]
+// CHECK:   [[ARG0cls2:%.*]] = struct_extract [[ARG0]]
+// CHECK:   strong_release [[ARG0cls2]]
+// CHECK: } // end sil function 'small_struct_test'
+sil @small_struct_test : $@convention(thin) (@owned SmallCodesizeStruct) -> () {
+bb0(%0 : $SmallCodesizeStruct):
+  %1 = alloc_stack $SmallCodesizeStruct
+  store %0 to %1 : $*SmallCodesizeStruct
+  destroy_addr %1 : $*SmallCodesizeStruct
+  dealloc_stack %1 : $*SmallCodesizeStruct
+  %7 = tuple ()
+  return %7 : $()
+}
+
+// CHECK-LABEL: sil @dead_address_projections
+// CHECK-NOT: alloc_stack
+// CHECK: } // end sil function 'dead_address_projections'
+sil @dead_address_projections : $@convention(thin) (((), ())) -> ((), ()) {
+bb0(%0 : $((), ())):
+  %1 = alloc_stack $((), ())
+  %200 = tuple_element_addr %1 : $*((), ()), 0
+  %300 = tuple_element_addr %1 : $*((), ()), 1
+  cond_br undef, bb1, bb2
+
+bb1:
+  store %0 to %1 : $*((), ())
+  %16 = load %1 : $*((), ())
+  dealloc_stack %1 : $*((), ())
+  br bb3(%16 : $((), ()))
+
+bb2:
+  dealloc_stack %1 : $*((), ())
+  br bb3(%0 : $((), ()))
+
+bb3(%20 : $((), ())):
+  return %20 : $((), ())
+}
+
+// CHECK-LABEL: sil @load_tuple_of_void
+// CHECK:   [[T:%[0-9]+]] = tuple (%{{[0-9]+}} : $(), %{{[0-9]+}} : $())
+// CHECK:   return [[T]] : $((), ())
+// CHECK: } // end sil function 'load_tuple_of_void'
+sil @load_tuple_of_void : $@convention(thin) () -> ((), ()) {
+bb0:
+  %1 = alloc_stack $((), ())
+  %16 = load %1 : $*((), ())
+  dealloc_stack %1 : $*((), ())
+  return %16 : $((), ())
+}
+
+// CHECK-LABEL: sil @unchecked_bitwise_cast
+// CHECK-NOT: alloc_stack
+// CHECK: [[CAST:%.*]] = unchecked_bitwise_cast %0 : $Optional<Klass> to $Klass
+// CHECK: release_value [[CAST]]
+// CHECK: return
+sil @unchecked_bitwise_cast : $@convention(thin) (@owned Optional<Klass>) -> () {
+bb0(%0 : $Optional<Klass>):
+  %1 = alloc_stack $Optional<Klass>
+  store %0 to %1 : $*Optional<Klass>
+  %2 = unchecked_addr_cast %1 : $*Optional<Klass> to $*Klass
+  %3 = load %2 : $*Klass
+  release_value %3 : $Klass
+  dealloc_stack %1 : $*Optional<Klass>
+  %4 = tuple()
+  return %4 : $()
+}
+
+// dead args okay in non-ossa
+// CHECK-LABEL: sil @multi_basic_block_use_on_one_path :
+// CHECK-NOT: alloc_stack
+// CHECK: br bb3(undef : $Klass)
+// CHECK: bb3([[dead_arg:%.*]]):
+sil @multi_basic_block_use_on_one_path : $@convention(thin) (@owned Klass) -> () {
+bb0(%0 : $Klass):
+  %1 = alloc_stack $Klass
+  cond_br undef, bb1, bb2
+
+bb1:
+  dealloc_stack %1 : $*Klass
+  strong_release %0 : $Klass
+  br bb3
+
+bb2:
+  store %0 to %1 : $*Klass
+  %7 = load %1 : $*Klass
+  dealloc_stack %1 : $*Klass
+  strong_release %7 : $Klass
+  br bb3
+
+bb3:
+  %11 = tuple ()
+  return %11 : $()
+}
+
+// CHECK-LABEL: sil @load_from_uninitialized_empty : {{.*}} {
+// CHECK:         [[V_3_0:%[^,]+]] = struct $EmptyStruct
+// CHECK:         [[V_3_1:%[^,]+]] = struct $EmptyStruct
+// CHECK:         [[V_2_0:%[^,]+]] = struct $Pair{{.*}} ([[V_3_0]]{{.*}}, [[V_3_1]]
+// CHECK:         [[V_2_1:%[^,]+]] = struct $EmptyStruct ()
+// CHECK:         [[V_1_0:%[^,]+]] = struct $Pair{{.*}} ([[V_2_0]]{{.*}}, [[V_2_1]]
+// CHECK:         [[V_2_2:%[^,]+]] = struct $EmptyStruct
+// CHECK:         [[V_2_3:%[^,]+]] = struct $EmptyStruct
+// CHECK:         [[V_1_1:%[^,]+]] = tuple ([[V_2_2]]{{.*}}, [[V_2_3]]
+// CHECK:         [[V_1_2:%[^,]+]] = struct $EmptyStruct
+// CHECK:         [[V_0:%[^,]+]] = tuple ([[V_1_0]]{{.*}}, [[V_1_1]]{{.*}}, [[V_1_2]]{{.*}})
+// CHECK:         return [[V_0]]
+// CHECK-LABEL: } // end sil function 'load_from_uninitialized_empty'
+sil @load_from_uninitialized_empty : $@convention(thin) () -> (Pair<Pair<EmptyStruct, EmptyStruct>, EmptyStruct>, (EmptyStruct, EmptyStruct), EmptyStruct) {
+  %addr = alloc_stack $(Pair<Pair<EmptyStruct, EmptyStruct>, EmptyStruct>, (EmptyStruct, EmptyStruct), EmptyStruct)
+  %value = load %addr : $*(Pair<Pair<EmptyStruct, EmptyStruct>, EmptyStruct>, (EmptyStruct, EmptyStruct), EmptyStruct)
+  dealloc_stack %addr : $*(Pair<Pair<EmptyStruct, EmptyStruct>, EmptyStruct>, (EmptyStruct, EmptyStruct), EmptyStruct)
+  return %value : $(Pair<Pair<EmptyStruct, EmptyStruct>, EmptyStruct>, (EmptyStruct, EmptyStruct), EmptyStruct)
+}
+
+
+// CHECK-LABEL: sil @dont_canonicalize_undef : {{.*}} {
+// CHECK:         [[RETVAL:%[^,]+]] = tuple
+// CHECK:         return [[RETVAL]]
+// CHECK-LABEL: } // end sil function 'dont_canonicalize_undef'
+sil @dont_canonicalize_undef : $@convention(thin) () -> () {
+  %addr = alloc_stack $()
+  store undef to %addr : $*()
+  dealloc_stack %addr : $*()
+  %retval = tuple ()
+  return %retval : $()
+}
+
+// CHECK-LABEL: sil @undef_for_load_of_empty_type_from_nontrivial_aggregate : {{.*}} {
+// CHECK:         [[EMPTY:%[^,]+]] = tuple ()
+// CHECK:         [[AGGREGATE:%[^,]+]] = tuple (undef : $Builtin.BridgeObject, [[EMPTY]] : $())
+// CHECK:         tuple_extract [[AGGREGATE]] : $(Builtin.BridgeObject, ()), 1
+// CHECK-LABEL: } // end sil function 'undef_for_load_of_empty_type_from_nontrivial_aggregate'
+sil @undef_for_load_of_empty_type_from_nontrivial_aggregate : $@convention(thin) () -> () {
+bb0:
+  %11 = alloc_stack $(Builtin.BridgeObject, ())
+  %12 = tuple_element_addr %11 : $*(Builtin.BridgeObject, ()), 1
+  %13 = load %12 : $*()
+  %empty = tuple ()
+  %14 = tuple (%empty : $(), %13 : $())
+  dealloc_stack %11 : $*(Builtin.BridgeObject, ())
+  return undef : $()
+}
+
+typealias ResilientTy = CheckedContinuation<(), Error>
+
+// CHECK-LABEL: sil @dont_promote_addronly_aggregate : {{.*}} {
+// CHECK:         alloc_stack
+// CHECK-LABEL: } // end sil function 'dont_promote_addronly_aggregate'
+sil @dont_promote_addronly_aggregate : $@convention(thin) () -> () {
+bb0:
+  %11 = alloc_stack $Pair<ResilientTy, ()>
+  %12 = struct_element_addr %11 : $*Pair<ResilientTy, ()>, #Pair.u
+  %13 = load %12 : $*()
+  %empty = tuple ()
+  %14 = tuple (%empty : $(), %13 : $())
+  dealloc_stack %11 : $*Pair<ResilientTy, ()>
+  return undef : $()
+}
+
+// CHECK-LABEL: sil @dont_promote_addronly_aggregate_2 : {{.*}} {
+// CHECK:         alloc_stack
+// CHECK-LABEL: } // end sil function 'dont_promote_addronly_aggregate_2'
+sil @dont_promote_addronly_aggregate_2 : $@convention(thin) <T> () -> () {
+bb0:
+  %11 = alloc_stack $Pair<T, ()>
+  %12 = struct_element_addr %11 : $*Pair<T, ()>, #Pair.u
+  %13 = load %12 : $*()
+  %empty = tuple ()
+  %14 = tuple (%empty : $(), %13 : $())
+  dealloc_stack %11 : $*Pair<T, ()>
+  return undef : $()
 }

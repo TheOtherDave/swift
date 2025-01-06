@@ -41,7 +41,7 @@ func test_NSCoder_decodeTopLevelObjectOfClasses_forKey_error(
 
 
 func test_NSKeyedUnarchiver_unarchiveObjectWithData(_ data: NSData) {
-  var r = NSKeyedUnarchiver.unarchiveObject(with: data as Data)
+  var r = NSKeyedUnarchiver.unarchiveObject(with: data as Data) // expected-warning * {{'unarchiveObject(with:)' was deprecated}}
   expectType(Optional<Any>.self, &r)
 }
 
@@ -63,3 +63,15 @@ func test_NSKeyedUnarchiver_decodeObjectForKey(
   expectType(Optional<Any>.self, &r)
 }
 
+
+@available(OSX 10.13, iOS 11.0, watchOS 4.0, tvOS 11.0, *)
+func test_NSKeyedUnarchiver_unarchivedObjectOfClass(from data: Data) throws {
+    var r = try NSKeyedUnarchiver.unarchivedObject(ofClass: NSString.self, from: data)
+    expectType(NSString?.self, &r)
+}
+
+@available(OSX 10.13, iOS 11.0, watchOS 4.0, tvOS 11.0, *)
+func test_NSKeyedUnarchiver_unarchivedObjectOfClasses(from data: Data) throws {
+    var r = try NSKeyedUnarchiver.unarchivedObject(ofClasses: [NSString.self, NSData.self, NSArray.self], from: data)
+    expectType(Any?.self, &r)
+}

@@ -10,51 +10,108 @@
 //
 //===----------------------------------------------------------------------===//
 
+import SwiftShims
+
+// Macros are disabled when Swift is built without swift-syntax.
+#if $Macros && hasAttribute(attached)
+
+/// Converts description definitions to a debugger Type Summary.
+///
+/// This macro converts compatible description implementations written in Swift
+/// to an LLDB format known as a Type Summary. A Type Summary is LLDB's
+/// equivalent to `debugDescription`, with the distinction that it does not
+/// execute code inside the debugged process. By avoiding code execution,
+/// descriptions can be produced faster, without potential side effects, and
+/// shown in situations where code execution is not performed, such as the
+/// variable list of an IDE.
+///
+/// Consider this an example. This `Team` struct has a `debugDescription` which
+/// summarizes some key details, such as the team's name. The debugger only
+/// computes this string on demand - typically via the `po` command. By applying
+/// the `DebugDescription` macro, a matching Type Summary is constructed. This
+/// allows the user to show a string like "Rams [11-2]", without executing
+/// `debugDescription`. This improves the usability, performance, and
+/// reliability of the debugging experience.
+///
+///     @DebugDescription
+///     struct Team: CustomDebugStringConvertible {
+///        var name: String
+///        var wins, losses: Int
+///
+///        var debugDescription: String {
+///            "\(name) [\(wins)-\(losses)]"
+///        }
+///     }
+///
+/// The `DebugDescription` macro supports both `debugDescription`, `description`,
+/// as well as a third option: a property named `lldbDescription`. The first
+/// two are implemented when conforming to the `CustomDebugStringConvertible`
+/// and `CustomStringConvertible` protocols. The additional `lldbDescription`
+/// property is useful when both `debugDescription` and `description` are
+/// implemented, but don't meet the requirements of the `DebugDescription`
+/// macro. If `lldbDescription` is implemented, `DebugDescription` choose it
+/// over `debugDescription` and `description`. Likewise, `debugDescription` is
+/// preferred over `description`.
+///
+/// ### Description Requirements
+///
+/// The description implementation has the following requirements:
+///
+/// * The body of the description implementation must a single string
+///   expression. String concatenation is not supported, use string interpolation
+///   instead.
+/// * String interpolation can reference stored properties only, functions calls
+///   and other arbitrary computation are not supported. Of note, conditional
+///   logic and computed properties are not supported.
+/// * Overloaded string interpolation cannot be used.
+@attached(member)
+@attached(memberAttribute)
+public macro DebugDescription() =
+  #externalMacro(module: "SwiftMacros", type: "DebugDescriptionMacro")
+
+/// Internal-only macro. See `@DebugDescription`.
+@attached(peer, names: named(_lldb_summary))
+public macro _DebugDescriptionProperty(_ debugIdentifier: String, _ computedProperties: [String]) =
+  #externalMacro(module: "SwiftMacros", type: "_DebugDescriptionPropertyMacro")
+
+#endif
+
+#if SWIFT_ENABLE_REFLECTION
+
+@frozen // namespace
 public enum _DebuggerSupport {
-  @_versioned // FIXME(sil-serialize-all)
-  internal enum CollectionStatus {
-    case NotACollection
-    case CollectionOfElements
-    case CollectionOfPairs
-    case Element
-    case Pair
-    case ElementOfPair
+  private enum CollectionStatus {
+    case notACollection
+    case collectionOfElements
+    case collectionOfPairs
+    case element
+    case pair
+    case elementOfPair
   
-    @_inlineable // FIXME(sil-serialize-all)
-    @_versioned // FIXME(sil-serialize-all)
     internal var isCollection: Bool {
-      return self != .NotACollection
+      return self != .notACollection
     }
   
-    @_inlineable // FIXME(sil-serialize-all)
-    @_versioned // FIXME(sil-serialize-all)
     internal func getChildStatus(child: Mirror) -> CollectionStatus {
-      let disposition = child.displayStyle ?? .struct
+      let disposition = child.displayStyle
     
-      if disposition == .collection { return .CollectionOfElements }
-      if disposition == .dictionary { return .CollectionOfPairs }
-      if disposition == .set { return .CollectionOfElements }
+      if disposition == .collection { return .collectionOfElements }
+      if disposition == .dictionary { return .collectionOfPairs }
+      if disposition == .set { return .collectionOfElements }
     
-      if self == .CollectionOfElements { return .Element }
-      if self == .CollectionOfPairs { return .Pair }
-      if self == .Pair { return .ElementOfPair }
+      if self == .collectionOfElements { return .element }
+      if self == .collectionOfPairs { return .pair }
+      if self == .pair { return .elementOfPair }
     
-      return .NotACollection
+      return .notACollection
     }
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
-  internal static func isClass(_ value: Any) -> Bool {
-    if let _ = type(of: value) as? AnyClass {
-      return true
-    }
-    return false
+  private static func isClass(_ value: Any) -> Bool {
+    return type(of: value) is AnyClass
   }
   
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
-  internal static func checkValue<T>(
+  private static func checkValue<T>(
     _ value: Any,
     ifClass: (AnyObject) -> T,
     otherwise: () -> T
@@ -65,119 +122,76 @@ public enum _DebuggerSupport {
     return otherwise()
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
-  internal static func asObjectIdentifier(_ value: Any) -> ObjectIdentifier? {
+  private static func asObjectIdentifier(_ value: Any) -> ObjectIdentifier? {
     return checkValue(value,
       ifClass: { return ObjectIdentifier($0) },
       otherwise: { return nil })
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
-  internal static func asNumericValue(_ value: Any) -> Int {
-    return checkValue(value,
+  private static func asObjectAddress(_ value: Any) -> String {
+    let address = checkValue(value,
       ifClass: { return unsafeBitCast($0, to: Int.self) },
       otherwise: { return 0 })
+    return String(address, radix: 16, uppercase: false)
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
-  internal static func asStringRepresentation(
+  private static func asStringRepresentation(
     value: Any?,
     mirror: Mirror,
     count: Int
   ) -> String? {
-    let ds = mirror.displayStyle ?? .`struct`
-    switch ds {
-      case .optional:
-        if count > 0 {
-          return "\(mirror.subjectType)"
-        }
-        else {
-          if let x = value {
-            return String(reflecting: x)
-          }
-        }
-      case .collection:
-        fallthrough
-      case .dictionary:
-        fallthrough
-      case .set:
-        fallthrough
-      case .tuple:
-        if count == 1 {
-          return "1 element"
-        } else {
-          return "\(count) elements"
-        }
-      case .`struct`:
-        fallthrough
-      case .`enum`:
-        if let x = value {
-          if let cdsc = (x as? CustomDebugStringConvertible) {
-            return cdsc.debugDescription
-          }
-          if let csc = (x as? CustomStringConvertible) {
-            return csc.description
-          }
-        }
-        if count > 0 {
-            return "\(mirror.subjectType)"
-        }
-      case .`class`:
-        if let x = value {
-          if let cdsc = (x as? CustomDebugStringConvertible) {
-            return cdsc.debugDescription
-          }
-          if let csc = (x as? CustomStringConvertible) {
-            return csc.description
-          }
-          // for a Class with no custom summary, mimic the Foundation default
-          return "<\(type(of: x)): 0x\(String(asNumericValue(x), radix: 16, uppercase: false))>"
-        } else {
-          // but if I can't provide a value, just use the type anyway
-          return "\(mirror.subjectType)"
-        }
-    }
-    if let x = value {
-      return String(reflecting: x)
-    }
-    return nil
-  }
-
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
-  internal static func ivarCount(mirror: Mirror) -> Int {
-    let count = Int(mirror.children.count)
-    if let sc = mirror.superclassMirror {
-      return ivarCount(mirror: sc) + count
-    } else {
-      return count
+    switch mirror.displayStyle {
+    case .optional? where count > 0:
+        return "\(mirror.subjectType)"
+    case .optional?:
+      return value.map(String.init(reflecting:))
+    case .collection?, .dictionary?, .set?, .tuple?:
+      return count == 1 ? "1 element" : "\(count) elements"
+    case .`struct`?, .`enum`?, nil:
+      switch value {
+      case let x as CustomDebugStringConvertible:
+        return x.debugDescription
+      case let x as CustomStringConvertible:
+        return x.description
+      case _ where count > 0:
+        return "\(mirror.subjectType)"
+      default:
+        return value.map(String.init(reflecting:))
+      }
+    case .`class`?:
+      switch value {
+      case let x as CustomDebugStringConvertible:
+        return x.debugDescription
+      case let x as CustomStringConvertible:
+        return x.description
+      case let x?:
+        // for a Class with no custom summary, mimic the Foundation default
+        return "<\(type(of: x)): 0x\(asObjectAddress(x))>"
+      default:
+        // but if I can't provide a value, just use the type anyway
+        return "\(mirror.subjectType)"
+      }
     }
   }
 
+  private static func ivarCount(mirror: Mirror) -> Int {
+    let ivars = mirror.superclassMirror.map(ivarCount) ?? 0
+    return ivars + mirror.children.count
+  }
 
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
-  internal static func shouldExpand(
+  private static func shouldExpand(
     mirror: Mirror,
     collectionStatus: CollectionStatus,
     isRoot: Bool
   ) -> Bool {
     if isRoot || collectionStatus.isCollection { return true }
-    let count = Int(mirror.children.count)
-    if count > 0 { return true }
-    if let sc = mirror.superclassMirror {
-      return ivarCount(mirror: sc) > 0
-    } else {
-      return true
-    }
+    if !mirror.children.isEmpty { return true }
+    if mirror.displayStyle == .`class` { return true }
+    if let sc = mirror.superclassMirror { return ivarCount(mirror: sc) > 0 }
+    return true
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
-  internal static func printForDebuggerImpl<StreamType : TextOutputStream>(
+  private static func printForDebuggerImpl<StreamType: TextOutputStream>(
     value: Any?,
     mirror: Mirror,
     name: String?,
@@ -187,72 +201,69 @@ public enum _DebuggerSupport {
     parentCollectionStatus: CollectionStatus,
     refsAlreadySeen: inout Set<ObjectIdentifier>,
     maxItemCounter: inout Int,
-    targetStream: inout StreamType
-  ) {
-    if maxItemCounter <= 0 {
-      return
-    }
+    target: inout StreamType
+  ) {    
+    guard maxItemCounter > 0 else { return }
 
-    if !shouldExpand(mirror: mirror,
-                     collectionStatus: parentCollectionStatus,
-                     isRoot: isRoot) {
-      return
-    }
+    guard shouldExpand(mirror: mirror,
+                       collectionStatus: parentCollectionStatus,
+                       isRoot: isRoot) 
+    else { return }
 
     maxItemCounter -= 1
   
-    for _ in 0..<indent {
-      print(" ", terminator: "", to: &targetStream)
-    }
+    print(String(repeating: " ", count: indent), terminator: "", to: &target)
 
     // do not expand classes with no custom Mirror
     // yes, a type can lie and say it's a class when it's not since we only
     // check the displayStyle - but then the type would have a custom Mirror
     // anyway, so there's that...
-    var willExpand = true
-    if let ds = mirror.displayStyle {
-      if ds == .`class` {
-        if let x = value {
-          if !(x is CustomReflectable) {
-            willExpand = false
-          }
-        }
-      }
+    let isNonClass = mirror.displayStyle != .`class`
+    let isCustomReflectable: Bool
+    if let value = value {
+      isCustomReflectable = value is CustomReflectable
+    } else {
+      isCustomReflectable = true
     }
+    let willExpand = isNonClass || isCustomReflectable
 
-    let count = Int(mirror.children.count)
+    let count = mirror.children.count
     let bullet = isRoot && (count == 0 || !willExpand) ? ""
       : count == 0    ? "- "
       : maxDepth <= 0 ? "▹ " : "▿ "
-    print("\(bullet)", terminator: "", to: &targetStream)
+    print(bullet, terminator: "", to: &target)
   
     let collectionStatus = parentCollectionStatus.getChildStatus(child: mirror)
   
-    if let nam = name {
-      print("\(nam) : ", terminator: "", to: &targetStream)
+    if let name = name {
+      print("\(name) : ", terminator: "", to: &target)
     }
 
-    if let str = asStringRepresentation(value: value, mirror: mirror, count: count) {
-      print("\(str)", terminator: "", to: &targetStream)
+    if isRoot, let value = value as? String {
+      // We don't want to use string's debug desciprtion for 'po' because it
+      // escapes the string and prints it raw (e.g. prints "\n" instead of
+      // actually printing a newline), but only if its the root value. Otherwise,
+      // continue using the debug description.
+      print(value, terminator: "", to: &target)
+    } else if let str = asStringRepresentation(value: value, mirror: mirror, count: count) {
+      print(str, terminator: "", to: &target)
     }
   
     if (maxDepth <= 0) || !willExpand {
-      print("", to: &targetStream)
+      print("", to: &target)
       return
     }
 
-    if let x = value {
-      if let valueIdentifier = asObjectIdentifier(x) {
-        if refsAlreadySeen.contains(valueIdentifier) {
-          print(" { ... }", to: &targetStream)
-          return
-        } else {
-          refsAlreadySeen.insert(valueIdentifier)
-        }
+    if let valueIdentifier = value.flatMap(asObjectIdentifier) {
+      if refsAlreadySeen.contains(valueIdentifier) {
+        print(" { ... }", to: &target)
+        return
+      } else {
+        refsAlreadySeen.insert(valueIdentifier)
       }
     }
 
-    print("", to: &targetStream)
+    print("", to: &target)
   
     var printedElements = 0
   
@@ -264,28 +275,22 @@ public enum _DebuggerSupport {
         indent: indent + 2,
         maxDepth: maxDepth - 1,
         isRoot: false,
-        parentCollectionStatus: .NotACollection,
+        parentCollectionStatus: .notACollection,
         refsAlreadySeen: &refsAlreadySeen,
         maxItemCounter: &maxItemCounter,
-        targetStream: &targetStream)
+        target: &target)
     }
   
     for (optionalName,child) in mirror.children {
       let childName = optionalName ?? "\(printedElements)"
       if maxItemCounter <= 0 {
-        for _ in 0..<(indent+4) {
-          print(" ", terminator: "", to: &targetStream)
-        }
+        print(String(repeating: " ", count: indent+4), terminator: "", to: &target)
         let remainder = count - printedElements
-        print("(\(remainder)", terminator: "", to: &targetStream)
+        print("(\(remainder)", terminator: "", to: &target)
         if printedElements > 0 {
-          print(" more", terminator: "", to: &targetStream)
+          print(" more", terminator: "", to: &target)
         }
-        if remainder == 1 {
-          print(" child)", to: &targetStream)
-        } else {
-          print(" children)", to: &targetStream)
-        }
+        print(remainder == 1 ? " child)" : " children)", to: &target)
         return
       }
     
@@ -299,18 +304,15 @@ public enum _DebuggerSupport {
         parentCollectionStatus: collectionStatus,
         refsAlreadySeen: &refsAlreadySeen,
         maxItemCounter: &maxItemCounter,
-        targetStream: &targetStream)
+        target: &target)
       printedElements += 1
     }
   }
 
-  // LLDB uses this function in expressions, and if it is inlined the resulting
-  // LLVM IR is enormous.  As a result, to improve LLDB performance we are not
-  // making it @_inlineable.
   public static func stringForPrintObject(_ value: Any) -> String {
     var maxItemCounter = Int.max
     var refs = Set<ObjectIdentifier>()
-    var targetStream = ""
+    var target = ""
 
     printForDebuggerImpl(
       value: value,
@@ -319,12 +321,55 @@ public enum _DebuggerSupport {
       indent: 0,
       maxDepth: maxItemCounter,
       isRoot: true,
-      parentCollectionStatus: .NotACollection,
+      parentCollectionStatus: .notACollection,
       refsAlreadySeen: &refs,
       maxItemCounter: &maxItemCounter,
-      targetStream: &targetStream)
+      target: &target)
 
-    return targetStream
+    return target
   }
 }
 
+public func _stringForPrintObject(_ value: Any) -> String {
+  return _DebuggerSupport.stringForPrintObject(value)
+}
+
+#endif // SWIFT_ENABLE_REFLECTION
+
+public func _debuggerTestingCheckExpect(_: String, _: String) { }
+
+@_alwaysEmitIntoClient @_transparent
+internal func _withHeapObject<R>(
+  of object: AnyObject,
+  _ body: (UnsafeMutableRawPointer) -> R
+) -> R {
+  defer { _fixLifetime(object) }
+  let unmanaged = Unmanaged.passUnretained(object)
+  return body(unmanaged.toOpaque())
+}
+
+@_extern(c, "swift_retainCount") @usableFromInline
+internal func _swift_retainCount(_: UnsafeMutableRawPointer) -> Int
+@_extern(c, "swift_unownedRetainCount") @usableFromInline
+internal func _swift_unownedRetainCount(_: UnsafeMutableRawPointer) -> Int
+@_extern(c, "swift_weakRetainCount") @usableFromInline
+internal func _swift_weakRetainCount(_: UnsafeMutableRawPointer) -> Int
+
+// Utilities to get refcount(s) of class objects.
+@_alwaysEmitIntoClient
+public func _getRetainCount(_ object: AnyObject) -> UInt {
+  let count = _withHeapObject(of: object) { _swift_retainCount($0) }
+  return UInt(bitPattern: count)
+}
+
+@_alwaysEmitIntoClient
+public func _getUnownedRetainCount(_ object: AnyObject) -> UInt {
+  let count = _withHeapObject(of: object) { _swift_unownedRetainCount($0) }
+  return UInt(bitPattern: count)
+}
+
+@_alwaysEmitIntoClient
+public func _getWeakRetainCount(_ object: AnyObject) -> UInt {
+  let count = _withHeapObject(of: object) { _swift_weakRetainCount($0) }
+  return UInt(bitPattern: count)
+}

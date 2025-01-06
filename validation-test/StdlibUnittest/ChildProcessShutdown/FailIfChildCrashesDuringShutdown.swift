@@ -4,10 +4,16 @@
 // UNSUPPORTED: OS=watchos
 
 import StdlibUnittest
-#if os(Linux) || os(FreeBSD) || os(PS4) || os(Android) || os(Windows)
-import Glibc
+#if canImport(Darwin)
+  import Darwin
+#elseif canImport(Glibc)
+  import Glibc
+#elseif os(Windows)
+  import MSVCRT
+#elseif canImport(Android)
+  import Android
 #else
-import Darwin
+#error("Unsupported platform")
 #endif
 
 _setTestSuiteFailedCallback() { print("abort()") }
@@ -28,7 +34,7 @@ TestSuiteChildCrashes.test("passes") {
 // CHECK: [ RUN      ] TestSuiteChildCrashes.passes
 // CHECK: [       OK ] TestSuiteChildCrashes.passes
 // CHECK: TestSuiteChildCrashes: All tests passed
-// CHECK: stderr>>> Fatal error: Crash at exit:
+// CHECK: stderr>>> {{.*}}Fatal error: Crash at exit
 // CHECK: stderr>>> CRASHED: SIG
 // CHECK: The child process failed during shutdown, aborting.
 // CHECK: abort()

@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/Dominance.h"
 #include "swift/SILOptimizer/Analysis/DominanceAnalysis.h"
 #include "swift/SILOptimizer/Analysis/LoopAnalysis.h"
@@ -18,11 +19,12 @@
 
 using namespace swift;
 
-SILLoopInfo *SILLoopAnalysis::newFunctionAnalysis(SILFunction *F) {
+std::unique_ptr<SILLoopInfo>
+SILLoopAnalysis::newFunctionAnalysis(SILFunction *F) {
   assert(DA != nullptr && "Expect a valid dominance analysis");
   DominanceInfo *DT = DA->get(F);
   assert(DT != nullptr && "Expect a valid dominance information");
-  return new SILLoopInfo(F, DT);
+  return std::make_unique<SILLoopInfo>(F, DT);
 }
 
 void SILLoopAnalysis::initialize(SILPassManager *PM) {

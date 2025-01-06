@@ -10,8 +10,22 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/SILOptimizer/Analysis/ArraySemantic.h"
+#include "swift/SILOptimizer/Analysis/BasicCalleeAnalysis.h"
 #include "swift/SILOptimizer/Utils/PerformanceInlinerUtils.h"
-#include "swift/Strings.h"
+#include "swift/AST/Module.h"
+#include "swift/Basic/Assertions.h"
+#include "swift/SILOptimizer/Utils/InstOptUtils.h"
+#include "llvm/Support/CommandLine.h"
+
+llvm::cl::opt<std::string>
+    SILInlineNeverFuns("sil-inline-never-functions", llvm::cl::init(""),
+                       llvm::cl::desc("Never inline functions whose name "
+                                      "includes this string."));
+llvm::cl::list<std::string>
+    SILInlineNeverFun("sil-inline-never-function", llvm::cl::CommaSeparated,
+                       llvm::cl::desc("Never inline functions whose name "
+                                      "is this string"));
 
 //===----------------------------------------------------------------------===//
 //                               ConstantTracker
@@ -104,6 +118,30 @@ static SILValue getMember(SILInstruction *inst, ProjectionPath &projStack) {
   return SILValue();
 }
 
+SILValue swift::stripFunctionConversions(SILValue val) {
+  SILValue result = nullptr;
+
+  for (;;) {
+    if (auto ti = dyn_cast<ThinToThickFunctionInst>(val)) {
+      val = ti->getOperand();
+      result = val;
+      continue;
+    } else if (auto cfi = dyn_cast<ConvertFunctionInst>(val)) {
+      val = cfi->getOperand();
+      result = val;
+      continue;
+    } else if (auto cvt = dyn_cast<ConvertEscapeToNoEscapeInst>(val)) {
+      val = cvt->getOperand();
+      result = val;
+      continue;
+    } else {
+      break;
+    }
+  }
+
+  return result;
+}
+
 SILInstruction *ConstantTracker::getDef(SILValue val,
                                         ProjectionPath &projStack) {
 
@@ -124,11 +162,8 @@ SILInstruction *ConstantTracker::getDef(SILValue val,
         // A value loaded from memory.
         val = loadedVal;
         continue;
-      } else if (auto ti = dyn_cast<ThinToThickFunctionInst>(inst)) {
-        val = ti->getOperand();
-        continue;
-      } else if (auto cfi = dyn_cast<ConvertFunctionInst>(inst)) {
-        val = cfi->getOperand();
+      } else if (auto base = stripFunctionConversions(inst)) {
+        val = base;
         continue;
       }
       return inst;
@@ -156,9 +191,9 @@ case BuiltinValueKind::id:
       IntConst lhs = getIntConst(Args[0], depth);
       IntConst rhs = getIntConst(Args[1], depth);
       if (lhs.isValid && rhs.isValid) {
-        return IntConst(constantFoldComparison(lhs.value, rhs.value,
-                                               Builtin.ID),
-                        lhs.isFromCaller || rhs.isFromCaller);
+        return IntConst(
+            constantFoldComparisonInt(lhs.value, rhs.value, Builtin.ID),
+            lhs.isFromCaller || rhs.isFromCaller);
       }
       break;
     }
@@ -299,10 +334,10 @@ SILBasicBlock *ConstantTracker::getTakenBlock(TermInst *term) {
     if (SILInstruction *def = getDefInCaller(CCB->getOperand())) {
       if (auto *UCI = dyn_cast<UpcastInst>(def)) {
         SILType castType = UCI->getOperand()->getType();
-        if (CCB->getCastType().isExactSuperclassOf(castType)) {
+        if (CCB->getTargetLoweredType().isExactSuperclassOf(castType)) {
           return CCB->getSuccessBB();
         }
-        if (!castType.isBindableToSuperclassOf(CCB->getCastType())) {
+        if (!castType.isBindableToSuperclassOf(CCB->getTargetLoweredType())) {
           return CCB->getFailureBB();
         }
       }
@@ -413,6 +448,10 @@ void ShortestPathAnalysis::analyzeLoopsRecursively(SILLoop *Loop, int LoopDepth)
 ShortestPathAnalysis::Weight ShortestPathAnalysis::
 getWeight(SILBasicBlock *BB, Weight CallerWeight) {
   assert(BB->getParent() == F);
+
+  // Return a conservative default if the analysis was not done due to a high number of blocks.
+  if (BlockInfos.empty())
+    return Weight(CallerWeight.ScopeLength + ColdBlockLength, CallerWeight.LoopWeight);
 
   SILLoop *Loop = LI->getLoopFor(BB);
   if (!Loop) {
@@ -543,94 +582,141 @@ static bool calleeIsSelfRecursive(SILFunction *Callee) {
   for (auto &BB : *Callee)
     for (auto &I : BB)
       if (auto Apply = FullApplySite::isa(&I))
-        if (Apply.getReferencedFunction() == Callee)
+        if (Apply.getReferencedFunctionOrNull() == Callee)
           return true;
   return false;
 }
 
-// Returns true if the callee contains a partial apply instruction,
-// whose substitutions list would contain opened existentials after
-// inlining.
-static bool calleeHasPartialApplyWithOpenedExistentials(FullApplySite AI) {
-  if (!AI.hasSubstitutions())
-    return false;
+SemanticFunctionLevel swift::getSemanticFunctionLevel(SILFunction *function) {
+  // Currently, we only consider "array" semantic calls to be "optimizable
+  // semantic functions" (non-transient) because we only have semantic passes
+  // that recognize array operations, for example, hoisting them out of loops.
+  //
+  // Compiler "hints" and informational annotations (like remarks) should
+  // ideally use a separate annotation rather than @_semantics.
+  switch (getArraySemanticsKind(function)) {
+  case ArrayCallKind::kNone:
+    return SemanticFunctionLevel::Transient;
 
-  SILFunction *Callee = AI.getReferencedFunction();
-  auto Subs = AI.getSubstitutions();
+  case ArrayCallKind::kArrayInitEmpty:
+  case ArrayCallKind::kArrayPropsIsNativeTypeChecked:
+  case ArrayCallKind::kCheckSubscript:
+  case ArrayCallKind::kCheckIndex:
+  case ArrayCallKind::kGetCount:
+  case ArrayCallKind::kGetCapacity:
+  case ArrayCallKind::kGetElement:
+  case ArrayCallKind::kGetElementAddress:
+  case ArrayCallKind::kMakeMutable:
+  case ArrayCallKind::kEndMutation:
+  case ArrayCallKind::kMutateUnknown:
+    return SemanticFunctionLevel::Fundamental;
 
-  // Bail if there are no open existentials in the list of substitutions.
-  bool HasNoOpenedExistentials = true;
-  for (auto Sub : Subs) {
-    if (Sub.getReplacement()->hasOpenedExistential()) {
-      HasNoOpenedExistentials = false;
-      break;
-    }
+  // These have nested semantic calls, but they also expose the underlying
+  // buffer so must be treated as fundamental, and should not be inlined until
+  // after array semantic passes have run.
+  //
+  // TODO: Once Nested semantics calls are preserved during early inlining,
+  // change these to Nested.
+  case ArrayCallKind::kArrayInit:
+  case ArrayCallKind::kArrayUninitialized:
+  case ArrayCallKind::kWithUnsafeMutableBufferPointer:
+    return SemanticFunctionLevel::Fundamental;
+
+  case ArrayCallKind::kReserveCapacityForAppend:
+  case ArrayCallKind::kAppendContentsOf:
+  case ArrayCallKind::kAppendElement:
+    return SemanticFunctionLevel::Nested;
+
+  // Compiler intrinsics hide "normal" semantic methods, such as
+  // "array.uninitialized" or "array.end_mutation"--they are intentionally
+  // transient and should be inlined away immediately.
+  case ArrayCallKind::kArrayUninitializedIntrinsic:
+  case ArrayCallKind::kArrayFinalizeIntrinsic:
+  case ArrayCallKind::kCopyIntoVector:
+    return SemanticFunctionLevel::Transient;
+
+  } // end switch
+  llvm_unreachable("covered switch");
+}
+
+/// Return true if \p apply calls into an optimizable semantic function from
+/// within another semantic function, or from a "trivial" wrapper.
+///
+/// Checking for wrappers, in addition to directly annotated nested semantic
+/// functions, allows semantic function calls to be wrapped inside trivial
+/// getters and closures without needing to explicitly annotate those wrappers.
+///
+/// For example:
+///
+///   public var count: Int { getCount() }
+///   @_semantic("count") internal func getCount() { ... }
+///
+/// Wrappers may be closures, so this semantic "nesting" is allowed:
+///
+///   @_semantics("append")
+///   public func append(...) {
+///     defer { endMutation() }
+///     ...
+///   }
+///   @_semantics("endMutation") func endMutation() { ... }
+///
+/// TODO: if simply checking the call arguments results in too many functions
+/// being considered "wrappers", thus preventing useful inlining, consider
+/// either using a cost metric to check for low-cost wrappers or directly
+/// checking for getters or closures.
+///
+/// TODO: Move this into PerformanceInlinerUtils and apply it to
+/// getEligibleFunction. The mid-level pipeline should not inline semantic
+/// functions into their wrappers. If such wrappers have still not been fully
+/// inlined by the time late inlining runs, then the semantic call can be
+/// inlined into the wrapper at that time.
+bool swift::isNestedSemanticCall(FullApplySite apply) {
+  auto callee = apply.getReferencedFunctionOrNull();
+  if (!callee) {
+     return false;
   }
-
-  if (HasNoOpenedExistentials)
+  if (!isOptimizableSemanticFunction(callee)) {
     return false;
-
-  auto SubsMap = Callee->getLoweredFunctionType()
-    ->getGenericSignature()->getSubstitutionMap(Subs);
-
-  for (auto &BB : *Callee) {
-    for (auto &I : BB) {
-      if (auto PAI = dyn_cast<PartialApplyInst>(&I)) {
-        auto PAISubs = PAI->getSubstitutions();
-        if (PAISubs.empty())
-          continue;
-
-        // Check if any of substitutions would contain open existentials
-        // after inlining.
-        auto PAISubMap = PAI->getOrigCalleeType()
-          ->getGenericSignature()->getSubstitutionMap(PAISubs);
-        PAISubMap = PAISubMap.subst(SubsMap);
-        if (PAISubMap.hasOpenedExistential())
-          return true;
+  }
+  if (isOptimizableSemanticFunction(apply.getFunction())) {
+    return true;
+  }
+  // In a trivial wrapper, all call arguments are simply forwarded from the
+  // wrapper's arguments.
+  auto isForwardedArg = [](SILValue arg) {
+    while (true) {
+      if (isa<SILFunctionArgument>(arg) || isa<LiteralInst>(arg)) {
+        return true;
       }
+      auto *argInst = arg->getDefiningInstruction();
+      if (!argInst) {
+        return false;
+      }
+      if (!getSingleValueCopyOrCast(argInst)) {
+        return false;
+      }
+      arg = argInst->getOperand(0);
     }
-  }
-
-  return false;
-}
-
-// Returns true if a given apply site should be skipped during the
-// early inlining pass.
-//
-// NOTE: Add here the checks for any specific @_semantics/@_effects
-// attributes causing a given callee to be excluded from the inlining
-// during the early inlining pass.
-static bool shouldSkipApplyDuringEarlyInlining(FullApplySite AI) {
-  // Add here the checks for any specific @_semantics attributes that need
-  // to be skipped during the early inlining pass.
-  ArraySemanticsCall ASC(AI.getInstruction());
-  if (ASC && !ASC.canInlineEarly())
-    return true;
-
-  SILFunction *Callee = AI.getReferencedFunction();
-  if (!Callee)
-    return false;
-
-  if (Callee->hasSemanticsAttr("self_no_escaping_closure") ||
-      Callee->hasSemanticsAttr("pair_no_escaping_closure"))
-    return true;
-
-  // Add here the checks for any specific @_effects attributes that need
-  // to be skipped during the early inlining pass.
-  if (Callee->hasEffectsKind())
-    return true;
-
-  return false;
+  };
+  return llvm::all_of(apply.getArguments(), isForwardedArg);
 }
 
 /// Checks if a generic callee and caller have compatible layout constraints.
 static bool isCallerAndCalleeLayoutConstraintsCompatible(FullApplySite AI) {
-  SILFunction *Callee = AI.getReferencedFunction();
-  auto CalleeSig = Callee->getLoweredFunctionType()->getGenericSignature();
-  auto SubstParams = CalleeSig->getSubstitutableParams();
-  auto AISubs = AI.getSubstitutions();
-  for (auto idx : indices(SubstParams)) {
-    auto Param = SubstParams[idx];
+  SILFunction *Callee = AI.getReferencedFunctionOrNull();
+  assert(Callee && "Trying to optimize a dynamic function!?");
+
+  auto CalleeSig = Callee->getLoweredFunctionType()
+                         ->getInvocationGenericSignature();
+  auto AISubs = AI.getSubstitutionMap();
+
+  SmallVector<GenericTypeParamType *, 4> SubstParams;
+  CalleeSig->forEachParam([&](GenericTypeParamType *Param, bool Canonical) {
+    if (Canonical)
+      SubstParams.push_back(Param);
+  });
+
+  for (auto Param : SubstParams) {
     // Map the parameter into context
     auto ContextTy = Callee->mapTypeIntoContext(Param->getCanonicalType());
     auto Archetype = ContextTy->getAs<ArchetypeType>();
@@ -641,38 +727,59 @@ static bool isCallerAndCalleeLayoutConstraintsCompatible(FullApplySite AI) {
       continue;
     // The generic parameter has a layout constraint.
     // Check that the substitution has the same constraint.
-    auto AIReplacement = AISubs[idx].getReplacement();
-    auto AIArchetype = AIReplacement->getAs<ArchetypeType>();
-    if (!AIArchetype)
-      return false;
-    auto AILayout = AIArchetype->getLayoutConstraint();
-    if (!AILayout)
-      return false;
-    if (AILayout != Layout)
-      return false;
+    auto AIReplacement = Type(Param).subst(AISubs);
+
+    if (Layout->isClass()) {
+      if (!AIReplacement->satisfiesClassConstraint())
+        return false;
+    } else {
+      auto AIArchetype = AIReplacement->getAs<ArchetypeType>();
+      if (!AIArchetype)
+        return false;
+      auto AILayout = AIArchetype->getLayoutConstraint();
+      if (!AILayout)
+        return false;
+      if (AILayout != Layout)
+        return false;
+    }
   }
   return true;
 }
 
-// Returns the callee of an apply_inst if it is basically inlineable.
+// Returns the callee of an apply_inst if it is basically inlinable.
 SILFunction *swift::getEligibleFunction(FullApplySite AI,
                                         InlineSelection WhatToInline) {
-
-  SILFunction *Callee = AI.getReferencedFunction();
-  SILFunction *EligibleCallee = nullptr;
+  SILFunction *Callee = AI.getReferencedFunctionOrNull();
 
   if (!Callee) {
     return nullptr;
   }
-  auto ModuleName = Callee->getModule().getSwiftModule()->getName().str();
-  bool IsInStdlib = (ModuleName == STDLIB_NAME || ModuleName == SWIFT_ONONE_SUPPORT);
 
-  // Don't inline functions that are marked with the @_semantics or @effects
+  // Not all apply sites can be inlined, even if they're direct.
+  if (!SILInliner::canInlineApplySite(AI))
+    return nullptr;
+
+  // If our inline selection is only always inline, do a quick check if we have
+  // an always inline function and bail otherwise.
+  if (WhatToInline == InlineSelection::OnlyInlineAlways &&
+      Callee->getInlineStrategy() != AlwaysInline) {
+    return nullptr;
+  }
+
+  ModuleDecl *SwiftModule = Callee->getModule().getSwiftModule();
+  bool IsInStdlib = (SwiftModule->isStdlibModule() ||
+                     SwiftModule->isOnoneSupportModule());
+
+  // Don't inline functions that are marked with the @_semantics or @_effects
   // attribute if the inliner is asked not to inline them.
   if (Callee->hasSemanticsAttrs() || Callee->hasEffectsKind()) {
-    if (WhatToInline == InlineSelection::NoSemanticsAndGlobalInit) {
-      if (shouldSkipApplyDuringEarlyInlining(AI))
+    if (WhatToInline >= InlineSelection::NoSemanticsAndEffects) {
+      // TODO: for stable optimization of semantics, prevent inlining whenever
+      // isOptimizableSemanticFunction(Callee) is true.
+      if (getSemanticFunctionLevel(Callee) == SemanticFunctionLevel::Fundamental
+          || Callee->hasEffectsKind()) {
         return nullptr;
+      }
       if (Callee->hasSemanticsAttr("inline_late"))
         return nullptr;
     }
@@ -689,11 +796,6 @@ SILFunction *swift::getEligibleFunction(FullApplySite AI,
         return nullptr;
       }
     }
-
-  } else if (Callee->isGlobalInit()) {
-    if (WhatToInline != InlineSelection::Everything) {
-      return nullptr;
-    }
   }
 
   // We can't inline external declarations.
@@ -701,8 +803,19 @@ SILFunction *swift::getEligibleFunction(FullApplySite AI,
     return nullptr;
   }
 
-  // Explicitly disabled inlining.
+  // Explicitly disabled inlining or optimization.
   if (Callee->getInlineStrategy() == NoInline) {
+    return nullptr;
+  }
+
+  if (!SILInlineNeverFuns.empty() &&
+      Callee->getName().contains(SILInlineNeverFuns))
+    return nullptr;
+
+  if (!SILInlineNeverFun.empty() &&
+      SILInlineNeverFun.end() != std::find(SILInlineNeverFun.begin(),
+                                           SILInlineNeverFun.end(),
+                                           Callee->getName())) {
     return nullptr;
   }
 
@@ -718,13 +831,14 @@ SILFunction *swift::getEligibleFunction(FullApplySite AI,
     // Check if passed Self is the same as the Self of the caller.
     // In this case, it is safe to inline because both functions
     // use the same Self.
-    if (AI.hasSelfArgument() && Caller->hasSelfParam()) {
-      auto CalleeSelf = stripCasts(AI.getSelfArgument());
-      auto CallerSelf = Caller->getSelfArgument();
-      if (CalleeSelf != SILValue(CallerSelf))
-        return nullptr;
-    } else
+    if (!AI.hasSelfArgument() || !Caller->hasDynamicSelfMetadata()) {
       return nullptr;
+    }
+    auto CalleeSelf = stripCasts(AI.getSelfArgument());
+    auto CallerSelf = Caller->getDynamicSelfMetadata();
+    if (CalleeSelf != SILValue(CallerSelf)) {
+      return nullptr;
+    }
   }
 
   // Detect self-recursive calls.
@@ -733,13 +847,13 @@ SILFunction *swift::getEligibleFunction(FullApplySite AI,
   }
 
   // A non-fragile function may not be inlined into a fragile function.
-  if (Caller->isSerialized() &&
-      !Callee->hasValidLinkageForFragileInline()) {
-    if (!Callee->hasValidLinkageForFragileRef()) {
+  if (!Callee->canBeInlinedIntoCaller(Caller->getSerializedKind())) {
+    if (Caller->isAnySerialized() &&
+        !Callee->hasValidLinkageForFragileRef(Caller->getSerializedKind())) {
       llvm::errs() << "caller: " << Caller->getName() << "\n";
       llvm::errs() << "callee: " << Callee->getName() << "\n";
-      llvm_unreachable("Should never be inlining a resilient function into "
-                       "a fragile function");
+      ASSERT(false && "Should never be inlining a resilient function into "
+                      "a fragile function");
     }
     return nullptr;
   }
@@ -747,15 +861,10 @@ SILFunction *swift::getEligibleFunction(FullApplySite AI,
   // Inlining self-recursive functions into other functions can result
   // in excessive code duplication since we run the inliner multiple
   // times in our pipeline
+  //
+  // FIXME: This should be cached!
   if (calleeIsSelfRecursive(Callee)) {
     return nullptr;
-  }
-
-  if (!EnableSILInliningOfGenerics && AI.hasSubstitutions()) {
-    // Inlining of generics is not allowed unless it is an @inline(__always)
-    // or transparent function.
-    if (Callee->getInlineStrategy() != AlwaysInline && !Callee->isTransparent())
-      return nullptr;
   }
 
   // We cannot inline function with layout constraints on its generic types
@@ -763,62 +872,92 @@ SILFunction *swift::getEligibleFunction(FullApplySite AI,
   // The reason for this restriction is that we'd need to be able to express
   // in SIL something like casting a value of generic type T into a value of
   // generic type T: _LayoutConstraint, which is impossible currently.
-  if (EnableSILInliningOfGenerics && AI.hasSubstitutions()) {
-    if (!isCallerAndCalleeLayoutConstraintsCompatible(AI))
+  if (AI.hasSubstitutions()) {
+    if (!isCallerAndCalleeLayoutConstraintsCompatible(AI) &&
+        // TODO: revisit why we can make an exception for inline-always
+        // functions. Some tests depend on it.
+        Callee->getInlineStrategy() != AlwaysInline && !Callee->isTransparent())
       return nullptr;
   }
 
-  // IRGen cannot handle partial_applies containing opened_existentials
-  // in its substitutions list.
-  if (calleeHasPartialApplyWithOpenedExistentials(AI)) {
-    return nullptr;
-  }
-
-  EligibleCallee = Callee;
-  return EligibleCallee;
+  return Callee;
 }
 
-/// Returns true if a given value is constant.
-/// The value is considered to be constant if it is:
-/// - a literal
-/// - a tuple or a struct whose fields are all constants
-static bool isConstantValue(SILValue V) {
-  if (isa<LiteralInst>(V))
-    return true;
-  if (auto *TI = dyn_cast<TupleInst>(V)) {
-    for (auto E : TI->getElements()) {
-      if (!isConstantValue(E))
-        return false;
+/// Returns true if the instruction \I has any interesting side effects which
+/// might prevent inlining a pure function.
+static bool hasInterestingSideEffect(SILInstruction *I) {
+  switch (I->getKind()) {
+    // Those instructions turn into no-ops after inlining, redundant load
+    // elimination, constant folding and dead-object elimination.
+    case swift::SILInstructionKind::StrongRetainInst:
+    case swift::SILInstructionKind::StrongReleaseInst:
+    case swift::SILInstructionKind::RetainValueInst:
+    case swift::SILInstructionKind::ReleaseValueInst:
+    case swift::SILInstructionKind::StoreInst:
+    case swift::SILInstructionKind::DeallocStackRefInst:
+    case swift::SILInstructionKind::DeallocRefInst:
+      return false;
+    default:
+      return I->getMemoryBehavior() != MemoryBehavior::None;
+  }
+}
+
+/// Returns true if the operand \p Arg is a constant or an object which is
+/// initialized with constant values.
+///
+/// The value is considered to be constant if it is composed of side-effect free
+/// instructions, like literal or aggregate instructions.
+static bool isConstantArg(Operand *Arg) {
+  auto *ArgI = Arg->get()->getDefiningInstruction();
+  if (!ArgI)
+    return false;
+
+  SmallPtrSet<SILInstruction *, 8> Visited;
+  SmallVector<SILInstruction *, 8> Worklist;
+
+  auto addToWorklist = [&](SILInstruction *I) {
+    if (Visited.insert(I).second)
+      Worklist.push_back(I);
+  };
+
+  addToWorklist(ArgI);
+
+  // Visit the transitive closure of \p Arg and see if there is any side-effect
+  // instructions which prevents folding away everything after inlining.
+  while (!Worklist.empty()) {
+    SILInstruction *I = Worklist.pop_back_val();
+
+    if (hasInterestingSideEffect(I))
+      return false;
+
+    for (SILValue Result : I->getResults()) {
+      for (Operand *Use : Result->getUses()) {
+        if (Use != Arg)
+          addToWorklist(Use->getUser());
+      }
     }
-    return true;
-  }
-  if (auto *SI = dyn_cast<StructInst>(V)) {
-    for (auto E : SI->getElements()) {
-      if (!isConstantValue(E))
+    for (Operand &Op : I->getAllOperands()) {
+      if (SILInstruction *OpInst = Op.get()->getDefiningInstruction()) {
+        addToWorklist(OpInst);
+      } else {
         return false;
+      }
     }
-    return true;
   }
-  if (auto *MT = dyn_cast<MetatypeInst>(V)) {
-    if (!MT->getType().hasArchetype())
-      return true;
-  }
-  return false;
+  return true;
 }
 
 
-bool swift::isPureCall(FullApplySite AI, SideEffectAnalysis *SEA) {
+bool swift::isPureCall(FullApplySite AI, BasicCalleeAnalysis *BCA) {
   // If a call has only constant arguments and the call is pure, i.e. has
   // no side effects, then we should always inline it.
-  SideEffectAnalysis::FunctionEffects ApplyEffects;
-  SEA->getEffects(ApplyEffects, AI);
-  auto GE = ApplyEffects.getGlobalEffects();
-  if (GE.mayRead() || GE.mayWrite() || GE.mayRetain() || GE.mayRelease())
+  // This includes arguments which are objects initialized with constant values.
+  if (BCA->getMemoryBehavior(AI, /*observeRetains*/ true) != MemoryBehavior::None)
     return false;
   // Check if all parameters are constant.
-  auto Args = AI.getArgumentsWithoutIndirectResults();
-  for (auto Arg : Args) {
-    if (!isConstantValue(Arg)) {
+  auto Args = AI.getArgumentOperands().slice(AI.getNumIndirectSILResults());
+  for (Operand &Arg : Args) {
+    if (!isConstantArg(&Arg)) {
       return false;
     }
   }

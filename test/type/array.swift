@@ -42,7 +42,7 @@ func constructArray(_ n: Int) {
 
 typealias FixIt0 = Int[] // expected-error{{array types are now written with the brackets around the element type}}{{20-20=[}}{{23-24=}}
 
-// Make sure preCheckExpression() properly folds member types.
+// Make sure preCheckTarget() properly folds member types.
 
 class Outer {
   class Middle {
@@ -114,3 +114,23 @@ func passAssocType<T : HasAssocType>(_ t: T) {
   takesAssocType(t, [T.A](), [T.A?]())
 }
 
+// https://github.com/apple/swift/issues/53530
+do {
+  let _ = [[1, 2, 3][0]] // ok
+  let _ = [[1, 2, 3] [1]] // expected-warning {{unexpected subscript in array literal; did you mean to write two separate elements instead?}}
+  // expected-note@-1 {{add a separator between the elements}}{{21-21=,}}
+  // expected-note@-2 {{remove the space between the elements to silence this warning}}{{21-22=}}
+  let _ = [
+    [1, 2, 3] [1] // expected-warning {{unexpected subscript in array literal; did you mean to write two separate elements instead?}}
+  // expected-note@-1 {{add a separator between the elements}}{{14-14=,}}
+  // expected-note@-2 {{remove the space between the elements to silence this warning}}{{14-15=}}
+  ]
+}
+
+struct TupleWith<T> {
+  typealias And<U> = (T, U)
+}
+_ = [TupleWith<String>.And<Int>](repeating: ("", 0), count: 0)
+_ = [TupleWith.And<Int>](repeating: ("", 0), count: 0)
+_ = [TupleWith<String>.And](repeating: ("", 0), count: 0)
+_ = [TupleWith.And](repeating: ("", 0), count: 0)

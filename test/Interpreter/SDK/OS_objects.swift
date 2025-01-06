@@ -2,6 +2,7 @@
 //
 // RUN: cp %s %t/main.swift
 // RUN: %target-build-swift %t/main.swift -I %S/Inputs/custom-modules/ -o %t/OS_objects -Xfrontend -disable-access-control
+// RUN: %target-codesign %t/OS_objects
 // RUN: %target-run %t/OS_objects 2>&1 | %FileCheck %s
 
 // REQUIRES: objc_interop
@@ -15,9 +16,8 @@ import DispatchObjects
 
 // CHECK: Get current queue
 print("Get current queue")
-// TODO: Properly implement generalized dynamic casts from Any to
-// runtime-visible classes. `as AnyObject` should be unnecessary here.
-let obj = dispatch_get_current_queue() as AnyObject
+
+let obj = dispatch_get_current_queue()
 
 // CHECK-NEXT: Object is a dispatch queue
 if let q = obj as? OS_dispatch_queue {

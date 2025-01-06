@@ -14,7 +14,7 @@
 #define SWIFT_AST_GENERICPARAMKEY_H
 
 #include "llvm/ADT/DenseMapInfo.h"
-#include "llvm/ADT/ArrayRef.h"
+#include "swift/AST/Type.h"
 
 namespace swift {
 
@@ -24,17 +24,20 @@ class GenericTypeParamType;
 /// A fully-abstracted generic type parameter key, maintaining only the depth
 /// and index of the generic parameter.
 struct GenericParamKey {
-  unsigned Depth : 16;
+  unsigned ParameterPack : 1;
+  unsigned Depth : 15;
   unsigned Index : 16;
 
-  GenericParamKey(unsigned depth, unsigned index)
-    : Depth(depth), Index(index) { }
+  GenericParamKey(bool isParameterPack, unsigned depth, unsigned index)
+      : ParameterPack(isParameterPack), Depth(depth), Index(index) {}
 
   GenericParamKey(const GenericTypeParamDecl *d);
   GenericParamKey(const GenericTypeParamType *d);
 
   friend bool operator==(GenericParamKey lhs, GenericParamKey rhs) {
-    return lhs.Depth == rhs.Depth && lhs.Index == rhs.Index;
+    return lhs.ParameterPack == rhs.ParameterPack &&
+           lhs.Depth == rhs.Depth &&
+           lhs.Index == rhs.Index;
   }
 
   friend bool operator!=(GenericParamKey lhs, GenericParamKey rhs) {
@@ -90,8 +93,7 @@ struct GenericParamKey {
 
   /// Find the index that this key would have into an array of
   /// generic type parameters
-  unsigned findIndexIn(
-             llvm::ArrayRef<GenericTypeParamType *> genericParams) const;
+  unsigned findIndexIn(ArrayRef<GenericTypeParamType *> genericParams) const;
 };
 
 } // end namespace swift
@@ -101,18 +103,21 @@ namespace llvm {
 template<>
 struct DenseMapInfo<swift::GenericParamKey> {
   static inline swift::GenericParamKey getEmptyKey() {
-    return {0xFFFF, 0xFFFF};
+    return {true, 0xFFFF, 0xFFFF};
   }
   static inline swift::GenericParamKey getTombstoneKey() {
-    return {0xFFFE, 0xFFFE};
+    return {true, 0xFFFE, 0xFFFE};
   }
 
   static inline unsigned getHashValue(swift::GenericParamKey k) {
-    return DenseMapInfo<unsigned>::getHashValue(k.Depth << 16 | k.Index);
+    return DenseMapInfo<unsigned>::getHashValue(
+        k.Depth << 16 | k.Index | ((k.ParameterPack ? 1 : 0) << 30));
   }
   static bool isEqual(swift::GenericParamKey a,
                       swift::GenericParamKey b) {
-    return a.Depth == b.Depth && a.Index == b.Index;
+    return a.ParameterPack == b.ParameterPack &&
+           a.Depth == b.Depth &&
+           a.Index == b.Index;
   }
 };
   

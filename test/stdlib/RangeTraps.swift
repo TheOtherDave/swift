@@ -13,9 +13,12 @@
 // RUN: %target-build-swift %s -o %t/a.out_Debug -Onone
 // RUN: %target-build-swift %s -o %t/a.out_Release -O
 //
+// RUN: %target-codesign %t/a.out_Debug
+// RUN: %target-codesign %t/a.out_Release
 // RUN: %target-run %t/a.out_Debug
 // RUN: %target-run %t/a.out_Release
 // REQUIRES: executable_test
+// UNSUPPORTED: OS=wasi
 
 
 import StdlibUnittest
@@ -72,7 +75,76 @@ RangeTraps.test("CountablePartialRangeFrom")
     _ = it.next()
 }
 
+RangeTraps.test("nanLowerBound")
+  .code {
+  expectCrashLater()
+  _ = Double.nan ... 0
+}
 
+RangeTraps.test("nanUpperBound")
+  .code {
+  expectCrashLater()
+  _ = 0 ... Double.nan
+}
+
+RangeTraps.test("nanLowerBoundPartial")
+  .code {
+  expectCrashLater()
+  _ = Double.nan ..< 0
+}
+
+RangeTraps.test("nanUpperBoundPartial")
+  .code {
+  expectCrashLater()
+  _ = 0 ..< Double.nan
+}
+
+RangeTraps.test("fromNaN")
+  .code {
+  expectCrashLater()
+  _ = Double.nan...
+}
+
+RangeTraps.test("toNaN")
+  .code {
+  expectCrashLater()
+  _ = ..<Double.nan
+}
+
+RangeTraps.test("throughNaN")
+  .code {
+  expectCrashLater()
+  _ = ...Double.nan
+}
+
+if #available(SwiftStdlib 5.6, *) {
+  RangeTraps.test("UIntOverflow")
+    .code {
+    expectCrashLater()
+    _blackHole((0 ..< UInt.max).count)
+  }
+}
+
+if #available(SwiftStdlib 5.5, *) {
+  // Debug check was introduced in https://github.com/apple/swift/pull/34961
+  RangeTraps.test("UncheckedHalfOpen")
+  .xfail(.custom(
+      { !_isStdlibDebugChecksEnabled() },
+      reason: "assertions are disabled in Release and Unchecked mode"))
+  .code {
+    expectCrashLater()
+    var range = Range(uncheckedBounds: (lower: 1, upper: 0))
+  }
+
+  RangeTraps.test("UncheckedClosed")
+  .xfail(.custom(
+      { !_isStdlibDebugChecksEnabled() },
+      reason: "assertions are disabled in Release and Unchecked mode"))
+  .code {
+    expectCrashLater()
+    var range = ClosedRange(uncheckedBounds: (lower: 1, upper: 0))
+  }
+}
 
 runAllTests()
 

@@ -1,5 +1,5 @@
 // Fixed-layout struct
-@_fixed_layout public struct Point {
+@frozen public struct Point {
   public var x: Int // read-write stored property
   public let y: Int // read-only stored property
 
@@ -27,7 +27,7 @@ public struct Size {
 }
 
 // Fixed-layout struct with resilient members
-@_fixed_layout public struct Rectangle {
+@frozen public struct Rectangle {
   public let p: Point
   public let s: Size
   public let color: Int
@@ -64,7 +64,7 @@ public struct ResilientDouble {
   }
 }
 
-@_fixed_layout public struct ResilientLayoutRuntimeTest {
+@frozen public struct ResilientLayoutRuntimeTest {
   public let b1: ResilientBool
   public let i: ResilientInt
   public let b2: ResilientBool
@@ -77,3 +77,47 @@ public struct ResilientDouble {
     self.d = d
   }
 }
+
+public class Referent {
+  public init() {}
+}
+
+public struct ResilientWeakRef {
+  public weak var ref: Referent?
+
+  public init (_ r: Referent) {
+    ref = r
+  }
+}
+
+public struct ResilientRef {
+  public var r: Referent
+
+  public init(r: Referent) { self.r = r }
+}
+
+public struct ResilientWithInternalField {
+  var x: Int
+}
+
+// Tuple parameters with resilient structs
+public class Subject {}
+
+public struct Container {
+  public var s: Subject
+}
+
+public struct PairContainer {
+  public var pair : (Container, Container)
+}
+
+@available(*, unavailable)
+public struct UnavailableResilientInt {
+  public let i: Int
+
+  public init(i: Int) {
+    self.i = i
+  }
+}
+
+public struct ResilientEmptyStruct {}

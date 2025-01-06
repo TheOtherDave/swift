@@ -3,8 +3,6 @@
 // Make sure we can code complete at EOF.
 // Don't add any tests at the end of the file!
 //
-// A: Begin completions
-// A-DAG: Pattern/ExprSpecific:               ['(']{#(x): Int#})[#Void#]{{; name=.+$}}
-// A: End completions
+// A-DAG: Decl[FreeFunction]/CurrModule/Flair[ArgLabels]: ['(']{#(x): Int#}[')'][#Void#]{{; name=.+$}}
 func f(_ x: Int) {}
 f(#^A^#

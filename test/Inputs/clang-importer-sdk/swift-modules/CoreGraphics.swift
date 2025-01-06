@@ -5,11 +5,14 @@ public func == (lhs: CGPoint, rhs: CGPoint) -> Bool {
   return lhs.x == rhs.x  &&  lhs.y == rhs.y
 }
 
+#if !CGFLOAT_IN_COREFOUNDATION
 public struct CGFloat {
-#if arch(i386) || arch(arm)
+#if _pointerBitWidth(_32)
   public typealias UnderlyingType = Float
-#elseif arch(x86_64) || arch(arm64)
+#elseif _pointerBitWidth(_64)
   public typealias UnderlyingType = Double
+#else
+#error("Unknown platform")
 #endif
 
   public init() { 
@@ -49,4 +52,11 @@ public extension Double {
   init(_ value: CGFloat) {
     self = Double(value.value)
   }
+}
+#endif
+
+import CoreFoundation
+
+extension CGFloat: CustomStringConvertible {
+  public var description: String { "" }
 }

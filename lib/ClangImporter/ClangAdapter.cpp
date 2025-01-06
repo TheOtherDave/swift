@@ -31,10 +31,10 @@ using namespace importer;
 
 /// Get a bit vector indicating which arguments are non-null for a
 /// given function or method.
-llvm::SmallBitVector
+SmallBitVector
 importer::getNonNullArgs(const clang::Decl *decl,
                          ArrayRef<const clang::ParmVarDecl *> params) {
-  llvm::SmallBitVector result;
+  SmallBitVector result;
   if (!decl)
     return result;
 
@@ -53,7 +53,8 @@ importer::getNonNullArgs(const clang::Decl *decl,
     if (result.empty())
       result.resize(params.size(), false);
 
-    for (unsigned idx : nonnull->args()) {
+    for (auto paramIdx : nonnull->args()) {
+      unsigned idx = paramIdx.getASTIndex();
       if (idx < result.size())
         result.set(idx);
     }
@@ -62,7 +63,7 @@ importer::getNonNullArgs(const clang::Decl *decl,
   return result;
 }
 
-Optional<const clang::Decl *>
+std::optional<const clang::Decl *>
 importer::getDefinitionForClangTypeDecl(const clang::Decl *D) {
   if (auto OID = dyn_cast<clang::ObjCInterfaceDecl>(D))
     return OID->getDefinition();
@@ -73,10 +74,36 @@ importer::getDefinitionForClangTypeDecl(const clang::Decl *D) {
   if (auto OPD = dyn_cast<clang::ObjCProtocolDecl>(D))
     return OPD->getDefinition();
 
-  return None;
+  return std::nullopt;
 }
 
-Optional<clang::Module *>
+static bool isInLocalScope(const clang::Decl *D) {
+  const clang::DeclContext *LDC = D->getLexicalDeclContext();
+  while (true) {
+    if (LDC->isFunctionOrMethod())
+      return true;
+    if (!isa<clang::TagDecl>(LDC))
+      return false;
+    if (const auto *CRD = dyn_cast<clang::CXXRecordDecl>(LDC))
+      if (CRD->isLambda())
+        return true;
+    LDC = LDC->getLexicalParent();
+  }
+  return false;
+}
+
+const clang::Decl *
+importer::getFirstNonLocalDecl(const clang::Decl *D) {
+  D = D->getCanonicalDecl();
+  auto iter = llvm::find_if(D->redecls(), [](const clang::Decl *next) -> bool {
+    return !isInLocalScope(next);
+  });
+  if (iter == D->redecls_end())
+    return nullptr;
+  return *iter;
+}
+
+std::optional<clang::Module *>
 importer::getClangSubmoduleForDecl(const clang::Decl *D,
                                    bool allowForwardDeclaration) {
   const clang::Decl *actual = nullptr;
@@ -84,13 +111,13 @@ importer::getClangSubmoduleForDecl(const clang::Decl *D,
   // Put an Objective-C class into the module that contains the @interface
   // definition, not just some @class forward declaration.
   if (auto maybeDefinition = getDefinitionForClangTypeDecl(D)) {
-    actual = maybeDefinition.getValue();
+    actual = maybeDefinition.value();
     if (!actual && !allowForwardDeclaration)
-      return None;
+      return std::nullopt;
   }
 
   if (!actual)
-    actual = D->getCanonicalDecl();
+    actual = getFirstNonLocalDecl(D);
 
   return actual->getImportedOwningModule();
 }
@@ -177,7 +204,7 @@ OmissionTypeName importer::getClangTypeNameForOmission(clang::ASTContext &ctx,
       if (isCollectionName(name)) {
         if (auto ptrType = type->getAs<clang::PointerType>()) {
           return OmissionTypeName(
-              name, None,
+              name, std::nullopt,
               getClangTypeNameForOmission(ctx, ptrType->getPointeeType()).Name);
         }
       }
@@ -191,7 +218,7 @@ OmissionTypeName importer::getClangTypeNameForOmission(clang::ASTContext &ctx,
     // For array types, convert the element type and treat this an as array.
     if (auto arrayType = dyn_cast<clang::ArrayType>(typePtr)) {
       return OmissionTypeName(
-          "Array", None,
+          "Array", std::nullopt,
           getClangTypeNameForOmission(ctx, arrayType->getElementType()).Name);
     }
 
@@ -237,17 +264,18 @@ OmissionTypeName importer::getClangTypeNameForOmission(clang::ASTContext &ctx,
         unsigned lastWordSize = camel_case::getLastWord(className).size();
         StringRef elementName =
             className.substr(0, className.size() - lastWordSize);
-        return OmissionTypeName(className, None, elementName);
+        return OmissionTypeName(className, std::nullopt, elementName);
       }
 
       // If we don't have type arguments, the collection element type
       // is "Object".
       auto typeArgs = objcObjectPtr->getTypeArgs();
       if (typeArgs.empty())
-        return OmissionTypeName(className, None, "Object");
+        return OmissionTypeName(className, std::nullopt, "Object");
 
       return OmissionTypeName(
-          className, None, getClangTypeNameForOmission(ctx, typeArgs[0]).Name);
+          className, std::nullopt,
+          getClangTypeNameForOmission(ctx, typeArgs[0]).Name);
     }
 
     // Objective-C "id" type.
@@ -298,6 +326,9 @@ OmissionTypeName importer::getClangTypeNameForOmission(clang::ASTContext &ctx,
     case clang::BuiltinType::Double:
       return "Double";
 
+    case clang::BuiltinType::Char8:
+      return "UInt8";
+
     case clang::BuiltinType::Char16:
       return "UInt16";
 
@@ -329,16 +360,45 @@ OmissionTypeName importer::getClangTypeNameForOmission(clang::ASTContext &ctx,
     case clang::BuiltinType::ARCUnbridgedCast:
     case clang::BuiltinType::BoundMember:
     case clang::BuiltinType::BuiltinFn:
+    case clang::BuiltinType::IncompleteMatrixIdx:
     case clang::BuiltinType::Overload:
     case clang::BuiltinType::PseudoObject:
     case clang::BuiltinType::UnknownAny:
+    case clang::BuiltinType::UnresolvedTemplate:
       return OmissionTypeName();
 
     // FIXME: Types that can be mapped, but aren't yet.
+    case clang::BuiltinType::ShortAccum:
+    case clang::BuiltinType::Accum:
+    case clang::BuiltinType::LongAccum:
+    case clang::BuiltinType::UShortAccum:
+    case clang::BuiltinType::UAccum:
+    case clang::BuiltinType::ULongAccum:
+    case clang::BuiltinType::ShortFract:
+    case clang::BuiltinType::Fract:
+    case clang::BuiltinType::LongFract:
+    case clang::BuiltinType::UShortFract:
+    case clang::BuiltinType::UFract:
+    case clang::BuiltinType::ULongFract:
+    case clang::BuiltinType::SatShortAccum:
+    case clang::BuiltinType::SatAccum:
+    case clang::BuiltinType::SatLongAccum:
+    case clang::BuiltinType::SatUShortAccum:
+    case clang::BuiltinType::SatUAccum:
+    case clang::BuiltinType::SatULongAccum:
+    case clang::BuiltinType::SatShortFract:
+    case clang::BuiltinType::SatFract:
+    case clang::BuiltinType::SatLongFract:
+    case clang::BuiltinType::SatUShortFract:
+    case clang::BuiltinType::SatUFract:
+    case clang::BuiltinType::SatULongFract:
     case clang::BuiltinType::Half:
     case clang::BuiltinType::LongDouble:
+    case clang::BuiltinType::BFloat16:
+    case clang::BuiltinType::Float16:
     case clang::BuiltinType::Float128:
     case clang::BuiltinType::NullPtr:
+    case clang::BuiltinType::Ibm128:
       return OmissionTypeName();
 
     // Objective-C types that aren't mapped directly; rather, pointers to
@@ -348,52 +408,47 @@ OmissionTypeName importer::getClangTypeNameForOmission(clang::ASTContext &ctx,
     case clang::BuiltinType::ObjCSel:
       return OmissionTypeName();
 
-    // OpenCL types that don't have Swift equivalents.
-    case clang::BuiltinType::OCLImage1dRO:
-    case clang::BuiltinType::OCLImage1dRW:
-    case clang::BuiltinType::OCLImage1dWO:
-    case clang::BuiltinType::OCLImage1dArrayRO:
-    case clang::BuiltinType::OCLImage1dArrayRW:
-    case clang::BuiltinType::OCLImage1dArrayWO:
-    case clang::BuiltinType::OCLImage1dBufferRO:
-    case clang::BuiltinType::OCLImage1dBufferRW:
-    case clang::BuiltinType::OCLImage1dBufferWO:
-    case clang::BuiltinType::OCLImage2dRO:
-    case clang::BuiltinType::OCLImage2dRW:
-    case clang::BuiltinType::OCLImage2dWO:
-    case clang::BuiltinType::OCLImage2dArrayRO:
-    case clang::BuiltinType::OCLImage2dArrayRW:
-    case clang::BuiltinType::OCLImage2dArrayWO:
-    case clang::BuiltinType::OCLImage2dDepthRO:
-    case clang::BuiltinType::OCLImage2dDepthRW:
-    case clang::BuiltinType::OCLImage2dDepthWO:
-    case clang::BuiltinType::OCLImage2dArrayDepthRO:
-    case clang::BuiltinType::OCLImage2dArrayDepthRW:
-    case clang::BuiltinType::OCLImage2dArrayDepthWO:
-    case clang::BuiltinType::OCLImage2dMSAARO:
-    case clang::BuiltinType::OCLImage2dMSAARW:
-    case clang::BuiltinType::OCLImage2dMSAAWO:
-    case clang::BuiltinType::OCLImage2dArrayMSAARO:
-    case clang::BuiltinType::OCLImage2dArrayMSAARW:
-    case clang::BuiltinType::OCLImage2dArrayMSAAWO:
-    case clang::BuiltinType::OCLImage2dMSAADepthRO:
-    case clang::BuiltinType::OCLImage2dMSAADepthRW:
-    case clang::BuiltinType::OCLImage2dMSAADepthWO:
-    case clang::BuiltinType::OCLImage2dArrayMSAADepthRO:
-    case clang::BuiltinType::OCLImage2dArrayMSAADepthRW:
-    case clang::BuiltinType::OCLImage2dArrayMSAADepthWO:
-    case clang::BuiltinType::OCLImage3dRO:
-    case clang::BuiltinType::OCLImage3dRW:
-    case clang::BuiltinType::OCLImage3dWO:
-    case clang::BuiltinType::OCLSampler:
-    case clang::BuiltinType::OCLEvent:
-    case clang::BuiltinType::OCLClkEvent:
-    case clang::BuiltinType::OCLQueue:
-    case clang::BuiltinType::OCLReserveID:
+    // OpenMP types that don't have Swift equivalents.
+    case clang::BuiltinType::ArraySection:
+    case clang::BuiltinType::OMPArrayShaping:
+    case clang::BuiltinType::OMPIterator:
       return OmissionTypeName();
 
-    // OpenMP types that don't have Swift equivalents.
-    case clang::BuiltinType::OMPArraySection:
+    // OpenCL builtin types that don't have Swift equivalents.
+    case clang::BuiltinType::OCLClkEvent:
+    case clang::BuiltinType::OCLEvent:
+    case clang::BuiltinType::OCLSampler:
+    case clang::BuiltinType::OCLQueue:
+    case clang::BuiltinType::OCLReserveID:
+#define IMAGE_TYPE(Name, Id, ...) case clang::BuiltinType::Id:
+#include "clang/Basic/OpenCLImageTypes.def"
+#define EXT_OPAQUE_TYPE(Name, Id, ...) case clang::BuiltinType::Id:
+#include "clang/Basic/OpenCLExtensionTypes.def"
+      return OmissionTypeName();
+
+    // ARM SVE builtin types that don't have Swift equivalents.
+#define SVE_TYPE(Name, Id, ...) case clang::BuiltinType::Id:
+#include "clang/Basic/AArch64SVEACLETypes.def"
+      return OmissionTypeName();
+
+    // PPC MMA builtin types that don't have Swift equivalents.
+#define PPC_VECTOR_TYPE(Name, Id, ...) case clang::BuiltinType::Id:
+#include "clang/Basic/PPCTypes.def"
+      return OmissionTypeName();
+
+    // RISC-V V builtin types that don't have Swift equivalents.
+#define RVV_TYPE(Name, Id, ...) case clang::BuiltinType::Id:
+#include "clang/Basic/RISCVVTypes.def"
+      return OmissionTypeName();
+
+    // WASM builtin types that don't have Swift equivalents.
+#define WASM_TYPE(Name, Id, ...) case clang::BuiltinType::Id:
+#include "clang/Basic/WebAssemblyReferenceTypes.def"
+      return OmissionTypeName();
+
+    // AMDGPU builtins that don't have Swift equivalents.
+#define AMDGPU_TYPE(Name, Id, ...) case clang::BuiltinType::Id:
+#include "clang/Basic/AMDGPUTypes.def"
       return OmissionTypeName();
     }
   }
@@ -417,10 +472,10 @@ OmissionTypeName importer::getClangTypeNameForOmission(clang::ASTContext &ctx,
   return StringRef();
 }
 
-static clang::SwiftNewtypeAttr *
+static clang::SwiftNewTypeAttr *
 retrieveNewTypeAttr(const clang::TypedefNameDecl *decl) {
   // Retrieve the attribute.
-  auto attr = decl->getAttr<clang::SwiftNewtypeAttr>();
+  auto attr = decl->getAttr<clang::SwiftNewTypeAttr>();
   if (!attr)
     return nullptr;
 
@@ -433,7 +488,7 @@ retrieveNewTypeAttr(const clang::TypedefNameDecl *decl) {
   return attr;
 }
 
-clang::SwiftNewtypeAttr *
+clang::SwiftNewTypeAttr *
 importer::getSwiftNewtypeAttr(const clang::TypedefNameDecl *decl,
                               ImportNameVersion version) {
   // Newtype was introduced in Swift 3
@@ -467,7 +522,9 @@ clang::TypedefNameDecl *importer::findSwiftNewtype(const clang::NamedDecl *decl,
     clang::LookupResult lookupResult(clangSema, notificationName,
                                      clang::SourceLocation(),
                                      clang::Sema::LookupOrdinaryName);
-    if (!clangSema.LookupName(lookupResult, nullptr))
+    if (!clangSema.LookupQualifiedName(
+            lookupResult,
+            /*LookupCtx*/ clangSema.getASTContext().getTranslationUnitDecl()))
       return nullptr;
     auto nsDecl = lookupResult.getAsSingle<clang::TypedefNameDecl>();
     if (!nsDecl)
@@ -493,6 +550,13 @@ bool importer::isNSString(const clang::Type *type) {
 
 bool importer::isNSString(clang::QualType qt) {
   return qt.getTypePtrOrNull() && isNSString(qt.getTypePtrOrNull());
+}
+
+bool importer::isNSNotificationName(clang::QualType type) {
+  if (auto *typealias = type->getAs<clang::TypedefType>()) {
+    return typealias->getDecl()->getName() == "NSNotificationName";
+  }
+  return false;
 }
 
 bool importer::isNSNotificationGlobal(const clang::NamedDecl *decl) {
@@ -522,44 +586,26 @@ bool importer::isNSNotificationGlobal(const clang::NamedDecl *decl) {
 }
 
 bool importer::hasNativeSwiftDecl(const clang::Decl *decl) {
-  for (auto annotation : decl->specific_attrs<clang::AnnotateAttr>()) {
-    if (annotation->getAnnotation() == SWIFT_NATIVE_ANNOTATION_STRING) {
+  if (auto *attr = decl->getAttr<clang::ExternalSourceSymbolAttr>())
+    if (attr->getGeneratedDeclaration() && attr->getLanguage() == "Swift")
       return true;
-    }
-  }
-
-  if (auto *category = dyn_cast<clang::ObjCCategoryDecl>(decl)) {
-    clang::SourceLocation categoryNameLoc = category->getCategoryNameLoc();
-    if (categoryNameLoc.isMacroID()) {
-      // Climb up to the top-most macro invocation.
-      clang::ASTContext &clangCtx = category->getASTContext();
-      clang::SourceManager &SM = clangCtx.getSourceManager();
-
-      clang::SourceLocation macroCaller =
-          SM.getImmediateMacroCallerLoc(categoryNameLoc);
-      while (macroCaller.isMacroID()) {
-        categoryNameLoc = macroCaller;
-        macroCaller = SM.getImmediateMacroCallerLoc(categoryNameLoc);
-      }
-
-      StringRef macroName = clang::Lexer::getImmediateMacroName(
-          categoryNameLoc, SM, clangCtx.getLangOpts());
-      if (macroName == "SWIFT_EXTENSION")
-        return true;
-    }
-  }
-
   return false;
 }
 
 /// Translate the "nullability" notion from API notes into an optional type
 /// kind.
-OptionalTypeKind importer::translateNullability(clang::NullabilityKind kind) {
+OptionalTypeKind importer::translateNullability(
+    clang::NullabilityKind kind, bool stripNonResultOptionality) {
+  if (stripNonResultOptionality &&
+      kind != clang::NullabilityKind::NullableResult)
+    return OptionalTypeKind::OTK_None;
+
   switch (kind) {
   case clang::NullabilityKind::NonNull:
     return OptionalTypeKind::OTK_None;
 
   case clang::NullabilityKind::Nullable:
+  case clang::NullabilityKind::NullableResult:
     return OptionalTypeKind::OTK_Optional;
 
   case clang::NullabilityKind::Unspecified:
@@ -567,29 +613,7 @@ OptionalTypeKind importer::translateNullability(clang::NullabilityKind kind) {
   }
 
   llvm_unreachable("Invalid NullabilityKind.");
-}
-
-bool importer::hasDesignatedInitializers(
-    const clang::ObjCInterfaceDecl *classDecl) {
-  if (classDecl->hasDesignatedInitializers())
-    return true;
-
-  return false;
-}
-
-bool importer::isDesignatedInitializer(
-    const clang::ObjCInterfaceDecl *classDecl,
-    const clang::ObjCMethodDecl *method) {
-  // If the information is on the AST, use it.
-  if (classDecl->hasDesignatedInitializers()) {
-    auto *methodParent = method->getClassInterface();
-    if (!methodParent ||
-        methodParent->getCanonicalDecl() == classDecl->getCanonicalDecl()) {
-      return method->hasAttr<clang::ObjCDesignatedInitializerAttr>();
-    }
-  }
-
-  return false;
+  return OptionalTypeKind::OTK_Optional;
 }
 
 bool importer::isRequiredInitializer(const clang::ObjCMethodDecl *method) {
@@ -630,7 +654,7 @@ importer::shouldImportPropertyAsAccessors(const clang::ObjCPropertyDecl *prop) {
   // These appear as both properties and methods in ObjC and should be
   // imported as methods into Swift, as a sort of least-common-denominator
   // compromise.
-  if (!prop->getName().startswith("accessibility"))
+  if (!prop->getName().starts_with("accessibility"))
     return false;
   if (isAccessibilityConformingContext(prop->getDeclContext()))
     return true;
@@ -664,7 +688,8 @@ bool importer::isObjCId(const clang::Decl *decl) {
 }
 
 bool importer::isUnavailableInSwift(
-    const clang::Decl *decl, const PlatformAvailability &platformAvailability,
+    const clang::Decl *decl,
+    const PlatformAvailability *platformAvailability,
     bool enableObjCInterop) {
   // 'id' is always unavailable in Swift.
   if (enableObjCInterop && isObjCId(decl))
@@ -677,33 +702,32 @@ bool importer::isUnavailableInSwift(
     if (attr->getPlatform()->getName() == "swift")
       return true;
 
-    if (platformAvailability.filter &&
-        !platformAvailability.filter(attr->getPlatform()->getName())) {
+    if (!platformAvailability)
+      continue;
+
+    if (!platformAvailability->isPlatformRelevant(
+            attr->getPlatform()->getName())) {
       continue;
     }
 
-    if (platformAvailability.deprecatedAsUnavailableFilter) {
-      clang::VersionTuple version = attr->getDeprecated();
-      if (version.empty())
-        continue;
-      if (platformAvailability.deprecatedAsUnavailableFilter(
-            version.getMajor(), version.getMinor())) {
-        return true;
-      }
+
+    llvm::VersionTuple version = attr->getDeprecated();
+    if (version.empty())
+      continue;
+    if (platformAvailability->treatDeprecatedAsUnavailable(
+            decl, version, /*isAsync=*/false)) {
+      return true;
     }
   }
 
   return false;
 }
 
-OptionalTypeKind importer::getParamOptionality(version::Version swiftVersion,
-                                               const clang::ParmVarDecl *param,
+OptionalTypeKind importer::getParamOptionality(const clang::ParmVarDecl *param,
                                                bool knownNonNull) {
-  auto &clangCtx = param->getASTContext();
-
   // If nullability is available on the type, use it.
   clang::QualType paramTy = param->getType();
-  if (auto nullability = paramTy->getNullability(clangCtx)) {
+  if (auto nullability = paramTy->getNullability()) {
     return translateNullability(*nullability);
   }
 
@@ -712,11 +736,10 @@ OptionalTypeKind importer::getParamOptionality(version::Version swiftVersion,
     return OTK_None;
 
   // Check for the 'static' annotation on C arrays.
-  if (!swiftVersion.isVersion3())
-    if (const auto *DT = dyn_cast<clang::DecayedType>(paramTy))
-      if (const auto *AT = DT->getOriginalType()->getAsArrayTypeUnsafe())
-        if (AT->getSizeModifier() == clang::ArrayType::Static)
-          return OTK_None;
+  if (const auto *DT = dyn_cast<clang::DecayedType>(paramTy))
+    if (const auto *AT = DT->getOriginalType()->getAsArrayTypeUnsafe())
+      if (AT->getSizeModifier() == clang::ArraySizeModifier::Static)
+        return OTK_None;
 
   // Default to implicitly unwrapped optionals.
   return OTK_ImplicitlyUnwrappedOptional;

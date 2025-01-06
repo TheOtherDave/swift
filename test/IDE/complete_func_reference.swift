@@ -68,11 +68,9 @@ do {
   func take(_: @escaping ()->()) {}
   take(#^VOID_VOID_0^#)
 }
-// VOID_VOID: Begin completions
-// VOID_VOID-DAG: Decl{{.*}}/TypeRelation[Identical]: voidToVoid;
-// VOID_VOID-DAG: Decl{{.*}}/TypeRelation[Convertible]: anyToVoid(a:);
-// VOID_VOID-DAG: Decl{{.*}}/NotRecommended/TypeRelation[Invalid]: intToVoid({#a: Int#})[#Void#];
-// VOID_VOID-DAT: Decl{{.*}}/NotRecommended/TypeRelation[Invalid]: anyToVoid({#a: Any#})[#Void#];
+// VOID_VOID-DAG: Decl{{.*}}/TypeRelation[Convertible]: voidToVoid[#() -> ()#];
+// VOID_VOID-DAG: Decl{{.*}}/TypeRelation[Invalid]: anyToVoid({#a: Any#})[#Void#];
+// VOID_VOID-DAG: Decl{{.*}}/TypeRelation[Invalid]: intToVoid({#a: Int#})[#Void#];
 // VOID_VOID-DAG: Decl{{.*}}:      anyToAny({#a: Any#})[#Any#];
 // VOID_VOID-DAG: Decl{{.*}}:      intToAny({#a: Int#})[#Any#];
 // VOID_VOID-DAG: Decl{{.*}}:      voidToInt()[#Int#];
@@ -80,7 +78,6 @@ do {
 // VOID_VOID-DAG: Decl{{.*}}:      intToInt({#a: Int#})[#Int#];
 // VOID_VOID-DAG: Decl{{.*}}:      voidToAny()[#Any#];
 // VOID_VOID-DAG: Decl{{.*}}:      returnsIntToInt()[#(Int) -> Int#];
-// VOID_VOID: End completions
 
 do {
   func take(_: Int, _: Int, c: @escaping ()->()) {}
@@ -121,61 +118,53 @@ do {
   take = S0().#^ANY_INT_4^#
 }
 
-// ANY_INT: Begin completions
-// ANY_INT-DAG: Decl{{.*}}/TypeRelation[Convertible]: anyToInt(a:);
-// ANY_INT-DAG: Decl{{.*}}/NotRecommended/TypeRelation[Invalid]: intToVoid({#a: Int#})[#Void#];
-// ANY_INT-DAG: Decl{{.*}}/NotRecommended/TypeRelation[Invalid]: anyToVoid({#a: Any#})[#Void#];
-// ANY_INT-DAG: Decl{{.*}}/NotRecommended/TypeRelation[Invalid]: voidToVoid()[#Void#];
+// ANY_INT-DAG: Decl{{.*}}/TypeRelation[Convertible]: anyToInt(a:)[#(Any) -> Int#]; name=anyToInt(a:)
+// ANY_INT-DAG: Decl{{.*}}/TypeRelation[Invalid]: intToVoid({#a: Int#})[#Void#];
+// ANY_INT-DAG: Decl{{.*}}/TypeRelation[Invalid]: anyToVoid({#a: Any#})[#Void#];
+// ANY_INT-DAG: Decl{{.*}}/TypeRelation[Invalid]: voidToVoid()[#Void#];
 // ANY_INT-DAG: Decl{{.*}}:      voidToAny()[#Any#];
 // ANY_INT-DAG: Decl{{.*}}:      intToInt({#a: Int#})[#Int#];
 // ANY_INT-DAG: Decl{{.*}}:      intToAny({#a: Int#})[#Any#];
 // ANY_INT-DAG: Decl{{.*}}:      anyToAny({#a: Any#})[#Any#];
 // ANY_INT-DAG: Decl{{.*}}:      voidToInt()[#Int#];
 // ANY_INT-DAG: Decl{{.*}}:      returnsIntToInt()[#(Int) -> Int#];
-// ANY_INT: End completions
 
-// ANY_INT_STATIC_CURRY: Begin completions
-// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Convertible]: anyToInt({#self: S0#})[#(a: Any) -> Int#];
-// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/NotRecommended/TypeRelation[Invalid]: voidToVoid({#self: S0#})[#() -> Void#];
-// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/NotRecommended/TypeRelation[Invalid]: intToVoid({#self: S0#})[#(a: Int) -> Void#];
-// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/NotRecommended/TypeRelation[Invalid]: anyToVoid({#self: S0#})[#(a: Any) -> Void#];
-// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal:   voidToInt({#self: S0#})[#() -> Int#];
-// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal:   intToInt({#self: S0#})[#(a: Int) -> Int#];
-// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal:   voidToAny({#self: S0#})[#() -> Any#];
-// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal:   anyToAny({#self: S0#})[#(a: Any) -> Any#];
-// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal:   intToAny({#self: S0#})[#(a: Int) -> Any#];
-// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal:   returnsIntToInt({#self: S0#})[#() -> (Int) -> Int#];
-// ANY_INT_STATIC_CURRY: End completions
+// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Convertible]: anyToInt({#(self): S0#})[#(a: Any) -> Int#];
+// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: voidToVoid({#(self): S0#})[#() -> Void#];
+// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: intToVoid({#(self): S0#})[#(a: Int) -> Void#];
+// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: anyToVoid({#(self): S0#})[#(a: Any) -> Void#];
+// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal:   voidToInt({#(self): S0#})[#() -> Int#];
+// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal:   intToInt({#(self): S0#})[#(a: Int) -> Int#];
+// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal:   voidToAny({#(self): S0#})[#() -> Any#];
+// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal:   anyToAny({#(self): S0#})[#(a: Any) -> Any#];
+// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal:   intToAny({#(self): S0#})[#(a: Int) -> Any#];
+// ANY_INT_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal:   returnsIntToInt({#(self): S0#})[#() -> (Int) -> Int#];
 
 do {
   func take(_: @escaping (Int)->Any) {}
   take(#^INT_ANY_0^#)
 }
 
-// INT_ANY: Begin completions
-// INT_ANY-DAG: Decl{{.*}}/TypeRelation[Convertible]: intToAny(a:);
-// INT_ANY-DAG: Decl{{.*}}/TypeRelation[Convertible]: intToInt(a:);
-// INT_ANY-DAG: Decl{{.*}}/TypeRelation[Convertible]: intToVoid(a:);
-// INT_ANY-DAG: Decl{{.*}}/TypeRelation[Convertible]: anyToAny(a:);
-// INT_ANY-DAG: Decl{{.*}}/TypeRelation[Convertible]: anyToInt(a:);
-// INT_ANY-DAG: Decl{{.*}}/TypeRelation[Convertible]: anyToVoid(a:);
+// INT_ANY-DAG: Decl{{.*}}/TypeRelation[Convertible]: intToAny(a:)[#(Int) -> Any#];
+// INT_ANY-DAG: Decl{{.*}}/TypeRelation[Convertible]: intToInt(a:)[#(Int) -> Int#];
+// INT_ANY-DAG: Decl{{.*}}/TypeRelation[Convertible]: intToVoid(a:)[#(Int) -> ()#];
+// INT_ANY-DAG: Decl{{.*}}/TypeRelation[Convertible]: anyToAny(a:)[#(Any) -> Any#];
+// INT_ANY-DAG: Decl{{.*}}/TypeRelation[Convertible]: anyToInt(a:)[#(Any) -> Int#];
+// INT_ANY-DAG: Decl{{.*}}/TypeRelation[Convertible]: anyToVoid(a:)[#(Any) -> ()#];
 // INT_ANY-DAG: Decl{{.*}}/TypeRelation[Convertible]: returnsIntToInt()[#(Int) -> Int#];
-// INT_ANY-DAG: Decl{{.*}}/NotRecommended/TypeRelation[Invalid]: voidToVoid()[#Void#];
+// INT_ANY-DAG: Decl{{.*}}/TypeRelation[Invalid]: voidToVoid()[#Void#];
 // INT_ANY-DAG: Decl{{.*}}:      voidToInt()[#Int#];
 // INT_ANY-DAG: Decl{{.*}}:      voidToAny()[#Any#];
-// INT_ANY: End completions
 
-// INT_ANY_STATIC_CURRY: Begin completions
-// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Convertible]: intToInt({#self: S0#})[#(a: Int) -> Int#];
-// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Convertible]: intToVoid({#self: S0#})[#(a: Int) -> Void#];
-// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Convertible]: anyToAny({#self: S0#})[#(a: Any) -> Any#];
-// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Convertible]: anyToVoid({#self: S0#})[#(a: Any) -> Void#];
-// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Convertible]: intToAny({#self: S0#})[#(a: Int) -> Any#];
-// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Convertible]: anyToInt({#self: S0#})[#(a: Any) -> Int#];
-// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Convertible]: returnsIntToInt({#self: S0#})[#() -> (Int) -> Int#];
-// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal:   voidToAny({#self: S0#})[#() -> Any#];
-// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal:   voidToInt({#self: S0#})[#() -> Int#];
-// INT_ANY_STATIC_CURRY: End completions
+// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Convertible]: intToInt({#(self): S0#})[#(a: Int) -> Int#];
+// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Convertible]: intToVoid({#(self): S0#})[#(a: Int) -> Void#];
+// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Convertible]: anyToAny({#(self): S0#})[#(a: Any) -> Any#];
+// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Convertible]: anyToVoid({#(self): S0#})[#(a: Any) -> Void#];
+// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Convertible]: intToAny({#(self): S0#})[#(a: Int) -> Any#];
+// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Convertible]: anyToInt({#(self): S0#})[#(a: Any) -> Int#];
+// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal: returnsIntToInt({#(self): S0#})[#() -> (Int) -> Int#];
+// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal:   voidToAny({#(self): S0#})[#() -> Any#];
+// INT_ANY_STATIC_CURRY-DAG: Decl[InstanceMethod]/CurrNominal:   voidToInt({#(self): S0#})[#() -> Int#];
 
 do {
   func take(_: @escaping (Int)->Any) {}
@@ -202,10 +191,10 @@ do {
   func take(_: @escaping ()->(Int)->Int) {}
   take(S0.#^VOID_INT_INT_2^#)
 }
-// VOID_INT_INT-DAG: Decl{{.*}}/TypeRelation[Identical]: returnsIntToInt;
-// VOID_INT_INT-DAG: Decl{{.*}}/NotRecommended/TypeRelation[Invalid]: intToVoid({#a: Int#})[#Void#];
-// VOID_INT_INT-DAG: Decl{{.*}}/NotRecommended/TypeRelation[Invalid]: anyToVoid({#a: Any#})[#Void#];
-// VOID_INT_INT-DAG: Decl{{.*}}/NotRecommended/TypeRelation[Invalid]: voidToVoid()[#Void#];
+// VOID_INT_INT-DAG: Decl{{.*}}/TypeRelation[Convertible]: returnsIntToInt[#() -> (Int) -> Int#];
+// VOID_INT_INT-DAG: Decl{{.*}}/TypeRelation[Invalid]: intToVoid({#a: Int#})[#Void#];
+// VOID_INT_INT-DAG: Decl{{.*}}/TypeRelation[Invalid]: anyToVoid({#a: Any#})[#Void#];
+// VOID_INT_INT-DAG: Decl{{.*}}/TypeRelation[Invalid]: voidToVoid()[#Void#];
 // VOID_INT_INT-DAG: Decl{{.*}}:      voidToAny()[#Any#];
 // VOID_INT_INT-DAG: Decl{{.*}}:      intToAny({#a: Int#})[#Any#];
 // VOID_INT_INT-DAG: Decl{{.*}}:      anyToAny({#a: Any#})[#Any#];

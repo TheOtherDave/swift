@@ -41,65 +41,53 @@ extension Double: P1 where B.AT2: P2, C: P3, B.AT2.AT2.AT3: P3 {
 
 // witness method for Double.normal
 
-// CHECK-LABEL: define linkonce_odr hidden swiftcc void @_T034conditional_conformance_with_assoc6DoubleVyxq_GAA2P1A2A2P3R_AA2P23AT2RpzAafH_AhaGP3AT3RPzrlAaEP6normalyyFTW(%T34conditional_conformance_with_assoc6DoubleV* noalias nocapture swiftself, %swift.type* %Self, i8** %SelfWitnessTable) #0 {
+// CHECK-LABEL: define linkonce_odr hidden swiftcc void @"$s34conditional_conformance_with_assoc6DoubleVyxq_GAA2P1A2A2P3R_AA2P23AT2RpzAafH_AhaGP3AT3RPzrlAaEP6normalyyFTW"(ptr noalias nocapture swiftself %0, ptr %Self, ptr %SelfWitnessTable)
 // CHECK-NEXT:  entry:
-// CHECK-NEXT:    [[C_P3_PTR:%.*]] = getelementptr inbounds i8*, i8** %SelfWitnessTable, i32 -1
-// CHECK-NEXT:    [[C_P3:%.*]] = load i8*, i8** [[C_P3_PTR]], align 8
-// CHECK-NEXT:    %"\CF\84_0_1.P3" = bitcast i8* [[C_P3]] to i8**
+// CHECK-NEXT:    [[C_P3_PTR:%.*]] = getelementptr inbounds ptr, ptr %SelfWitnessTable, i32 -1
+// CHECK-NEXT:    [[C_P3:%.*]] = load ptr, ptr [[C_P3_PTR]], align 8
 
-// CHECK-NEXT:    [[B_AT2_P2_PTR:%.*]] = getelementptr inbounds i8*, i8** %SelfWitnessTable, i32 -2
-// CHECK-NEXT:    [[B_AT2_P2:%.*]] = load i8*, i8** [[B_AT2_P2_PTR]], align 8
-// CHECK-NEXT:    %"\CF\84_0_0.AT2.P2" = bitcast i8* [[B_AT2_P2]] to i8**
+// CHECK-NEXT:    [[B_AT2_P2_PTR:%.*]] = getelementptr inbounds ptr, ptr %SelfWitnessTable, i32 -2
+// CHECK-NEXT:    [[B_AT2_P2:%.*]] = load ptr, ptr [[B_AT2_P2_PTR]], align 8
 
-// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3_PTR:%.*]] = getelementptr inbounds i8*, i8** %SelfWitnessTable, i32 -3
-// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3:%.*]] = load i8*, i8** [[B_AT2_AT2_AT3_P3_PTR]], align 8
-// CHECK-NEXT:    %"\CF\84_0_0.AT2.AT2.AT3.P3" = bitcast i8* [[B_AT2_AT2_AT3_P3]] to i8**
+// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3_PTR:%.*]] = getelementptr inbounds ptr, ptr %SelfWitnessTable, i32 -3
+// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3:%.*]] = load ptr, ptr [[B_AT2_AT2_AT3_P3_PTR]], align 8
 
-// CHECK-NEXT:    [[SELF_AS_TYPE_ARRAY:%.*]] = bitcast %swift.type* %Self to %swift.type**
-// CHECK-NEXT:    [[B_PTR:%.*]] = getelementptr inbounds %swift.type*, %swift.type** [[SELF_AS_TYPE_ARRAY]], i64 2
-// CHECK-NEXT:    [[B:%.*]] = load %swift.type*, %swift.type** [[B_PTR]], align 8
+// CHECK-NEXT:    [[B_PTR:%.*]] = getelementptr inbounds ptr, ptr %Self, i64 2
+// CHECK-NEXT:    [[B:%.*]] = load ptr, ptr [[B_PTR]], align 8
 
-// CHECK-NEXT:    [[SELF_AS_TYPE_ARRAY_2:%.*]] = bitcast %swift.type* %Self to %swift.type**
-// CHECK-NEXT:    [[C_PTR:%.*]] = getelementptr inbounds %swift.type*, %swift.type** [[SELF_AS_TYPE_ARRAY_2]], i64 3
-// CHECK-NEXT:    [[C:%.*]] = load %swift.type*, %swift.type** [[C_PTR]], align 8
+// CHECK-NEXT:    [[C_PTR:%.*]] = getelementptr inbounds ptr, ptr %Self, i64 3
+// CHECK-NEXT:    [[C:%.*]] = load ptr, ptr [[C_PTR]], align 8
 
-// CHECK-NEXT:    [[SELF_AS_WT_ARRAY:%.*]] = bitcast %swift.type* %Self to i8***
-// CHECK-NEXT:    [[B_P2_PTR:%.*]] = getelementptr inbounds i8**, i8*** [[SELF_AS_WT_ARRAY]], i64 4
-// CHECK-NEXT:    %"\CF\84_0_0.P2" = load i8**, i8*** [[B_P2_PTR]], align 8
+// CHECK-NEXT:    [[B_P2_PTR:%.*]] = getelementptr inbounds ptr, ptr %Self, i64 4
+// CHECK-NEXT:    %"\CF\84_0_0.P2" = load ptr, ptr [[B_P2_PTR]], align 8
 
-// CHECK-NEXT:    call swiftcc void @_T034conditional_conformance_with_assoc6DoubleVA2A2P3R_AA2P23AT2RpzAadF_AfaEP3AT3RPzrlE6normalyyF(%swift.type* %"\CF\84_0_0", %swift.type* %"\CF\84_0_1", i8** %"\CF\84_0_0.P2", i8** %"\CF\84_0_1.P3", i8** %"\CF\84_0_0.AT2.P2", i8** %"\CF\84_0_0.AT2.AT2.AT3.P3")
+// CHECK-NEXT:    call swiftcc void @"$s34conditional_conformance_with_assoc6DoubleVA2A2P3R_AA2P23AT2RpzAadF_AfaEP3AT3RPzrlE6normalyyF"(ptr %"\CF\84_0_0", ptr %"\CF\84_0_1", ptr %"\CF\84_0_0.P2", ptr [[C_P3]], ptr [[B_AT2_P2]], ptr [[B_AT2_AT2_AT3_P3]])
 // CHECK-NEXT:    ret void
 // CHECK-NEXT:  }
 
 // witness method for Double.generic
 
-// CHECK-LABEL: define linkonce_odr hidden swiftcc void @_T034conditional_conformance_with_assoc6DoubleVyxq_GAA2P1A2A2P3R_AA2P23AT2RpzAafH_AhaGP3AT3RPzrlAaEP7genericyqd__AaFRd__lFTW(%swift.opaque* noalias nocapture, %swift.type* %"\CF\84_1_0", i8** %"\CF\84_1_0.P3", %T34conditional_conformance_with_assoc6DoubleV* noalias nocapture swiftself, %swift.type* %Self, i8** %SelfWitnessTable) #0 {
+// CHECK-LABEL: define linkonce_odr hidden swiftcc void @"$s34conditional_conformance_with_assoc6DoubleVyxq_GAA2P1A2A2P3R_AA2P23AT2RpzAafH_AhaGP3AT3RPzrlAaEP7genericyyqd__AaFRd__lFTW"(ptr noalias %0, ptr %"\CF\84_1_0", ptr %"\CF\84_1_0.P3", ptr noalias nocapture swiftself %1, ptr %Self, ptr %SelfWitnessTable)
 // CHECK-NEXT:  entry:
-// CHECK-NEXT:    [[C_P3_PTR:%.*]] = getelementptr inbounds i8*, i8** %SelfWitnessTable, i32 -1
-// CHECK-NEXT:    [[C_P3:%.*]] = load i8*, i8** [[C_P3_PTR]], align 8
-// CHECK-NEXT:    %"\CF\84_0_1.P3" = bitcast i8* [[C_P3]] to i8**
+// CHECK-NEXT:    [[C_P3_PTR:%.*]] = getelementptr inbounds ptr, ptr %SelfWitnessTable, i32 -1
+// CHECK-NEXT:    [[C_P3:%.*]] = load ptr, ptr [[C_P3_PTR]], align 8
 
-// CHECK-NEXT:    [[B_AT2_P2_PTR:%.*]] = getelementptr inbounds i8*, i8** %SelfWitnessTable, i32 -2
-// CHECK-NEXT:    [[B_AT2_P2:%.*]] = load i8*, i8** [[B_AT2_P2_PTR]], align 8
-// CHECK-NEXT:    %"\CF\84_0_0.AT2.P2" = bitcast i8* [[B_AT2_P2]] to i8**
+// CHECK-NEXT:    [[B_AT2_P2_PTR:%.*]] = getelementptr inbounds ptr, ptr %SelfWitnessTable, i32 -2
+// CHECK-NEXT:    [[B_AT2_P2:%.*]] = load ptr, ptr [[B_AT2_P2_PTR]], align 8
 
-// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3_PTR:%.*]] = getelementptr inbounds i8*, i8** %SelfWitnessTable, i32 -3
-// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3:%.*]] = load i8*, i8** [[B_AT2_AT2_AT3_P3_PTR]], align 8
-// CHECK-NEXT:    %"\CF\84_0_0.AT2.AT2.AT3.P3" = bitcast i8* [[B_AT2_AT2_AT3_P3]] to i8**
+// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3_PTR:%.*]] = getelementptr inbounds ptr, ptr %SelfWitnessTable, i32 -3
+// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3:%.*]] = load ptr, ptr [[B_AT2_AT2_AT3_P3_PTR]], align 8
 
-// CHECK-NEXT:    [[SELF_AS_TYPE_ARRAY:%.*]] = bitcast %swift.type* %Self to %swift.type**
-// CHECK-NEXT:    [[B_PTR:%.*]] = getelementptr inbounds %swift.type*, %swift.type** [[SELF_AS_TYPE_ARRAY]], i64 2
-// CHECK-NEXT:    [[B:%.*]] = load %swift.type*, %swift.type** [[B_PTR]], align 8
+// CHECK-NEXT:    [[B_PTR:%.*]] = getelementptr inbounds ptr, ptr %Self, i64 2
+// CHECK-NEXT:    [[B:%.*]] = load ptr, ptr [[B_PTR]], align 8
 
-// CHECK-NEXT:    [[SELF_AS_TYPE_ARRAY_2:%.*]] = bitcast %swift.type* %Self to %swift.type**
-// CHECK-NEXT:    [[C_PTR:%.*]] = getelementptr inbounds %swift.type*, %swift.type** [[SELF_AS_TYPE_ARRAY_2]], i64 3
-// CHECK-NEXT:    [[C:%.*]] = load %swift.type*, %swift.type** [[C_PTR]], align 8
+// CHECK-NEXT:    [[C_PTR:%.*]] = getelementptr inbounds ptr, ptr %Self, i64 3
+// CHECK-NEXT:    [[C:%.*]] = load ptr, ptr [[C_PTR]], align 8
 
-// CHECK-NEXT:    [[SELF_AS_WT_ARRAY:%.*]] = bitcast %swift.type* %Self to i8***
-// CHECK-NEXT:    [[B_P2_PTR:%.*]] = getelementptr inbounds i8**, i8*** [[SELF_AS_WT_ARRAY]], i64 4
-// CHECK-NEXT:    %"\CF\84_0_0.P2" = load i8**, i8*** [[B_P2_PTR]], align 8
+// CHECK-NEXT:    [[B_P2_PTR:%.*]] = getelementptr inbounds ptr, ptr %Self, i64 4
+// CHECK-NEXT:    %"\CF\84_0_0.P2" = load ptr, ptr [[B_P2_PTR]], align 8
 
-// CHECK-NEXT:    call swiftcc void @_T034conditional_conformance_with_assoc6DoubleVA2A2P3R_AA2P23AT2RpzAadF_AfaEP3AT3RPzrlE7genericyqd__AaDRd__lF(%swift.opaque* noalias nocapture %0, %swift.type* %"\CF\84_0_0", %swift.type* %"\CF\84_0_1", %swift.type* %"\CF\84_1_0", i8** %"\CF\84_0_0.P2", i8** %"\CF\84_0_1.P3", i8** %"\CF\84_1_0.P3", i8** %"\CF\84_0_0.AT2.P2", i8** %"\CF\84_0_0.AT2.AT2.AT3.P3")
+// CHECK-NEXT:    call swiftcc void @"$s34conditional_conformance_with_assoc6DoubleVA2A2P3R_AA2P23AT2RpzAadF_AfaEP3AT3RPzrlE7genericyyqd__AaDRd__lF"(ptr noalias %0, ptr %"\CF\84_0_0", ptr %"\CF\84_0_1", ptr %"\CF\84_1_0", ptr %"\CF\84_0_0.P2", ptr [[C_P3]], ptr %"\CF\84_1_0.P3", ptr [[B_AT2_P2]], ptr [[B_AT2_AT2_AT3_P3]])
 // CHECK-NEXT:    ret void
 // CHECK-NEXT:  }
 
@@ -109,21 +97,22 @@ public func generic_generic<T: P2, U>(_: T.Type, _: U.Type)
 {
   takes_p1(Double<T, U>.self)
 }
-// CHECK-LABEL: define{{( protected)?}} swiftcc void @_T034conditional_conformance_with_assoc08generic_E0yxm_q_mtAA2P2RzAA2P3R_AaC3AT2RpzAadE_AeaCP3AT3RPzr0_lF(%swift.type*, %swift.type*, %swift.type* %T, %swift.type* %U, i8** %T.P2, i8** %U.P3, i8** %T.AT2.P2, i8** %T.AT2.AT2.AT3.P3) #0 {
+// CHECK-LABEL: define{{( dllexport)?}}{{( protected)?}} swiftcc void @"$s34conditional_conformance_with_assoc08generic_E0yyxm_q_mtAA2P2RzAA2P3R_AaC3AT2RpzAadE_AeaCP3AT3RPzr0_lF"(ptr %0, ptr %1, ptr %T, ptr %U, ptr %T.P2, ptr %U.P3, ptr %T.AT2.P2, ptr %T.AT2.AT2.AT3.P3)
 // CHECK-NEXT:  entry:
-// CHECK-NEXT:    %conditional.requirement.buffer = alloca [3 x i8**], align 8
-// CHECK-NEXT:    [[Double_TYPE:%.*]] = call %swift.type* @_T034conditional_conformance_with_assoc6DoubleVMa(%swift.type* %T, %swift.type* %U, i8** %T.P2)
+// CHECK:         %conditional.requirement.buffer = alloca [3 x ptr], align 8
+// CHECK:         [[T0:%.*]] = call swiftcc %swift.metadata_response @"$s34conditional_conformance_with_assoc6DoubleVMa"(i64 0, ptr %T, ptr %U, ptr %T.P2)
+// CHECK-NEXT:    [[Double_TYPE:%.*]] = extractvalue %swift.metadata_response [[T0]], 0
 
-// CHECK-NEXT:    [[CONDITIONAL_REQUIREMENTS:%.*]] = getelementptr inbounds [3 x i8**], [3 x i8**]* %conditional.requirement.buffer, i32 0, i32 0
-// CHECK-NEXT:    [[C_P3_PTR:%.*]] = getelementptr inbounds i8**, i8*** [[CONDITIONAL_REQUIREMENTS]], i32 0
-// CHECK-NEXT:    store i8** %U.P3, i8*** [[C_P3_PTR]], align 8
-// CHECK-NEXT:    [[B_AT2_P2_PTR:%.*]] = getelementptr inbounds i8**, i8*** [[CONDITIONAL_REQUIREMENTS]], i32 1
-// CHECK-NEXT:    store i8** %T.AT2.P2, i8*** [[B_AT2_P2_PTR]], align 8
-// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3_PTR:%.*]] = getelementptr inbounds i8**, i8*** [[CONDITIONAL_REQUIREMENTS]], i32 2
-// CHECK-NEXT:    store i8** %T.AT2.AT2.AT3.P3, i8*** [[B_AT2_AT2_AT3_P3_PTR]], align 8
+// CHECK-NEXT:    [[CONDITIONAL_REQUIREMENTS:%.*]] = getelementptr inbounds [3 x ptr], ptr %conditional.requirement.buffer, i32 0, i32 0
+// CHECK-NEXT:    [[C_P3_PTR:%.*]] = getelementptr inbounds ptr, ptr [[CONDITIONAL_REQUIREMENTS]], i32 0
+// CHECK-NEXT:    store ptr %U.P3, ptr [[C_P3_PTR]], align 8
+// CHECK-NEXT:    [[B_AT2_P2_PTR:%.*]] = getelementptr inbounds ptr, ptr [[CONDITIONAL_REQUIREMENTS]], i32 1
+// CHECK-NEXT:    store ptr %T.AT2.P2, ptr [[B_AT2_P2_PTR]], align 8
+// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3_PTR:%.*]] = getelementptr inbounds ptr, ptr [[CONDITIONAL_REQUIREMENTS]], i32 2
+// CHECK-NEXT:    store ptr %T.AT2.AT2.AT3.P3, ptr [[B_AT2_AT2_AT3_P3_PTR]], align 8
 
-// CHECK-NEXT:    [[Double_P1:%.*]] = call i8** @_T034conditional_conformance_with_assoc6DoubleVyxq_GAA2P1A2A2P3R_AA2P23AT2RpzAafH_AhaGP3AT3RPzrlWa(%swift.type* [[Double_TYPE]], i8*** [[CONDITIONAL_REQUIREMENTS]], i64 3)
-// CHECK-NEXT:    call swiftcc void @_T034conditional_conformance_with_assoc8takes_p1yxmAA2P1RzlF(%swift.type* [[Double_TYPE]], %swift.type* [[Double_TYPE]], i8** [[Double_P1]])
+// CHECK-NEXT:    [[Double_P1:%.*]] = call ptr @swift_getWitnessTable
+// CHECK-NEXT:    call swiftcc void @"$s34conditional_conformance_with_assoc8takes_p1yyxmAA2P1RzlF"(ptr [[Double_TYPE]], ptr [[Double_TYPE]], ptr [[Double_P1]])
 // CHECK-NEXT:    ret void
 // CHECK-NEXT:  }
 
@@ -132,21 +121,37 @@ public func generic_concrete<T: P2>(_: T.Type)
 {
   takes_p1(Double<T, IsP3>.self)
 }
-// CHECK-LABEL: define{{( protected)?}} swiftcc void @_T034conditional_conformance_with_assoc16generic_concreteyxmAA2P2RzAaC3AT2RpzAA2P3AD_AdaCP3AT3RPzlF(%swift.type*, %swift.type* %T, i8** %T.P2, i8** %T.AT2.P2, i8** %T.AT2.AT2.AT3.P3) #0 {
+// CHECK-LABEL: define{{( dllexport)?}}{{( protected)?}} swiftcc void @"$s34conditional_conformance_with_assoc16generic_concreteyyxmAA2P2RzAaC3AT2RpzAA2P3AD_AdaCP3AT3RPzlF"(ptr %0, ptr %T, ptr %T.P2, ptr %T.AT2.P2, ptr %T.AT2.AT2.AT3.P3)
 // CHECK-NEXT:  entry:
-// CHECK-NEXT:    %conditional.requirement.buffer = alloca [3 x i8**], align 8
-// CHECK-NEXT:    [[Double_TYPE:%.*]] = call %swift.type* @_T034conditional_conformance_with_assoc6DoubleVMa(%swift.type* %T, %swift.type* bitcast (i64* getelementptr inbounds (<{ i8**, i64, <{ i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i16, i16, i32 }>* }>, <{ i8**, i64, <{ i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i16, i16, i32 }>* }>* @_T034conditional_conformance_with_assoc4IsP3VMf, i32 0, i32 1) to %swift.type*), i8** %T.P2)
+// CHECK:         %conditional.requirement.buffer = alloca [3 x ptr], align 8
+// CHECK:         [[T0:%.*]] = call swiftcc %swift.metadata_response @"$s34conditional_conformance_with_assoc6DoubleVMa"(
+// CHECK-SAME:           i64 0,
+// CHECK-SAME:           ptr
+// CHECK-SAME:           %T,
+// CHECK-SAME:             ptr getelementptr inbounds (
+// CHECK-SAME:               <{
+// CHECK-SAME:                 ptr,
+// CHECK-SAME:                 i64,
+// CHECK-SAME:                 ptr
+// CHECK-SAME:               }>,
+// CHECK-SAME:               ptr @"$s34conditional_conformance_with_assoc4IsP3VMf",
+// CHECK-SAME:               i32 0,
+// CHECK-SAME:               i32 2
+// CHECK-SAME:           ),
+// CHECK-SAME:           ptr %T.P2
+// CHECK-SAME:         )
+// CHECK-NEXT:    [[Double_TYPE:%.*]] = extractvalue %swift.metadata_response [[T0]], 0
 
-// CHECK-NEXT:    [[CONDITIONAL_REQUIREMENTS:%.*]] = getelementptr inbounds [3 x i8**], [3 x i8**]* %conditional.requirement.buffer, i32 0, i32 0
-// CHECK-NEXT:    [[C_P3_PTR:%.*]] = getelementptr inbounds i8**, i8*** [[CONDITIONAL_REQUIREMENTS]], i32 0
-// CHECK-NEXT:    store i8** getelementptr inbounds ([1 x i8*], [1 x i8*]* @_T034conditional_conformance_with_assoc4IsP3VAA0F0AAWP, i32 0, i32 0), i8*** [[C_P3_PTR]], align 8
-// CHECK-NEXT:    [[B_AT2_P2_PTR:%.*]] = getelementptr inbounds i8**, i8*** [[CONDITIONAL_REQUIREMENTS]], i32 1
-// CHECK-NEXT:    store i8** %T.AT2.P2, i8*** [[B_AT2_P2_PTR]], align 8
-// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3_PTR:%.*]] = getelementptr inbounds i8**, i8*** [[CONDITIONAL_REQUIREMENTS]], i32 2
-// CHECK-NEXT:    store i8** %T.AT2.AT2.AT3.P3, i8*** [[B_AT2_AT2_AT3_P3_PTR]], align 8
+// CHECK-NEXT:    [[CONDITIONAL_REQUIREMENTS:%.*]] = getelementptr inbounds [3 x ptr], ptr %conditional.requirement.buffer, i32 0, i32 0
+// CHECK-NEXT:    [[C_P3_PTR:%.*]] = getelementptr inbounds ptr, ptr [[CONDITIONAL_REQUIREMENTS]], i32 0
+// CHECK-NEXT:    store ptr @"$s34conditional_conformance_with_assoc4IsP3VAA0F0AAWP", ptr [[C_P3_PTR]], align 8
+// CHECK-NEXT:    [[B_AT2_P2_PTR:%.*]] = getelementptr inbounds ptr, ptr [[CONDITIONAL_REQUIREMENTS]], i32 1
+// CHECK-NEXT:    store ptr %T.AT2.P2, ptr [[B_AT2_P2_PTR]], align 8
+// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3_PTR:%.*]] = getelementptr inbounds ptr, ptr [[CONDITIONAL_REQUIREMENTS]], i32 2
+// CHECK-NEXT:    store ptr %T.AT2.AT2.AT3.P3, ptr [[B_AT2_AT2_AT3_P3_PTR]], align 8
 
-// CHECK-NEXT:    [[Double_P1:%.*]] = call i8** @_T034conditional_conformance_with_assoc6DoubleVyxq_GAA2P1A2A2P3R_AA2P23AT2RpzAafH_AhaGP3AT3RPzrlWa(%swift.type* [[Double_TYPE]], i8*** [[CONDITIONAL_REQUIREMENTS]], i64 3)
-// CHECK-NEXT:    call swiftcc void @_T034conditional_conformance_with_assoc8takes_p1yxmAA2P1RzlF(%swift.type* [[Double_TYPE]], %swift.type* [[Double_TYPE]], i8** [[Double_P1]])
+// CHECK-NEXT:    [[Double_P1:%.*]] = call ptr @swift_getWitnessTable
+// CHECK-NEXT:    call swiftcc void @"$s34conditional_conformance_with_assoc8takes_p1yyxmAA2P1RzlF"(ptr [[Double_TYPE]], ptr [[Double_TYPE]], ptr [[Double_P1]])
 // CHECK-NEXT:    ret void
 // CHECK-NEXT:  }
 
@@ -157,19 +162,20 @@ public func concrete_generic<U>(_: U.Type)
   takes_p1(Double<IsAlsoP2, U>.self)
 }
 
-// CHECK-LABEL: define{{( protected)?}} swiftcc void @_T034conditional_conformance_with_assoc16concrete_genericyxmAA2P3RzlF(%swift.type*, %swift.type* %U, i8** %U.P3) #0 {
+// CHECK-LABEL: define{{( dllexport)?}}{{( protected)?}} swiftcc void @"$s34conditional_conformance_with_assoc16concrete_genericyyxmAA2P3RzlF"(ptr %0, ptr %U, ptr %U.P3)
 // CHECK-NEXT:  entry:
-// CHECK-NEXT:  %conditional.requirement.buffer = alloca [3 x i8**], align 8
-// CHECK-NEXT:  [[Double_TYPE:%.*]] = call %swift.type* @_T034conditional_conformance_with_assoc6DoubleVMa(%swift.type* bitcast (i64* getelementptr inbounds (<{ i8**, i64, <{ i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i16, i16, i32 }>* }>, <{ i8**, i64, <{ i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i16, i16, i32 }>* }>* @_T034conditional_conformance_with_assoc8IsAlsoP2VMf, i32 0, i32 1) to %swift.type*), %swift.type* %U, i8** getelementptr inbounds ([2 x i8*], [2 x i8*]* @_T034conditional_conformance_with_assoc8IsAlsoP2VAA0G0AAWP, i32 0, i32 0))
-// CHECK-NEXT:  [[CONDITIONAL_REQUIREMENTS:%.*]] = getelementptr inbounds [3 x i8**], [3 x i8**]* %conditional.requirement.buffer, i32 0, i32 0
-// CHECK-NEXT:  [[C_P3_PTR:%.*]] = getelementptr inbounds i8**, i8*** [[CONDITIONAL_REQUIREMENTS]], i32 0
-// CHECK-NEXT:  store i8** %U.P3, i8*** [[C_P3_PTR]], align 8
-// CHECK-NEXT:  [[B_AT2_P2_PTR:%.*]] = getelementptr inbounds i8**, i8*** [[CONDITIONAL_REQUIREMENTS]], i32 1
-// CHECK-NEXT:  store i8** getelementptr inbounds ([2 x i8*], [2 x i8*]* @_T034conditional_conformance_with_assoc6IsBothVAA2P2AAWP, i32 0, i32 0), i8*** [[B_AT2_P2_PTR]], align 8
-// CHECK-NEXT:  [[B_AT2_AT2_AT3_P3_PTR:%.*]] = getelementptr inbounds i8**, i8*** [[CONDITIONAL_REQUIREMENTS]], i32 2
-// CHECK-NEXT:  store i8** getelementptr inbounds ([1 x i8*], [1 x i8*]* @_T034conditional_conformance_with_assoc4IsP3VAA0F0AAWP, i32 0, i32 0), i8*** [[B_AT2_AT2_AT3_P3_PTR]], align 8
-// CHECK-NEXT:  [[Double_P1:%.*]] = call i8** @_T034conditional_conformance_with_assoc6DoubleVyxq_GAA2P1A2A2P3R_AA2P23AT2RpzAafH_AhaGP3AT3RPzrlWa(%swift.type* [[Double_TYPE]], i8*** [[CONDITIONAL_REQUIREMENTS]], i64 3)
-// CHECK-NEXT:  call swiftcc void @_T034conditional_conformance_with_assoc8takes_p1yxmAA2P1RzlF(%swift.type* [[Double_TYPE]], %swift.type* [[Double_TYPE]], i8** [[Double_P1]])
+// CHECK:       %conditional.requirement.buffer = alloca [3 x ptr], align 8
+// CHECK:       [[T0:%.*]] = call swiftcc %swift.metadata_response @"$s34conditional_conformance_with_assoc6DoubleVMa"(i64 0, ptr getelementptr inbounds (<{ {{.*}} }>, ptr @"$s34conditional_conformance_with_assoc8IsAlsoP2VMf", i32 0, i32 2), ptr %U, ptr @"$s34conditional_conformance_with_assoc8IsAlsoP2VAA0G0AAWP")
+// CHECK-NEXT:  [[Double_TYPE:%.*]] = extractvalue %swift.metadata_response [[T0]], 0
+// CHECK-NEXT:  [[CONDITIONAL_REQUIREMENTS:%.*]] = getelementptr inbounds [3 x ptr], ptr %conditional.requirement.buffer, i32 0, i32 0
+// CHECK-NEXT:  [[C_P3_PTR:%.*]] = getelementptr inbounds ptr, ptr [[CONDITIONAL_REQUIREMENTS]], i32 0
+// CHECK-NEXT:  store ptr %U.P3, ptr [[C_P3_PTR]], align 8
+// CHECK-NEXT:  [[B_AT2_P2_PTR:%.*]] = getelementptr inbounds ptr, ptr [[CONDITIONAL_REQUIREMENTS]], i32 1
+// CHECK-NEXT:  store ptr @"$s34conditional_conformance_with_assoc6IsBothVAA2P2AAWP", ptr [[B_AT2_P2_PTR]], align 8
+// CHECK-NEXT:  [[B_AT2_AT2_AT3_P3_PTR:%.*]] = getelementptr inbounds ptr, ptr [[CONDITIONAL_REQUIREMENTS]], i32 2
+// CHECK-NEXT:  store ptr @"$s34conditional_conformance_with_assoc4IsP3VAA0F0AAWP", ptr [[B_AT2_AT2_AT3_P3_PTR]], align 8
+// CHECK-NEXT:  [[Double_P1:%.*]] = call ptr @swift_getWitnessTable
+// CHECK-NEXT:  call swiftcc void @"$s34conditional_conformance_with_assoc8takes_p1yyxmAA2P1RzlF"(ptr [[Double_TYPE]], ptr [[Double_TYPE]], ptr [[Double_P1]])
 // CHECK-NEXT:  ret void
 // CHECK-NEXT:}
 
@@ -178,78 +184,57 @@ public func concrete_concrete() {
   takes_p1(Double<IsAlsoP2, IsP3>.self)
 }
 
-// CHECK-LABEL: define{{( protected)?}} swiftcc void @_T034conditional_conformance_with_assoc09concrete_E0yyF() #0 {
+// CHECK-LABEL: define{{( dllexport)?}}{{( protected)?}} swiftcc void @"$s34conditional_conformance_with_assoc09concrete_E0yyF"()
 // CHECK-NEXT:  entry:
-// CHECK-NEXT:    %0 = call %swift.type* @_T034conditional_conformance_with_assoc6DoubleVyAA8IsAlsoP2VAA0F2P3VGMa() #10
-// CHECK-NEXT:    %1 = call i8** @_T034conditional_conformance_with_assoc6DoubleVyAA8IsAlsoP2VAA0F2P3VGACyxq_GAA2P1A2A0I0R_AA0H03AT2RpzAakM_AmaLP3AT3RPzrlWl() #10
-// CHECK-NEXT:    call swiftcc void @_T034conditional_conformance_with_assoc8takes_p1yxmAA2P1RzlF(%swift.type* %0, %swift.type* %0, i8** %1)
+// CHECK-NEXT:    [[X:%.*]] = call {{.*}} @__swift_instantiateConcreteTypeFromMangledName({{.*}} @"$s34conditional_conformance_with_assoc6DoubleVyAA8IsAlsoP2VAA0F2P3VGMD")
+// CHECK-NEXT:    [[Z:%.*]] = call ptr @"$s34conditional_conformance_with_assoc6DoubleVyAA8IsAlsoP2VAA0F2P3VGACyxq_GAA2P1A2A0I0R_AA0H03AT2RpzAakM_AmaLP3AT3RPzrlWl"()
+// CHECK-NEXT:    call swiftcc void @"$s34conditional_conformance_with_assoc8takes_p1yyxmAA2P1RzlF"(ptr [[X]], ptr [[X]], ptr [[Z]])
 // CHECK-NEXT:    ret void
 // CHECK-NEXT: }
 
 // Lazy witness table accessor for the concrete Double<IsAlsoP2, IsP3> : P1.
 
-// CHECK-LABEL: define linkonce_odr hidden i8** @_T034conditional_conformance_with_assoc6DoubleVyAA8IsAlsoP2VAA0F2P3VGACyxq_GAA2P1A2A0I0R_AA0H03AT2RpzAakM_AmaLP3AT3RPzrlWl() #1 {
+// CHECK-LABEL: define linkonce_odr hidden ptr @"$s34conditional_conformance_with_assoc6DoubleVyAA8IsAlsoP2VAA0F2P3VGACyxq_GAA2P1A2A0I0R_AA0H03AT2RpzAakM_AmaLP3AT3RPzrlWl"()
 // CHECK-NEXT:  entry:
-// CHECK-NEXT:    %conditional.requirement.buffer = alloca [3 x i8**], align 8
-// CHECK-NEXT:    [[CACHE:%.*]] = load i8**, i8*** @_T034conditional_conformance_with_assoc6DoubleVyAA8IsAlsoP2VAA0F2P3VGACyxq_GAA2P1A2A0I0R_AA0H03AT2RpzAakM_AmaLP3AT3RPzrlWL, align 8
-// CHECK-NEXT:    [[IS_NULL:%.*]] = icmp eq i8** [[CACHE]], null
+// CHECK-NEXT:    %conditional.requirement.buffer = alloca [3 x ptr], align 8
+// CHECK-NEXT:    [[CACHE:%.*]] = load ptr, ptr @"$s34conditional_conformance_with_assoc6DoubleVyAA8IsAlsoP2VAA0F2P3VGACyxq_GAA2P1A2A0I0R_AA0H03AT2RpzAakM_AmaLP3AT3RPzrlWL", align 8
+// CHECK-NEXT:    [[IS_NULL:%.*]] = icmp eq ptr [[CACHE]], null
 // CHECK-NEXT:    br i1 [[IS_NULL]], label %cacheIsNull, label %cont
 
 // CHECK:       cacheIsNull:
-// CHECK-NEXT:    [[Double_TYPE:%.*]] = call %swift.type* @_T034conditional_conformance_with_assoc6DoubleVyAA8IsAlsoP2VAA0F2P3VGMa() #10
-// CHECK-NEXT:    [[CONDITIONAL_REQUIREMENTS:%.*]] = getelementptr inbounds [3 x i8**], [3 x i8**]* %conditional.requirement.buffer, i32 0, i32 0
-// CHECK-NEXT:    [[C_P3_PTR:%.*]] = getelementptr inbounds i8**, i8*** [[CONDITIONAL_REQUIREMENTS]], i32 0
-// CHECK-NEXT:    store i8** getelementptr inbounds ([1 x i8*], [1 x i8*]* @_T034conditional_conformance_with_assoc4IsP3VAA0F0AAWP, i32 0, i32 0), i8*** [[C_P3_PTR]], align 8
-// CHECK-NEXT:    [[B_AT2_P2_PTR:%.*]] = getelementptr inbounds i8**, i8*** [[CONDITIONAL_REQUIREMENTS]], i32 1
-// CHECK-NEXT:    store i8** getelementptr inbounds ([2 x i8*], [2 x i8*]* @_T034conditional_conformance_with_assoc6IsBothVAA2P2AAWP, i32 0, i32 0), i8*** [[B_AT2_P2_PTR]], align 8
-// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3_PTR:%.*]] = getelementptr inbounds i8**, i8*** [[CONDITIONAL_REQUIREMENTS]], i32 2
-// CHECK-NEXT:    store i8** getelementptr inbounds ([1 x i8*], [1 x i8*]* @_T034conditional_conformance_with_assoc4IsP3VAA0F0AAWP, i32 0, i32 0), i8*** [[B_AT2_AT2_AT3_P3_PTR]], align 8
-// CHECK-NEXT:    [[Double_P1:%.*]] = call i8** @_T034conditional_conformance_with_assoc6DoubleVyxq_GAA2P1A2A2P3R_AA2P23AT2RpzAafH_AhaGP3AT3RPzrlWa(%swift.type* [[Double_TYPE]], i8*** [[CONDITIONAL_REQUIREMENTS]], i64 3)
-// CHECK-NEXT:    store atomic i8** [[Double_P1]], i8*** @_T034conditional_conformance_with_assoc6DoubleVyAA8IsAlsoP2VAA0F2P3VGACyxq_GAA2P1A2A0I0R_AA0H03AT2RpzAakM_AmaLP3AT3RPzrlWL release, align 8
+// CHECK-STABLE-ABI-FALSE-NEXT:   [[T0:%.*]] = call swiftcc %swift.metadata_response @"$s34conditional_conformance_with_assoc6DoubleVyAA8IsAlsoP2VAA0F2P3VGMa"(i64 255)
+// CHECK-STABLE-ABI-FALSE-NEXT:   [[Double_TYPE:%.*]] = extractvalue %swift.metadata_response [[T0]], 0
+// CHECK-STABLE-ABI-FALSE-NEXT:   extractvalue %swift.metadata_response [[T0]], 1
+// CHECK-STABLE-ABI-TRUE-NEXT:    [[T0:%.*]] = call ptr @__swift_instantiateConcreteTypeFromMangledNameAbstract(ptr @"$s34conditional_conformance_with_assoc6DoubleVyAA8IsAlsoP2VAA0F2P3VGMD")
+// CHECK-NEXT:    [[CONDITIONAL_REQUIREMENTS:%.*]] = getelementptr inbounds [3 x ptr], ptr %conditional.requirement.buffer, i32 0, i32 0
+// CHECK-NEXT:    [[C_P3_PTR:%.*]] = getelementptr inbounds ptr, ptr [[CONDITIONAL_REQUIREMENTS]], i32 0
+// CHECK-NEXT:    store ptr @"$s34conditional_conformance_with_assoc4IsP3VAA0F0AAWP", ptr [[C_P3_PTR]], align 8
+// CHECK-NEXT:    [[B_AT2_P2_PTR:%.*]] = getelementptr inbounds ptr, ptr [[CONDITIONAL_REQUIREMENTS]], i32 1
+// CHECK-NEXT:    store ptr @"$s34conditional_conformance_with_assoc6IsBothVAA2P2AAWP", ptr [[B_AT2_P2_PTR]], align 8
+// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3_PTR:%.*]] = getelementptr inbounds ptr, ptr [[CONDITIONAL_REQUIREMENTS]], i32 2
+// CHECK-NEXT:    store ptr @"$s34conditional_conformance_with_assoc4IsP3VAA0F0AAWP", ptr [[B_AT2_AT2_AT3_P3_PTR]], align 8
+// CHECK-NEXT:    [[Double_P1:%.*]] = call ptr @swift_getWitnessTable
+// CHECK-NEXT:    store atomic ptr [[Double_P1]], ptr @"$s34conditional_conformance_with_assoc6DoubleVyAA8IsAlsoP2VAA0F2P3VGACyxq_GAA2P1A2A0I0R_AA0H03AT2RpzAakM_AmaLP3AT3RPzrlWL" release, align 8
 // CHECK-NEXT:    br label %cont
 
 // CHECK:       cont:
-// CHECK-NEXT:    %8 = phi i8** [ [[CACHE]], %entry ], [ [[Double_P1]], %cacheIsNull ]
-// CHECK-NEXT:    ret i8** %8
+// CHECK-NEXT:    [[T0:%.*]] = phi ptr [ [[CACHE]], %entry ], [ [[Double_P1]], %cacheIsNull ]
+// CHECK-NEXT:    ret ptr [[T0]]
 // CHECK-NEXT:  }
 
 
 
-// witness table instantiator for Double : P1
+protocol Base {
+}
 
-// CHECK-LABEL: define internal void @_T034conditional_conformance_with_assoc6DoubleVyxq_GAA2P1A2A2P3R_AA2P23AT2RpzAafH_AhaGP3AT3RPzrlWI(i8**, %swift.type*, i8**) #0 {
-// CHECK-NEXT:  entry:
-// CHECK-NEXT:    [[CONDITIONAL_TABLE_SLICE:%.*]] = bitcast i8** %2 to %swift.witness_table_slice*
-// CHECK-NEXT:    [[TABLES_PTR:%.*]] = getelementptr inbounds %swift.witness_table_slice, %swift.witness_table_slice* [[CONDITIONAL_TABLE_SLICE]], i32 0, i32 0
-// CHECK-NEXT:    [[TABLES:%.*]] = load i8***, i8**** [[TABLES_PTR]], align 8
-// CHECK-NEXT:    [[COUNT_PTR:%.*]] = getelementptr inbounds %swift.witness_table_slice, %swift.witness_table_slice* [[CONDITIONAL_TABLE_SLICE]], i32 0, i32 1
-// CHECK-NEXT:    [[COUNT:%.*]] = load i64, i64* [[COUNT_PTR]], align 8
-// CHECK-NEXT:    [[COND:%.*]] = icmp eq i64 [[COUNT]],
-// CHECK-NEXT:    br i1 [[COND]], label %cont, label %bad_witness_table_count
+protocol Sub : Base {
+  associatedtype S : Base
+}
 
-// CHECK:       cont:
-// CHECK-NEXT:    [[C_P3_SRC:%.*]] = getelementptr inbounds i8**, i8*** [[TABLES]], i32 0
-// CHECK-NEXT:    [[C_P3_DEST:%.*]] = getelementptr inbounds i8*, i8** %0, i32 -1
-// CHECK-NEXT:    [[C_P3:%.*]] = load i8**, i8*** [[C_P3_SRC]], align 8
-// CHECK-NEXT:    [[CAST_C_P3_DEST:%.*]] = bitcast i8** [[C_P3_DEST]] to i8***
-// CHECK-NEXT:    store i8** [[C_P3]], i8*** [[CAST_C_P3_DEST]], align 8
+struct X<T> {
+}
 
-// CHECK-NEXT:    [[B_AT2_P2_SRC:%.*]] = getelementptr inbounds i8**, i8*** [[TABLES]], i32 1
-// CHECK-NEXT:    [[B_AT2_P2_DEST:%.*]] = getelementptr inbounds i8*, i8** %0, i32 -2
-// CHECK-NEXT:    [[B_AT2_P2:%.*]] = load i8**, i8*** [[B_AT2_P2_SRC]], align 8
-// CHECK-NEXT:    [[CAST_B_AT2_P2_DEST:%.*]] = bitcast i8** [[B_AT2_P2_DEST]] to i8***
-// CHECK-NEXT:    store i8** [[B_AT2_P2]], i8*** [[CAST_B_AT2_P2_DEST]], align 8
-
-// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3_SRC:%.*]] = getelementptr inbounds i8**, i8*** [[TABLES]], i32 2
-// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3_DEST:%.*]] = getelementptr inbounds i8*, i8** %0, i32 -3
-// CHECK-NEXT:    [[B_AT2_AT2_AT3_P3:%.*]] = load i8**, i8*** [[B_AT2_AT2_AT3_P3_SRC]], align 8
-// CHECK-NEXT:    [[CAST_B_AT2_AT2_AT3_P3_DEST:%.*]] = bitcast i8** [[B_AT2_AT2_AT3_P3_DEST]] to i8***
-// CHECK-NEXT:    store i8** [[B_AT2_AT2_AT3_P3]], i8*** [[CAST_B_AT2_AT2_AT3_P3_DEST]], align 8
-
-// CHECK-NEXT:    ret void
-
-// CHECK:       bad_witness_table_count:
-// CHECK-NEXT:    call void @llvm.trap()
-// CHECK-NEXT:    unreachable
-// CHECK-NEXT:  }
-
+extension X: Base where T: Base { }
+extension X: Sub where T: Sub, T.S == T {
+   typealias S = X<T>
+}

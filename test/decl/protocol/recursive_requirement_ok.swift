@@ -1,5 +1,5 @@
 // RUN: %target-typecheck-verify-swift
-// RUN: %target-typecheck-verify-swift -typecheck -debug-generic-signatures %s > %t.dump 2>&1
+// RUN: %target-typecheck-verify-swift -debug-generic-signatures > %t.dump 2>&1
 // RUN: %FileCheck %s < %t.dump
 
 protocol P {
@@ -15,25 +15,27 @@ func testP<T: P>(_ t: T) {
   testP(t.assoc.assoc.assoc.assoc.assoc.assoc.assoc)
 }
 
-// SR-5485
+// https://github.com/apple/swift/issues/48057
+
 protocol P1 {
   associatedtype X : P2
 }
 
 // CHECK-LABEL: .P2@
-// CHECK: Requirement signature: <Self where Self == Self.Y.X, Self.Y : P1, Self.Z : P1>
+// CHECK: Requirement signature: <Self where Self == Self.[P2]Y.[P1]X, Self.[P2]Y : P1, Self.[P2]Z : P1>
 protocol P2 {
   associatedtype Y : P1 where Y.X == Self
   associatedtype Z : P1
 }
 
-// SR-5473
+// https://github.com/apple/swift/issues/48045
+
 protocol P3 {
 	associatedtype X : P4
 }
 
 // CHECK-LABEL: .P4@
-// CHECK: Requirement signature: <Self where Self == Self.Y.X, Self.Y : P3, Self.Z : P3, Self.Y.X == Self.Z.X>
+// CHECK: Requirement signature: <Self where Self == Self.[P4]Y.[P3]X, Self.[P4]Y : P3, Self.[P4]Z : P3, Self.[P4]Y.[P3]X == Self.[P4]Z.[P3]X>
 protocol P4 {
 	associatedtype Y: P3 where Y.X == Self
 	associatedtype Z: P3 where Z.X == Self
@@ -45,15 +47,16 @@ protocol P5 {
 }
 
 // CHECK-LABEL: .P6@
-// CHECK: Requirement signature: <Self where Self : P5, Self.Y : P5>
+// CHECK: Requirement signature: <Self where Self : P5, Self.[P6]Y : P5>
 protocol P6 : P5 {
   associatedtype Y : P5
 }
 
-// CHECK: Generic signature: <Self where Self : P6, Self.X == Self.Y.X>
+// CHECK: Generic signature: <Self where Self : P6, Self.[P5]X == Self.[P6]Y.[P5]X>
 extension P6 where X == Y.X { }
 
-// SR-5601
+// https://github.com/apple/swift/issues/48173
+
 protocol P7 {
     associatedtype X: P9 where X.Q == Self, X.R == UInt8
     associatedtype Y: P9 where Y.Q == Self, Y.R == UInt16
@@ -73,7 +76,8 @@ struct S9<E> : P9 {
     typealias Q = A7
 }
 
-// SR-5610
+// https://github.com/apple/swift/issues/48180
+
 protocol P10 {
   associatedtype X : P11 where X.Q == Self
 }
@@ -81,13 +85,15 @@ protocol P11 {
   associatedtype Q : P10
 
   // CHECK-LABEL: .P11.map@
-  // CHECK: Generic signature: <Self, T where Self : P11, T : P11, Self.Q == T.Q>
+  // CHECK: Generic signature: <Self, T where Self : P11, T : P11, Self.[P11]Q == T.[P11]Q>
   func map<T>(_: T.Type) where T : P11, Q == T.Q
 }
 
 // Redundances within a requirement signature.
 protocol P12 { }
 
+// CHECK-LABEL: .P13@
+// CHECK: Requirement signature: <Self where Self.[P13]AT1 : P12, Self.[P13]AT1 == Self.[P13]AT2.[P13]AT1, Self.[P13]AT2 : P13>
 protocol P13 {
   associatedtype AT1 : P12
   associatedtype AT2: P13 where AT2.AT1 == AT1

@@ -22,14 +22,21 @@
 #include <cstdint>
 #include <utility>
 #include "swift/Runtime/HeapObject.h"
+#include "../runtime/SwiftHashableSupport.h"
 #if SWIFT_OBJC_INTEROP
-#include "llvm/Support/Compiler.h"
 #include <objc/NSObject.h>
 #endif
 
 
 #if SWIFT_OBJC_INTEROP
+#if __OBJC__
 
+// Source code: "SwiftObject"
+// Real class name: mangled "Swift._SwiftObject"
+#define SwiftObject _TtCs12_SwiftObject
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wobjc-root-class"
 #if __has_attribute(objc_root_class)
 __attribute__((__objc_root_class__))
 #endif
@@ -38,6 +45,7 @@ SWIFT_RUNTIME_EXPORT @interface SwiftObject<NSObject> {
   Class isa;
   SWIFT_HEAPOBJECT_NON_OBJC_MEMBERS;
 }
+#pragma clang diagnostic pop
 
 - (BOOL)isEqual:(id)object;
 - (NSUInteger)hash;
@@ -68,23 +76,28 @@ SWIFT_RUNTIME_EXPORT @interface SwiftObject<NSObject> {
 - (instancetype)autorelease;
 - (NSUInteger)retainCount;
 
-- (NSString *)description;
-- (NSString *)debugDescription;
+- (id /* NSString */)description;
+- (id /* NSString */)debugDescription;
 @end
 
 namespace swift {
 
-struct String { void *x, *y, *z; };
-
-/// Helper from the standard library for stringizing an arbitrary object.
-extern "C" SWIFT_CC(swift)
-void swift_getSummary(String *out, OpaqueValue *value, const Metadata *T);
-
-// Convert a Swift String to an NSString.
-NSString *convertStringToNSString(String *swiftString);
+id getDescription(OpaqueValue *value, const Metadata *type);
 
 }
 
 #endif
+#endif
+
+namespace swift {
+
+/// Get the NSObject metadata.
+const Metadata *getNSObjectMetadata();
+const Metadata *getNSStringMetadata();
+
+namespace hashable_support {
+const HashableWitnessTable *getNSStringHashableConformance();
+}
+}
 
 #endif

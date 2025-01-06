@@ -17,15 +17,6 @@
 using namespace llvm;
 using swift::SwiftRCIdentity;
 
-// Register this pass...
-char SwiftRCIdentity::ID = 0;
-INITIALIZE_PASS(SwiftRCIdentity, "swift-rc-identity",
-               "Swift RC Identity Analysis", false, true)
-
-bool SwiftRCIdentity::doInitialization(Module &M) {
-  return true;
-}
-
 llvm::Value *
 SwiftRCIdentity::stripPointerCasts(llvm::Value *Val) {
   return Val->stripPointerCasts();
@@ -39,16 +30,16 @@ SwiftRCIdentity::stripReferenceForwarding(llvm::Value *Val) {
   auto Kind = classifyInstruction(*Inst);
   switch(Kind) {
   case RT_RetainN:
-  case RT_UnknownRetainN:
+  case RT_UnknownObjectRetainN:
   case RT_BridgeRetainN:
   case RT_ReleaseN:
-  case RT_UnknownReleaseN:
+  case RT_UnknownObjectReleaseN:
   case RT_BridgeReleaseN:
   case RT_FixLifetime:
   case RT_Retain:
-  case RT_UnknownRetain:
+  case RT_UnknownObjectRetain:
   case RT_Release:
-  case RT_UnknownRelease:
+  case RT_UnknownObjectRelease:
   case RT_Unknown:
   case RT_AllocObject:
   case RT_NoMemoryAccessed:
@@ -86,9 +77,4 @@ SwiftRCIdentity::getSwiftRCIdentityRoot(llvm::Value *Val) {
       return OldVal;
   } while (true);
   return Val;
-}
-
-llvm::ImmutablePass *swift::createSwiftRCIdentityPass() {
-  initializeSwiftRCIdentityPass(*PassRegistry::getPassRegistry());
-  return new SwiftRCIdentity();
 }

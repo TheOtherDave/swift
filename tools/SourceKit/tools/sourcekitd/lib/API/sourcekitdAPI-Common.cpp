@@ -10,12 +10,13 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "DictionaryKeys.h"
+#include "sourcekitd/DictionaryKeys.h"
 #include "sourcekitd/Internal.h"
 #include "sourcekitd/Logging.h"
 #include "sourcekitd/RequestResponsePrinterBase.h"
 #include "SourceKit/Support/Logging.h"
 #include "SourceKit/Support/UIdent.h"
+#include "swift/Basic/StringExtras.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -35,7 +36,7 @@ using llvm::raw_ostream;
 #define KEY(NAME, CONTENT) UIdent sourcekitd::Key##NAME(CONTENT);
 #include "SourceKit/Core/ProtocolUIDs.def"
 
-/// \brief Order for the keys to use when emitting the debug description of
+/// Order for the keys to use when emitting the debug description of
 /// dictionaries.
 static UIdent *OrderedKeys[] = {
 #define KEY(NAME, CONTENT) &Key##NAME,
@@ -115,6 +116,11 @@ public:
       const char *Ptr = sourcekitd_uid_get_string_ptr(UID);
       return static_cast<ImplClass*>(this)->visitUID(StringRef(Ptr, Len));
     }
+    case SOURCEKITD_VARIANT_TYPE_DATA: {
+      const void *Data = sourcekitd_variant_data_get_ptr(Obj);
+      size_t Size = sourcekitd_variant_data_get_size(Obj);
+      return static_cast<ImplClass*>(this)->visitData(Data, Size);
+    }
     }
   }
 };
@@ -127,30 +133,6 @@ public:
     : RequestResponsePrinterBase(OS, Indent, PrintAsJSON) { }
 };
 } // end anonymous namespace
-
-void sourcekitd::writeEscaped(llvm::StringRef Str, llvm::raw_ostream &OS) {
-  for (unsigned i = 0, e = Str.size(); i != e; ++i) {
-    unsigned char c = Str[i];
-
-    switch (c) {
-    case '\\':
-      OS << '\\' << '\\';
-      break;
-    case '\t':
-      OS << '\\' << 't';
-      break;
-    case '\n':
-      OS << '\\' << 'n';
-      break;
-    case '"':
-      OS << '\\' << '"';
-      break;
-    default:
-      OS << c;
-      break;
-    }
-  }
-}
 
 static void printError(sourcekitd_response_t Err, raw_ostream &OS) {
   OS << "error response (";
@@ -184,12 +166,12 @@ void sourcekitd::printResponse(sourcekitd_response_t Resp, raw_ostream &OS) {
     printVariant(sourcekitd_response_get_value(Resp), OS);
 }
 
-static void fatal_error_handler(void *user_data, const std::string& reason,
+static void fatal_error_handler(void *user_data, const char *reason,
                                 bool gen_crash_diag) {
   // Write the result out to stderr avoiding errs() because raw_ostreams can
   // call report_fatal_error.
   // FIXME: Put the error message in the crash report.
-  fprintf(stderr, "SOURCEKITD FATAL ERROR: %s\n", reason.c_str());
+  fprintf(stderr, "SOURCEKITD FATAL ERROR: %s\n", reason);
   ::abort();
 }
 
@@ -219,11 +201,11 @@ void sourcekitd::enableLogging(StringRef LoggerName) {
 static llvm::sys::Mutex GlobalInitMtx;
 static unsigned gInitRefCount = 0;
 
-void sourcekitd_initialize(void) {
+bool sourcekitd::initializeClient() {
   llvm::sys::ScopedLock L(GlobalInitMtx);
   ++gInitRefCount;
   if (gInitRefCount > 1)
-    return;
+    return false;
 
   static std::once_flag flag;
   std::call_once(flag, []() {
@@ -231,18 +213,15 @@ void sourcekitd_initialize(void) {
     sourcekitd::enableLogging("sourcekit");
   });
 
-  LOG_INFO_FUNC(High, "initializing");
-  sourcekitd::initialize();
+  return true;
 }
 
-void sourcekitd_shutdown(void) {
+bool sourcekitd::shutdownClient() {
   llvm::sys::ScopedLock L(GlobalInitMtx);
   --gInitRefCount;
   if (gInitRefCount > 0)
-    return;
-
-  LOG_INFO_FUNC(High, "shutting down");
-  sourcekitd::shutdown();
+    return false;
+  return true;
 }
 
 void
@@ -566,6 +545,26 @@ sourcekitd_variant_string_get_ptr(sourcekitd_variant_t obj) {
   return (const char *)obj.data[1];
 }
 
+size_t
+sourcekitd_variant_data_get_size(sourcekitd_variant_t obj) {
+  if (auto fn = VAR_FN(obj, data_get_size))
+    return fn(obj);
+
+  // Default implementation:
+  // We store the byte's length in data[2] and its data in data[1]
+  return obj.data[2];
+}
+
+const void *
+sourcekitd_variant_data_get_ptr(sourcekitd_variant_t obj) {
+  if (auto fn = VAR_FN(obj, data_get_ptr))
+    return fn(obj);
+
+  // Default implementation:
+  // We store the byte's length in data[2] and its data in data[1]
+  return reinterpret_cast<void *>(obj.data[1]);
+}
+
 sourcekitd_uid_t
 sourcekitd_variant_uid_get_value(sourcekitd_variant_t obj) {
   if (auto fn = VAR_FN(obj, uid_get_value))
@@ -699,7 +698,7 @@ sourcekitd_object_t YAMLRequestParser::createObjFromNode(
     if (!Raw.getAsInteger(10, val))
       return sourcekitd_request_int64_create(val);
 
-    if (Raw.find(' ') != StringRef::npos)
+    if (Raw.contains(' '))
       return withError("Found space in non-string value", Value, Error);
 
     return sourcekitd_request_uid_create(
@@ -761,7 +760,7 @@ bool YAMLRequestParser::parseArray(sourcekitd_object_t Array,
 
 void YAMLRequestParser::initError(StringRef Desc, llvm::yaml::Node *Node,
                                   std::string &Error) {
-  Error = Desc;
+  Error = Desc.str();
   Error += " at: ";
   llvm::SMRange Range = Node->getSourceRange();
   StringRef Text(Range.Start.getPointer(),

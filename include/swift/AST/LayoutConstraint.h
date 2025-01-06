@@ -17,43 +17,25 @@
 #ifndef SWIFT_LAYOUT_CONSTRAINT_H
 #define SWIFT_LAYOUT_CONSTRAINT_H
 
+#include "swift/AST/ASTAllocated.h"
+#include "swift/AST/LayoutConstraintKind.h"
+#include "swift/AST/PrintOptions.h"
 #include "swift/AST/TypeAlignments.h"
+#include "swift/Basic/Debug.h"
 #include "swift/Basic/SourceLoc.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/FoldingSet.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/StringRef.h"
-#include "swift/AST/PrintOptions.h"
 
 namespace swift {
 
-enum class AllocationArena;
-class ASTContext;
 class ASTPrinter;
 
-/// Describes a layout constraint information.
-enum class LayoutConstraintKind : unsigned char {
-  // It is not a known layout constraint.
-  UnknownLayout,
-  // It is a layout constraint representing a trivial type of an unknown size.
-  TrivialOfExactSize,
-  // It is a layout constraint representing a trivial type of an unknown size.
-  TrivialOfAtMostSize,
-  // It is a layout constraint representing a trivial type of an unknown size.
-  Trivial,
-  // It is a layout constraint representing a reference counted class instance.
-  Class,
-  // It is a layout constraint representing a reference counted native class
-  // instance.
-  NativeClass,
-  // It is a layout constraint representing a reference counted object.
-  RefCountedObject,
-  // It is a layout constraint representing a native reference counted object.
-  NativeRefCountedObject,
-  LastLayout = NativeRefCountedObject,
-};
-
 /// This is a class representing the layout constraint.
-class LayoutConstraintInfo : public llvm::FoldingSetNode {
+class LayoutConstraintInfo
+    : public llvm::FoldingSetNode,
+      public ASTAllocated<std::aligned_storage<8, 8>::type> {
   friend class LayoutConstraint;
   // Alignment of the layout in bytes.
   const unsigned Alignment : 16;
@@ -130,6 +112,10 @@ class LayoutConstraintInfo : public llvm::FoldingSetNode {
     return isNativeRefCounted(Kind);
   }
 
+  bool isBridgeObject() const { return isBridgeObject(Kind); }
+
+  bool isTrivialStride() const { return isTrivialStride(Kind); }
+
   unsigned getTrivialSizeInBytes() const {
     assert(isKnownSizeTrivial());
     return (SizeInBits + 7) / 8;
@@ -171,6 +157,16 @@ class LayoutConstraintInfo : public llvm::FoldingSetNode {
     return 8*8;
   }
 
+  unsigned getTrivialStride() const {
+    assert(isTrivialStride());
+    return (SizeInBits + 7) / 8;
+  }
+
+  unsigned getTrivialStrideInBits() const {
+    assert(isTrivialStride());
+    return SizeInBits;
+  }
+
   operator bool() const {
     return isKnownLayout();
   }
@@ -189,10 +185,10 @@ class LayoutConstraintInfo : public llvm::FoldingSetNode {
   std::string getString(const PrintOptions &PO = PrintOptions()) const;
 
   /// Return the name of this layout constraint.
-  StringRef getName() const;
+  StringRef getName(bool internalName = false) const;
 
   /// Return the name of a layout constraint with a given kind.
-  static StringRef getName(LayoutConstraintKind Kind);
+  static StringRef getName(LayoutConstraintKind Kind, bool internalName = false);
 
   static bool isKnownLayout(LayoutConstraintKind Kind);
 
@@ -218,6 +214,10 @@ class LayoutConstraintInfo : public llvm::FoldingSetNode {
 
   static bool isNativeRefCounted(LayoutConstraintKind Kind);
 
+  static bool isBridgeObject(LayoutConstraintKind Kind);
+
+  static bool isTrivialStride(LayoutConstraintKind Kind);
+
   /// Uniquing for the LayoutConstraintInfo.
   void Profile(llvm::FoldingSetNodeID &ID) {
     Profile(ID, Kind, SizeInBits, Alignment);
@@ -227,16 +227,6 @@ class LayoutConstraintInfo : public llvm::FoldingSetNode {
                       LayoutConstraintKind Kind,
                       unsigned SizeInBits,
                       unsigned Alignment);
-  private:
-  // Make vanilla new/delete illegal for LayoutConstraintInfo.
-  void *operator new(size_t Bytes) throw() = delete;
-  void operator delete(void *Data) throw() = delete;
-  public:
-  // Only allow allocation of LayoutConstraintInfo using the allocator in
-  // ASTContext or by doing a placement new.
-  void *operator new(size_t bytes, const ASTContext &ctx,
-                     AllocationArena arena, unsigned alignment = 8);
-  void *operator new(size_t Bytes, void *Mem) throw() { return Mem; }
 
   // Representation of the non-parameterized layouts.
   static LayoutConstraintInfo UnknownLayoutConstraintInfo;
@@ -245,6 +235,7 @@ class LayoutConstraintInfo : public llvm::FoldingSetNode {
   static LayoutConstraintInfo ClassConstraintInfo;
   static LayoutConstraintInfo NativeClassConstraintInfo;
   static LayoutConstraintInfo TrivialConstraintInfo;
+  static LayoutConstraintInfo BridgeObjectConstraintInfo;
 };
 
 /// A wrapper class containing a reference to the actual LayoutConstraintInfo
@@ -281,7 +272,7 @@ class LayoutConstraint {
 
   explicit operator bool() const { return Ptr != 0; }
 
-  void dump() const;
+  SWIFT_DEBUG_DUMP;
   void dump(raw_ostream &os, unsigned indent = 0) const;
 
   void print(raw_ostream &OS, const PrintOptions &PO = PrintOptions()) const;
@@ -289,6 +280,10 @@ class LayoutConstraint {
 
   /// Return the layout constraint as a string, for use in diagnostics only.
   std::string getString(const PrintOptions &PO = PrintOptions()) const;
+
+  friend llvm::hash_code hash_value(const LayoutConstraint &layout) {
+    return hash_value(layout.getPointer());
+  }
 
   bool operator==(LayoutConstraint rhs) const {
     if (isNull() && rhs.isNull())
@@ -299,6 +294,10 @@ class LayoutConstraint {
   bool operator!=(LayoutConstraint rhs) const {
     return !(*this == rhs);
   }
+
+  /// Defines a somewhat arbitrary linear order on layout constraints.
+  /// -1 if this < rhs, 0 if this == rhs, 1 if this > rhs.
+  int compare(LayoutConstraint rhs) const;
 };
 
 // Permit direct uses of isa/cast/dyn_cast on LayoutConstraint.
@@ -328,12 +327,6 @@ public:
 
   bool isError() const;
 
-  // FIXME: We generally shouldn't need to build LayoutConstraintLoc without
-  // a location.
-  static LayoutConstraintLoc withoutLoc(LayoutConstraint Layout) {
-    return LayoutConstraintLoc(Layout, SourceLoc());
-  }
-
   /// Get the representative location of this type, for diagnostic
   /// purposes.
   SourceLoc getLoc() const { return Loc; }
@@ -344,8 +337,6 @@ public:
   LayoutConstraint getLayoutConstraint() const { return Layout; }
 
   bool isNull() const { return Layout.isNull(); }
-
-  LayoutConstraintLoc clone(ASTContext &ctx) const { return *this; }
 };
 
 /// Checks if ID is a name of a layout constraint and returns this
@@ -395,7 +386,7 @@ template <> struct DenseMapInfo<swift::LayoutConstraint> {
 };
 
 // A LayoutConstraint is "pointer like".
-template <> class PointerLikeTypeTraits<swift::LayoutConstraint> {
+template <> struct PointerLikeTypeTraits<swift::LayoutConstraint> {
 public:
   static inline void *getAsVoidPointer(swift::LayoutConstraint I) {
     return (void *)I.getPointer();

@@ -45,8 +45,7 @@ public:
   Explosion &operator=(const Explosion &) = delete;
   Explosion(Explosion &&other) : NextValue(0) {
     // Do an uninitialized copy of the non-consumed elements.
-    Values.reserve(other.size());
-    Values.set_size(other.size());
+    Values.resize_for_overwrite(other.size());
     std::uninitialized_copy(other.begin(), other.end(), Values.begin());
 
     // Remove everything from the other explosion.
@@ -61,6 +60,10 @@ public:
     return *this;
   }
 
+  Explosion(llvm::Value *singleValue) : NextValue(0) {
+    add(singleValue);
+  }
+
   ~Explosion() {
     assert(empty() && "explosion had values remaining when destroyed!");
   }
@@ -73,11 +76,11 @@ public:
     return Values.size() - NextValue;
   }
 
-  typedef SmallVector<llvm::Value*, 8>::iterator iterator;
+  using iterator = SmallVector<llvm::Value *, 8>::iterator;
   iterator begin() { return Values.begin() + NextValue; }
   iterator end() { return Values.end(); }
 
-  typedef SmallVector<llvm::Value*, 8>::const_iterator const_iterator;
+  using const_iterator = SmallVector<llvm::Value *, 8>::const_iterator;
   const_iterator begin() const { return Values.begin() + NextValue; }
   const_iterator end() const { return Values.end(); }
 
@@ -97,18 +100,22 @@ public:
     Values.append(values.begin(), values.end());
   }
 
+  void insert(unsigned index, llvm::Value *value) {
+    Values.insert(Values.begin() + index, value);
+  }
+
   /// Return an array containing the given range of values.  The values
   /// are not claimed.
   ArrayRef<llvm::Value*> getRange(unsigned from, unsigned to) const {
     assert(from <= to);
     assert(to <= Values.size());
-    return llvm::makeArrayRef(begin() + from, to - from);
+    return llvm::ArrayRef(begin() + from, to - from);
   }
 
   /// Return an array containing all of the remaining values.  The values
   /// are not claimed.
   ArrayRef<llvm::Value *> getAll() {
-    return llvm::makeArrayRef(begin(), Values.size() - NextValue);
+    return llvm::ArrayRef(begin(), Values.size() - NextValue);
   }
 
   /// Transfer ownership of the next N values to the given explosion.
@@ -130,10 +137,14 @@ public:
     return Values[NextValue++];
   }
 
+  llvm::Constant *claimNextConstant() {
+    return cast<llvm::Constant>(claimNext());
+  }
+
   /// Claim and return the next N values in this explosion.
   ArrayRef<llvm::Value*> claim(unsigned n) {
     assert(NextValue + n <= Values.size());
-    auto array = llvm::makeArrayRef(begin(), n);
+    auto array = llvm::ArrayRef(begin(), n);
     NextValue += n;
     return array;
   }
@@ -165,6 +176,16 @@ public:
   void reset() {
     NextValue = 0;
     Values.clear();
+  }
+
+  /// Do an operation while borrowing the values from this explosion.
+  template <class Fn>
+  void borrowing(Fn &&fn) {
+    auto savedNextValue = NextValue;
+    fn(*this);
+    assert(empty() &&
+           "didn't claim all values from the explosion during the borrow");
+    NextValue = savedNextValue;
   }
 
   void print(llvm::raw_ostream &OS);
@@ -233,9 +254,9 @@ public:
     return Elements[index];
   }
 
-  typedef SmallVectorImpl<Element>::iterator iterator;
-  typedef SmallVectorImpl<Element>::const_iterator const_iterator;
-  
+  using iterator = SmallVectorImpl<Element>::iterator;
+  using const_iterator = SmallVectorImpl<Element>::const_iterator;
+
   iterator begin() { return Elements.begin(); }
   iterator end() { return Elements.end(); }
   const_iterator begin() const { return Elements.begin(); }
@@ -252,6 +273,63 @@ public:
   ///   - the element type, if the schema contains exactly one element;
   ///   - an anonymous struct type concatenating those types, otherwise.
   llvm::Type *getScalarResultType(IRGenModule &IGM) const;
+};
+
+/// A peepholed explosion of an optional scalar value.
+class OptionalExplosion {
+public:
+  enum Kind {
+    /// The value is known statically to be `Optional.none`.
+    /// The explosion is empty.
+    None,
+
+    /// The value is known statically to be `Optional.some(x)`.
+    /// The explosion is the wrapped value `x`.
+    Some,
+
+    /// It is unknown statically what case the optional is in.
+    /// The explosion is an optional value.
+    Optional
+  };
+
+private:
+  Kind kind;
+  Explosion value;
+
+  OptionalExplosion(Kind kind) : kind(kind) {}
+
+public:
+  static OptionalExplosion forNone() {
+    return None;
+  }
+
+  template <class Fn>
+  static OptionalExplosion forSome(Fn &&fn) {
+    OptionalExplosion result(Some);
+    std::forward<Fn>(fn)(result.value);
+    return result;
+  }
+
+  template <class Fn>
+  static OptionalExplosion forOptional(Fn &&fn) {
+    OptionalExplosion result(Optional);
+    std::forward<Fn>(fn)(result.value);
+    return result;
+  }
+
+  Kind getKind() const { return kind; }
+  bool isNone() const { return kind == None; }
+  bool isSome() const { return kind == Some; }
+  bool isOptional() const { return kind == Optional; }
+
+  Explosion &getSomeExplosion() {
+    assert(kind == Some);
+    return value;
+  }
+  Explosion &getOptionalExplosion() {
+    assert(kind == Optional);
+    return value;
+  }
 };
 
 } // end namespace irgen

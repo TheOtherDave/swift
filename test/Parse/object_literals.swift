@@ -1,6 +1,7 @@
 // RUN: %target-typecheck-verify-swift
 
-let _ = [##] // expected-error{{expected identifier after '#' in object literal expression}} expected-error{{object literal syntax no longer uses '[# ... #]'}} {{9-10=}} {{11-13=}}
-let _ = [#what#] // expected-error{{object literal syntax no longer uses '[# ... #]'}} {{9-10=}} {{15-17=}}
-let _ = [#what()#] // expected-error{{object literal syntax no longer uses '[# ... #]'}} {{9-10=}} {{17-19=}}
-let _ = [#colorLiteral( // expected-error@+1 {{expected expression in list of expressions}}
+let _ = #notAPound // expected-error {{no macro named 'notAPound'}}
+let _ = #notAPound(1, 2) // expected-error {{no macro named 'notAPound'}}
+let _ = #Color // expected-error {{no macro named 'Color'}}
+
+let _ = [##] // expected-error {{expected a macro identifier}} {{none}}

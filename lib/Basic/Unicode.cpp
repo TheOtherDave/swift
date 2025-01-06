@@ -10,7 +10,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Unicode.h"
+#include "swift/Basic/Compiler.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/ConvertUTF.h"
 
@@ -27,7 +30,22 @@ using namespace swift;
 // break between them. That is, whether we're overriding the behavior of the
 // hard coded Unicode 8 rules surrounding ZWJ and emoji modifiers.
 static inline bool graphemeBreakOverride(llvm::UTF32 lhs, llvm::UTF32 rhs) {
-  return lhs == 0x200D || (rhs >= 0x1F3FB && rhs <= 0x1F3FF);
+  // Assume ZWJ sequences produce new emoji
+  if (lhs == 0x200D) {
+    return true;
+  }
+
+  // Permit continuing regional indicators
+  if (rhs >= 0x1F3FB && rhs <= 0x1F3FF) {
+    return true;
+  }
+
+  // Permit emoji tag sequences
+  if (rhs >= 0xE0020 && rhs <= 0xE007F) {
+    return true;
+  }
+
+  return false;
 }
 
 StringRef swift::unicode::extractFirstExtendedGraphemeCluster(StringRef S) {
@@ -52,9 +70,6 @@ StringRef swift::unicode::extractFirstExtendedGraphemeCluster(StringRef S) {
 
   GraphemeClusterBreakProperty GCBForC0 = getGraphemeClusterBreakProperty(C[0]);
   while (true) {
-    if (isExtendedGraphemeClusterBoundaryAfter(GCBForC0))
-      return S.slice(0, SourceNext - SourceStart);
-
     size_t C1Offset = SourceNext - SourceStart;
     ConvertUTF8toUTF32(&SourceNext, SourceStart + S.size(), &TargetStart, C + 2,
                        llvm::lenientConversion);
@@ -112,21 +127,32 @@ unsigned swift::unicode::extractFirstUnicodeScalar(StringRef S) {
   return Scalar;
 }
 
-uint64_t swift::unicode::getUTF16Length(StringRef Str) {
-  uint64_t Length;
-  // Transcode the string to UTF-16 to get its length.
-  SmallVector<llvm::UTF16, 128> buffer(Str.size() + 1); // +1 for ending nulls.
-  const llvm::UTF8 *fromPtr = (const llvm::UTF8 *) Str.data();
-  llvm::UTF16 *toPtr = &buffer[0];
-  llvm::ConversionResult Result =
-    ConvertUTF8toUTF16(&fromPtr, fromPtr + Str.size(),
-                       &toPtr, toPtr + Str.size(),
-                       llvm::strictConversion);
-  assert(Result == llvm::conversionOK &&
-         "UTF-8 encoded string cannot be converted into UTF-16 encoding");
-  (void)Result;
+bool swift::unicode::isWellFormedUTF8(StringRef S) {
+  const llvm::UTF8 *begin = S.bytes_begin();
+  return llvm::isLegalUTF8String(&begin, S.bytes_end());
+}
 
-  // The length of the transcoded string in UTF-16 code points.
-  Length = toPtr - &buffer[0];
-  return Length;
+std::string swift::unicode::sanitizeUTF8(StringRef Text) {
+  llvm::SmallString<256> Builder;
+  Builder.reserve(Text.size());
+  const llvm::UTF8* Data = reinterpret_cast<const llvm::UTF8*>(Text.begin());
+  const llvm::UTF8* End = reinterpret_cast<const llvm::UTF8*>(Text.end());
+  StringRef Replacement = SWIFT_UTF8("\ufffd");
+  while (Data < End) {
+    auto Step = llvm::getNumBytesForUTF8(*Data);
+    if (Data + Step > End) {
+      Builder.append(Replacement);
+      break;
+    }
+
+    if (llvm::isLegalUTF8Sequence(Data, Data + Step)) {
+      Builder.append(Data, Data + Step);
+    } else {
+
+      // If malformed, add replacement characters.
+      Builder.append(Replacement);
+    }
+    Data += Step;
+  }
+  return std::string(Builder.str());
 }

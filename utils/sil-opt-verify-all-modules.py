@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # utils/sil-opt-verify-all-modules.py - Verifies Swift modules -*- python -*-
 #
 # This source file is part of the Swift.org open source project
@@ -9,13 +9,11 @@
 # See https://swift.org/LICENSE.txt for license information
 # See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 
-from __future__ import print_function
-
 import argparse
 import glob
 import multiprocessing
 import os
-import pipes
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -61,10 +59,7 @@ def get_verify_resource_dir_modules_commands(
     known_platforms = [
         ('appletvos', 'arm64', 'arm64-apple-tvos9.0'),
         ('appletvsimulator', 'x86_64', 'x86_64-apple-tvos9.0'),
-        ('iphoneos', 'armv7', 'armv7-apple-ios7.0'),
-        ('iphoneos', 'armv7s', 'armv7s-apple-ios7.0'),
         ('iphoneos', 'arm64', 'arm64-apple-ios7.0'),
-        ('iphonesimulator', 'i386', 'i386-apple-ios7.0'),
         ('iphonesimulator', 'x86_64', 'x86_64-apple-ios7.0'),
         ('macosx', 'x86_64', 'x86_64-apple-macosx10.9'),
         ('watchos', 'armv7k', 'armv7k-apple-watchos2.0'),
@@ -96,7 +91,7 @@ def get_verify_resource_dir_modules_commands(
 
 
 def quote_shell_command(args):
-    return " ".join([pipes.quote(a) for a in args])
+    return " ".join([shlex.quote(a) for a in args])
 
 
 def run_commands_in_parallel(commands):

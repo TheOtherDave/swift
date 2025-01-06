@@ -25,24 +25,30 @@ three different optimization levels:
 
 - ``-Onone``: This is meant for normal development. It performs minimal
   optimizations and preserves all debug info.
-- ``-O``: This is meant for most production code. The compiler performs
+- ``-Osize``: This is meant for most production code. The compiler performs
   aggressive optimizations that can drastically change the type and amount of
   emitted code. Debug information will be emitted but will be lossy.
-- ``-Ounchecked``: This is a special optimization mode meant for specific
-  libraries or applications where one is willing to trade safety for
-  performance.  The compiler will remove all overflow checks as well as some
-  implicit type checks.  This is not intended to be used in general since it may
-  result in undetected memory safety issues and integer overflows. Only use this
-  if you have carefully reviewed that your code is safe with respect to integer
-  overflow and type casts.
+- ``-O``: This is a special optimization mode where the compiler prioritizes
+  performance over code size.
 
 In the Xcode UI, one can modify the current optimization level as follows:
 
-...
+In the Project Navigator, select the project icon to enter the Project Editor.
+In the project editor, select the icon under the "Project" header to enter
+the project settings editor. From there, an optimization setting can be applied
+to every target in the project by changing the "Optimization Level" field under
+the "Build Settings" header.
 
+To apply a custom optimization level to a particular target, select that target
+under the "Targets" header in the Project Editor and override the
+"Optimization Level" field under its "Build Settings" header.
 
-Whole Module Optimizations
-==========================
+If a given optimization level is not available in the UI, its corresponding flag
+can be manually specified by selecting the ``Other...`` level in
+the "Optimization Level" dropdown.
+
+Whole Module Optimizations (WMO)
+================================
 
 By default Swift compiles each file individually. This allows Xcode to
 compile multiple files in parallel very quickly. However, compiling
@@ -53,8 +59,11 @@ mode is enabled using the ``swiftc`` command line flag
 ``-whole-module-optimization``. Programs that are compiled in this
 mode will most likely take longer to compile, but may run faster.
 
-This mode can be enabled using the Xcode build setting 'Whole Module Optimization'.
+This mode can be enabled using the Xcode build setting 'Whole Module
+Optimization'.
 
+NOTE: In sections below, for brevity purposes, we will refer to 'Whole
+Module Optimization' by the abbreviation 'WMO'.
 
 Reducing Dynamic Dispatch
 =========================
@@ -72,7 +81,7 @@ Classes use dynamic dispatch for methods and property accesses by default. Thus
 in the following code snippet, ``a.aProperty``, ``a.doSomething()`` and
 ``a.doSomethingElse()`` will all be invoked via dynamic dispatch:
 
-::
+.. code-block:: swift
 
   class A {
     var aProperty: [Int]
@@ -80,7 +89,7 @@ in the following code snippet, ``a.aProperty``, ``a.doSomething()`` and
     dynamic doSomethingElse() { ... }
   }
 
-  class B : A {
+  class B: A {
     override var aProperty {
       get { ... }
       set { ... }
@@ -111,7 +120,7 @@ compiler can emit direct function calls instead of indirect calls. For instance
 in the following ``C.array1`` and ``D.array1`` will be accessed directly
 [#]_. In contrast, ``D.array2`` will be called via a vtable:
 
-::
+.. code-block:: swift
 
   final class C {
     // No declarations in class 'C' can be overridden.
@@ -125,13 +134,13 @@ in the following ``C.array1`` and ``D.array1`` will be accessed directly
   }
 
   func usingC(_ c: C) {
-     c.array1[i] = ... // Can directly access C.array without going through dynamic dispatch.
-     c.doSomething() = ... // Can directly call C.doSomething without going through virtual dispatch.
+    c.array1[i] = ... // Can directly access C.array without going through dynamic dispatch.
+    c.doSomething()   // Can directly call C.doSomething without going through virtual dispatch.
   }
 
   func usingD(_ d: D) {
-     d.array1[i] = ... // Can directly access D.array1 without going through dynamic dispatch.
-     d.array2[i] = ... // Will access D.array2 through dynamic dispatch.
+    d.array1[i] = ... // Can directly access D.array1 without going through dynamic dispatch.
+    d.array2[i] = ... // Will access D.array2 through dynamic dispatch.
   }
 
 Advice: Use 'private' and 'fileprivate' when declaration does not need to be accessed outside of file
@@ -146,25 +155,39 @@ and field accesses accordingly. For instance in the following,
 ``e.doSomething()`` and ``f.myPrivateVar``, will be able to be accessed directly
 assuming ``E``, ``F`` do not have any overriding declarations in the same file:
 
-::
+.. code-block:: swift
 
   private class E {
     func doSomething() { ... }
   }
 
   class F {
-    fileprivate var myPrivateVar : Int
+    fileprivate var myPrivateVar: Int
   }
 
   func usingE(_ e: E) {
     e.doSomething() // There is no sub class in the file that declares this class.
                     // The compiler can remove virtual calls to doSomething()
-                    // and directly call A's doSomething method.
+                    // and directly call E's doSomething method.
   }
 
   func usingF(_ f: F) -> Int {
     return f.myPrivateVar
   }
+
+Advice: If WMO is enabled, use 'internal' when a declaration does not need to be accessed outside of module
+-----------------------------------------------------------------------------------------------------------
+
+WMO (see section above) causes the compiler to compile a module's
+sources all together at once. This allows the optimizer to have module
+wide visibility when compiling individual declarations. Since an
+internal declaration is not visible outside of the current module, the
+optimizer can then infer `final` by automatically discovering all
+potentially overriding declarations.
+
+NOTE: Since in Swift the default access control level is ``internal``
+anyways, by enabling Whole Module Optimization, one can gain
+additional devirtualization without any further work.
 
 Using Container Types Efficiently
 =================================
@@ -182,20 +205,20 @@ that value types cannot be included inside an NSArray. Thus when using value
 types, the optimizer can remove most of the overhead in Array that is necessary
 to handle the possibility of the array being backed an NSArray.
 
-Additionally, In contrast to reference types, value types only need reference
+Additionally, in contrast to reference types, value types only need reference
 counting if they contain, recursively, a reference type. By using value types
 without reference types, one can avoid additional retain, release traffic inside
 Array.
 
-::
+.. code-block:: swift
 
   // Don't use a class here.
   struct PhonebookEntry {
-    var name : String
-    var number : [Int]
+    var name: String
+    var number: [Int]
   }
 
-  var a : [PhonebookEntry]
+  var a: [PhonebookEntry]
 
 Keep in mind that there is a trade-off between using large value types and using
 reference types. In certain cases, the overhead of copying and moving around
@@ -208,7 +231,7 @@ Advice: Use ContiguousArray with reference types when NSArray bridging is unnece
 If you need an array of reference types and the array does not need to be
 bridged to NSArray, use ContiguousArray instead of Array:
 
-::
+.. code-block:: swift
 
   class C { ... }
   var a: ContiguousArray<C> = [C(...), C(...), ..., C(...)]
@@ -222,10 +245,10 @@ this allows the compiler to elide unnecessary copies by retaining the container
 instead of performing a deep copy. This is done by only copying the underlying
 container if the reference count of the container is greater than 1 and the
 container is mutated. For instance in the following, no copying will occur when
-``d`` is assigned to ``c``, but when ``d`` undergoes structural mutation by
+``c`` is assigned to ``d``, but when ``d`` undergoes structural mutation by
 appending ``2``, ``d`` will be copied and then ``2`` will be appended to ``d``:
 
-::
+.. code-block:: swift
 
   var c: [Int] = [ ... ]
   var d = c        // No copy will occur here.
@@ -237,9 +260,10 @@ object-reassignment in functions. In Swift, all parameters are passed in at +1,
 i.e. the parameters are retained before a callsite, and then are released at the
 end of the callee. This means that if one writes a function like the following:
 
-::
+.. code-block:: swift
 
   func append_one(_ a: [Int]) -> [Int] {
+    var a = a
     a.append(1)
     return a
   }
@@ -251,7 +275,7 @@ end of the callee. This means that if one writes a function like the following:
 has no uses after ``append_one`` due to the assignment. This can be avoided
 through the usage of ``inout`` parameters:
 
-::
+.. code-block:: swift
 
   func append_one_in_place(a: inout [Int]) {
     a.append(1)
@@ -260,29 +284,36 @@ through the usage of ``inout`` parameters:
   var a = [1, 2, 3]
   append_one_in_place(&a)
 
-Unchecked operations
+Wrapping operations
 ====================
 
 Swift eliminates integer overflow bugs by checking for overflow when performing
-normal arithmetic. These checks are not appropriate in high performance code
-where one knows that no memory safety issues can result.
+normal arithmetic. These checks may not be appropriate in high performance code
+if one either knows that overflow cannot occur, or that the result of
+allowing the operation to wrap around is correct.
 
-Advice: Use unchecked integer arithmetic when you can prove that overflow cannot occur
+Advice: Use wrapping integer arithmetic when you can prove that overflow cannot occur
 ---------------------------------------------------------------------------------------
 
-In performance-critical code you can elide overflow checks if you know it is
-safe.
+In performance-critical code you can use wrapping arithmetic to avoid overflow
+checks if you know it is safe.
 
-::
+.. code-block:: swift
 
-  a : [Int]
-  b : [Int]
-  c : [Int]
+  a: [Int]
+  b: [Int]
+  c: [Int]
 
-  // Precondition: for all a[i], b[i]: a[i] + b[i] does not overflow!
+  // Precondition: for all a[i], b[i]: a[i] + b[i] either does not overflow,
+  // or the result of wrapping is desired.
   for i in 0 ... n {
     c[i] = a[i] &+ b[i]
   }
+
+It's important to note that the behavior of the ``&+``, ``&-``, and ``&*``
+operators is fully-defined; the result simply wraps around if it would overflow.
+Thus, ``Int.max &+ 1`` is guaranteed to be ``Int.min`` (unlike in C, where
+``INT_MAX + 1`` is undefined behavior).
 
 Generics
 ========
@@ -295,7 +326,7 @@ behavior between ``MySwiftFunc<Int>`` and ``MySwiftFunc<String>`` are accounted
 for by passing a different table of function pointers and the size abstraction
 provided by the box. An example of generics:
 
-::
+.. code-block:: swift
 
   class MySwiftFunc<T> { ... }
 
@@ -310,14 +341,14 @@ generic function specialized to the specific type. This process, called
 *specialization*, enables the removal of the overhead associated with
 generics. Some more examples of generics:
 
-::
+.. code-block:: swift
 
   class MyStack<T> {
     func push(_ element: T) { ... }
     func pop() -> T { ... }
   }
 
-  func myAlgorithm(_ a: [T], length: Int) { ... }
+  func myAlgorithm<T>(_ a: [T], length: Int) { ... }
 
   // The compiler can specialize code of MyStack<Int>
   var stackOfInts: MyStack<Int>
@@ -363,15 +394,15 @@ represented as values, so this example is somewhat realistic.
 .. See Protocol-Oriented-Programming:
 .. https://developer.apple.com/videos/play/wwdc2015-408/
 
-::
+.. code-block:: swift
 
   protocol P {}
-  struct Node : P {
-    var left, right : P?
+  struct Node: P {
+    var left, right: P?
   }
 
   struct Tree {
-    var node : P?
+    var node: P?
     init() { ... }
   }
 
@@ -398,10 +429,10 @@ wrapping it in an array. This simple change has a major impact on the
 performance of our tree data structure, and the cost of passing the array as an
 argument drops from being O(n), depending on the size of the tree to O(1).
 
-::
+.. code-block:: swift
 
-  struct Tree : P {
-    var node : [P?]
+  struct Tree: P {
+    var node: [P?]
     init() {
       node = [thing]
     }
@@ -430,27 +461,27 @@ construct such a data structure:
 .. More details in this blog post by Mike Ash:
 .. https://www.mikeash.com/pyblog/friday-qa-2015-04-17-lets-build-swiftarray.html
 
-::
+.. code-block:: swift
 
   final class Ref<T> {
-    var val : T
-    init(_ v : T) {val = v}
+    var val: T
+    init(_ v: T) { val = v }
   }
 
   struct Box<T> {
-      var ref : Ref<T>
-      init(_ x : T) { ref = Ref(x) }
+    var ref: Ref<T>
+    init(_ x: T) { ref = Ref(x) }
 
-      var value: T {
-          get { return ref.val }
-          set {
-            if (!isUniquelyReferencedNonObjC(&ref)) {
-              ref = Ref(newValue)
-              return
-            }
-            ref.val = newValue
-          }
+    var value: T {
+      get { return ref.val }
+      set {
+        if !isKnownUniquelyReferenced(&ref) {
+          ref = Ref(newValue)
+          return
+        }
+        ref.val = newValue
       }
+    }
   }
 
 The type ``Box`` can replace the array in the code sample above.
@@ -467,12 +498,12 @@ the reference Swift will increment the reference count of the ``next`` object
 and decrement the reference count of the previous object. These reference
 count operations are expensive and unavoidable when using Swift classes.
 
-::
+.. code-block:: swift
 
   final class Node {
-   var next: Node?
-   var data: Int
-   ...
+    var next: Node?
+    var data: Int
+    ...
   }
 
 
@@ -492,32 +523,32 @@ instance held by the ``Unmanaged`` struct instance for the duration of the use
 of ``Unmanaged`` (see `Unmanaged.swift`_ for more details) that keeps the instance
 alive.
 
-::
+.. code-block:: swift
 
-    // The call to ``withExtendedLifetime(Head)`` makes sure that the lifetime of
-    // Head is guaranteed to extend over the region of code that uses Unmanaged
-    // references. Because there exists a reference to Head for the duration
-    // of the scope and we don't modify the list of ``Node``s there also exist a
-    // reference through the chain of ``Head.next``, ``Head.next.next``, ...
-    // instances.
+  // The call to ``withExtendedLifetime(Head)`` makes sure that the lifetime of
+  // Head is guaranteed to extend over the region of code that uses Unmanaged
+  // references. Because there exists a reference to Head for the duration
+  // of the scope and we don't modify the list of ``Node``s there also exist a
+  // reference through the chain of ``Head.next``, ``Head.next.next``, ...
+  // instances.
 
-    withExtendedLifetime(Head) {
+  withExtendedLifetime(Head) {
 
-      // Create an Unmanaged reference.
-      var Ref : Unmanaged<Node> = Unmanaged.passUnretained(Head)
+    // Create an Unmanaged reference.
+    var Ref: Unmanaged<Node> = Unmanaged.passUnretained(Head)
 
-      // Use the unmanaged reference in a call/variable access. The use of
-      // _withUnsafeGuaranteedRef allows the compiler to remove the ultimate
-      // retain/release across the call/access.
+    // Use the unmanaged reference in a call/variable access. The use of
+    // _withUnsafeGuaranteedRef allows the compiler to remove the ultimate
+    // retain/release across the call/access.
 
-      while let Next = Ref._withUnsafeGuaranteedRef { $0.next } {
-        ...
-        Ref = Unmanaged.passUnretained(Next)
-      }
+    while let Next = Ref._withUnsafeGuaranteedRef { $0.next } {
+      ...
+      Ref = Unmanaged.passUnretained(Next)
     }
+  }
 
 
-.. _Unmanaged.swift: https://github.com/apple/swift/blob/master/stdlib/public/core/Unmanaged.swift
+.. _Unmanaged.swift: https://github.com/swiftlang/swift/blob/main/stdlib/public/core/Unmanaged.swift
 
 Protocols
 =========
@@ -536,12 +567,44 @@ to retain or release non-trivial structures, which can be expensive.
 If it makes sense to limit the adoption of protocols to classes then mark
 protocols as class-only protocols to get better runtime performance.
 
-::
+.. code-block:: swift
 
-  protocol Pingable : class { func ping() -> Int }
+  protocol Pingable: AnyObject { func ping() -> Int }
 
 .. https://developer.apple.com/library/ios/documentation/Swift/Conceptual/Swift_Programming_Language/Protocols.html
 
+The Cost of Let/Var when Captured by Escaping Closures
+======================================================
+
+While one may think that the distinction in between let/var is just
+about language semantics, there are also performance
+considerations. Remember that any time one creates a binding for a
+closure, one is forcing the compiler to emit an escaping closure,
+e.x.:
+
+.. code-block:: swift
+
+  let f: () -> () = { ... } // Escaping closure
+  // Contrasted with:
+  ({ ... })() // Non Escaping closure
+  x.map { ... } // Non Escaping closure
+
+When a var is captured by an escaping closure, the compiler must
+allocate a heap box to store the var so that both the closure
+creator/closure can read/write to the value. This even includes
+situations where the underlying type of the captured binding is
+trivial! In contrast, when captured a `let` is captured by value. As
+such, the compiler stores a copy of the value directly into the
+closure's storage without needing a box.
+
+Advice: Pass var as an `inout` if closure not actually escaping
+---------------------------------------------------------------
+
+If one is using an escaping closure for expressivity purposes, but is
+actually using a closure locally, pass vars as inout parameters
+instead of by using captures. The inout will ensure that a heap box is
+not allocated for the variables and avoid any retain/release traffic
+from the heap box being passed around.
 
 Unsupported Optimization Attributes
 ===================================

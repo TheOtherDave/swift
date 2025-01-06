@@ -1,4 +1,5 @@
 // RUN: %target-typecheck-verify-swift
+// RUN: not %target-swift-frontend -c %s -diagnostic-style llvm 2>&1 | %FileCheck %s
 
 let x = 0 // We need this because of the #sourceLocation-ends-with-a-newline requirement.
 
@@ -22,8 +23,15 @@ x x // expected-error{{consecutive statements}} {{2-2=;}}
 // expected-warning @-1 2 {{unused}}
 
 // rdar://19582475
-public struct S { // expected-note{{in declaration of 'S'}}
-// expected-error@+1{{expected declaration}}
+public struct S {
+// expected-error@+8{{expected 'func' keyword in operator function declaration}}
+// expected-error@+7{{operator '/' declared in type 'S' must be 'static'}}
+// expected-error@+6{{expected '(' in argument list of function declaration}}
+// expected-error@+5{{operators must have one or two arguments}}
+// expected-error@+4{{member operator '/()' must have at least one argument of type 'S'}}
+// expected-error@+3{{expected '{' in body of function declaration}}
+// expected-error@+2 {{consecutive declarations on a line must be separated by ';}}
+// expected-error@+1 {{expected a macro identifier}}
 / ###line 25 "line-directive.swift"
 }
 // expected-error@+1{{#line directive was renamed to #sourceLocation}}
@@ -41,15 +49,33 @@ LABEL:
 #line 200 "labeled.swift"
 #sourceLocation()
 
+// https://github.com/apple/swift/issues/47817
 class C {
-#sourceLocation(file: "sr5242.swift", line: 100)
+#sourceLocation(file: "issue-47817.swift", line: 100)
     func foo() {}
     let bar = 12
-#sourceLocation(file: "sr5242.swift", line: 200)
+#sourceLocation(file: "issue-47817", line: 200)
 }
 enum E {
-#sourceLocation(file: "sr5242.swift", line: 300)
+#sourceLocation(file: "issue-47817", line: 300)
     case A, B
     case C, D
 #sourceLocation()
 }
+
+// https://github.com/apple/swift/issues/51280
+#sourceLocation(file: "issue-51280.swift", line: 400)
+2., 3
+// CHECK: issue-51280.swift:400:2: error: expected member name following '.'
+// CHECK: issue-51280.swift:400:3: error: consecutive statements on a line must be separated by ';'
+// CHECK: issue-51280.swift:400:3: error: expected expression
+
+// https://github.com/apple/swift/issues/55049
+class I55049 {
+#sourceLocation(file: "issue-55049.swift", line: 1_000)
+    let bar = 12
+#sourceLocation(file: "issue-55049.swift", line: 2_000)
+}
+
+#line 1_000 "issue-55049.swift"
+class I55049_1 {}

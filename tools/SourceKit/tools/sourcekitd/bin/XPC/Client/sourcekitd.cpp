@@ -12,7 +12,6 @@
 
 #include "sourcekitd/Internal-XPC.h"
 #include "SourceKit/Support/Logging.h"
-#include "SourceKit/Support/Tracing.h"
 #include "SourceKit/Support/UIdent.h"
 
 #include "llvm/Support/ErrorHandling.h"
@@ -29,11 +28,6 @@ using namespace sourcekitd;
 static UIdent gKeyNotification("key.notification");
 static UIdent gKeyDuration("key.duration");
 static UIdent gSemaDisableNotificationUID("source.notification.sema_disabled");
-
-void handleTraceMessageRequest(uint64_t Session, xpc_object_t Msg);
-void initializeTracing();
-void persistTracingData();
-bool isTracingEnabled();
 
 static llvm::sys::Mutex GlobalHandlersMtx;
 static sourcekitd_uid_handler_t UidMappingHandler;
@@ -112,6 +106,14 @@ sourcekitd_set_notification_handler(sourcekitd_response_receiver_t receiver) {
 // sourcekitd_request_sync
 //===----------------------------------------------------------------------===//
 
+/// Create a new SourceKit request handle. Each call of this method is
+/// guaranteed to return a new, unique handle.
+static sourcekitd_request_handle_t create_request_handle(void) {
+  static std::atomic<size_t> handle(1);
+  return reinterpret_cast<sourcekitd_request_handle_t>(
+      handle.fetch_add(1, std::memory_order_relaxed));
+}
+
 static xpc_connection_t getGlobalConnection();
 
 static bool ConnectionInterrupted = false;
@@ -128,11 +130,11 @@ sourcekitd_response_t sourcekitd_send_request_sync(sourcekitd_object_t req) {
   }
 
   xpc_connection_t Conn = getGlobalConnection();
-  xpc_object_t contents = xpc_array_create(nullptr, 0);
+  xpc_object_t contents = xpc_array_create_empty();
   xpc_array_append_value(contents, req);
 
-  xpc_object_t msg = xpc_dictionary_create(nullptr, nullptr,  0);
-  xpc_dictionary_set_value(msg, "msg", contents);
+  xpc_object_t msg = xpc_dictionary_create_empty();
+  xpc_dictionary_set_value(msg, xpc::KeyMsg, contents);
   xpc_release(contents);
 
   xpc_object_t reply = xpc_connection_send_message_with_reply_sync(Conn, msg);
@@ -159,7 +161,11 @@ sourcekitd_response_t sourcekitd_send_request_sync(sourcekitd_object_t req) {
 void sourcekitd_send_request(sourcekitd_object_t req,
                              sourcekitd_request_handle_t *out_handle,
                              sourcekitd_response_receiver_t receiver) {
-  // FIXME: Implement request handle.
+  sourcekitd_request_handle_t request_handle = nullptr;
+  if (out_handle) {
+    request_handle = create_request_handle();
+    *out_handle = request_handle;
+  }
 
   LOG_SECTION("sourcekitd_send_request-before", InfoHighPrio) {
     // Requests will be printed in Requests.cpp, print them out here as well.
@@ -173,11 +179,15 @@ void sourcekitd_send_request(sourcekitd_object_t req,
   }
 
   xpc_connection_t Conn = getGlobalConnection();
-  xpc_object_t contents = xpc_array_create(nullptr, 0);
+  xpc_object_t contents = xpc_array_create_empty();
   xpc_array_append_value(contents, req);
 
-  xpc_object_t msg = xpc_dictionary_create(nullptr, nullptr,  0);
-  xpc_dictionary_set_value(msg, "msg", contents);
+  xpc_object_t msg = xpc_dictionary_create_empty();
+  xpc_dictionary_set_value(msg, xpc::KeyMsg, contents);
+  if (request_handle) {
+    xpc_dictionary_set_uint64(msg, xpc::KeyCancelToken,
+                              reinterpret_cast<uint64_t>(request_handle));
+  }
   xpc_release(contents);
 
   dispatch_queue_t queue
@@ -207,7 +217,25 @@ void sourcekitd_send_request(sourcekitd_object_t req,
 }
 
 void sourcekitd_cancel_request(sourcekitd_request_handle_t handle) {
-  // FIXME: Implement cancelling.
+  xpc_connection_t conn = getGlobalConnection();
+  xpc_object_t msg = xpc_dictionary_create_empty();
+  xpc_dictionary_set_uint64(msg, xpc::KeyCancelRequest,
+                            reinterpret_cast<uint64_t>(handle));
+
+  xpc_connection_send_message(conn, msg);
+
+  xpc_release(msg);
+}
+
+void sourcekitd_request_handle_dispose(sourcekitd_request_handle_t handle) {
+  xpc_connection_t conn = getGlobalConnection();
+  xpc_object_t msg = xpc_dictionary_create_empty();
+  xpc_dictionary_set_uint64(msg, xpc::KeyDisposeRequestHandle,
+                            reinterpret_cast<uint64_t>(handle));
+
+  xpc_connection_send_message(conn, msg);
+
+  xpc_release(msg);
 }
 
 /// To avoid repeated crashes, used to notify the service to delay typechecking
@@ -218,7 +246,6 @@ static void handleInternalInitRequest(xpc_object_t reply) {
   size_t Delay = SemanticEditorDelaySecondsNum;
   if (Delay != 0)
     xpc_dictionary_set_uint64(reply, xpc::KeySemaEditorDelay, Delay);
-  xpc_dictionary_set_uint64(reply, xpc::KeyTracingEnabled, isTracingEnabled());
 }
 
 static void handleInternalUIDRequest(xpc_object_t XVal,
@@ -247,9 +274,7 @@ static void handleInternalUIDRequest(xpc_object_t XVal,
 
 static void handleInterruptedConnection(xpc_object_t event, xpc_connection_t conn);
 
-void sourcekitd::initialize() {
-  initializeTracing();
-
+static void initializeXPCClient() {
   assert(!GlobalConn);
   GlobalConn = xpc_connection_create(SOURCEKIT_XPCSERVICE_IDENTIFIER, nullptr);
 
@@ -311,15 +336,6 @@ void sourcekitd::initialize() {
         xpc_release(reply);
         break;
       }
-
-      case xpc::Message::TraceMessage: {
-        xpc_object_t reply = xpc_dictionary_create_reply(event);
-        handleTraceMessageRequest(xpc_array_get_uint64(contents, 1),
-                                  xpc_array_get_value(contents, 2));
-        xpc_connection_send_message(GlobalConn, reply);
-        xpc_release(reply);
-        break;
-      }
       }
     }
   });
@@ -327,9 +343,19 @@ void sourcekitd::initialize() {
   xpc_connection_resume(GlobalConn);
 }
 
-void sourcekitd::shutdown() {
-  assert(GlobalConn);
-  xpc_connection_cancel(GlobalConn);
+void sourcekitd_initialize(void) {
+  if (sourcekitd::initializeClient()) {
+    LOG_INFO_FUNC(High, "initializing");
+    initializeXPCClient();
+  }
+}
+
+void sourcekitd_shutdown(void) {
+  if (sourcekitd::shutdownClient()) {
+    LOG_INFO_FUNC(High, "shutting down");
+    assert(GlobalConn);
+    xpc_connection_cancel(GlobalConn);
+  }
 }
 
 static xpc_connection_t getGlobalConnection() {
@@ -341,7 +367,7 @@ static xpc_connection_t getGlobalConnection() {
 static void pingService(xpc_connection_t ping_conn) {
   LOG_WARN_FUNC("pinging service");
 
-  xpc_object_t ping_msg = xpc_dictionary_create(nullptr, nullptr, 0);
+  xpc_object_t ping_msg = xpc_dictionary_create_empty();
   xpc_dictionary_set_bool(ping_msg, "ping", true);
 
   dispatch_queue_t queue
@@ -444,7 +470,6 @@ static void updateSemanticEditorDelay() {
 static void handleInterruptedConnection(xpc_object_t event, xpc_connection_t conn) {
   ConnectionInterrupted = true;
 
-  persistTracingData();
   updateSemanticEditorDelay();
 
   // FIXME: InterruptedConnectionHandler will go away.

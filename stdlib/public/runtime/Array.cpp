@@ -22,6 +22,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "BytecodeLayouts.h"
 #include "swift/Runtime/Config.h"
 #include "swift/Runtime/HeapObject.h"
 #include "swift/Runtime/Metadata.h"
@@ -110,6 +111,16 @@ static void array_copy_operation(OpaqueValue *dest, OpaqueValue *src,
 
   // Call the witness to do the copy.
   if (copyKind == ArrayCopy::NoAlias || copyKind == ArrayCopy::FrontToBack) {
+    if (self->hasLayoutString() && destOp == ArrayDest::Init &&
+        srcOp == ArraySource::Copy) {
+      return swift_generic_arrayInitWithCopy(dest, src, count, stride, self);
+    }
+
+    if (self->hasLayoutString() && destOp == ArrayDest::Assign &&
+        srcOp == ArraySource::Copy) {
+      return swift_generic_arrayAssignWithCopy(dest, src, count, stride, self);
+    }
+
     auto copy = get_witness_function<destOp, srcOp>(wtable);
     for (size_t i = 0; i < count; ++i) {
       auto offset = i * stride;
@@ -134,7 +145,6 @@ static void array_copy_operation(OpaqueValue *dest, OpaqueValue *src,
   } while (i != 0);
 }
 
-SWIFT_CC(c)
 SWIFT_RUNTIME_EXPORT
 void swift_arrayInitWithCopy(OpaqueValue *dest, OpaqueValue *src, size_t count,
                              const Metadata *self) {
@@ -142,7 +152,6 @@ void swift_arrayInitWithCopy(OpaqueValue *dest, OpaqueValue *src, size_t count,
       dest, src, count, self);
 }
 
-SWIFT_CC(c)
 SWIFT_RUNTIME_EXPORT
 void swift_arrayInitWithTakeNoAlias(OpaqueValue *dest, OpaqueValue *src,
                                     size_t count, const Metadata *self) {
@@ -150,7 +159,6 @@ void swift_arrayInitWithTakeNoAlias(OpaqueValue *dest, OpaqueValue *src,
       dest, src, count, self);
 }
 
-SWIFT_CC(c)
 SWIFT_RUNTIME_EXPORT
 void swift_arrayInitWithTakeFrontToBack(OpaqueValue *dest, OpaqueValue *src,
                                         size_t count, const Metadata *self) {
@@ -158,7 +166,6 @@ void swift_arrayInitWithTakeFrontToBack(OpaqueValue *dest, OpaqueValue *src,
                        ArrayCopy::FrontToBack>(dest, src, count, self);
 }
 
-SWIFT_CC(c)
 SWIFT_RUNTIME_EXPORT
 void swift_arrayInitWithTakeBackToFront(OpaqueValue *dest, OpaqueValue *src,
                                         size_t count, const Metadata *self) {
@@ -166,7 +173,6 @@ void swift_arrayInitWithTakeBackToFront(OpaqueValue *dest, OpaqueValue *src,
                        ArrayCopy::BackToFront>(dest, src, count, self);
 }
 
-SWIFT_CC(c)
 SWIFT_RUNTIME_EXPORT
 void swift_arrayAssignWithCopyNoAlias(OpaqueValue *dest, OpaqueValue *src,
                                       size_t count, const Metadata *self) {
@@ -174,7 +180,6 @@ void swift_arrayAssignWithCopyNoAlias(OpaqueValue *dest, OpaqueValue *src,
                        ArrayCopy::NoAlias>(dest, src, count, self);
 }
 
-SWIFT_CC(c)
 SWIFT_RUNTIME_EXPORT
 void swift_arrayAssignWithCopyFrontToBack(OpaqueValue *dest, OpaqueValue *src,
                                           size_t count, const Metadata *self) {
@@ -182,7 +187,6 @@ void swift_arrayAssignWithCopyFrontToBack(OpaqueValue *dest, OpaqueValue *src,
                        ArrayCopy::FrontToBack>(dest, src, count, self);
 }
 
-SWIFT_CC(c)
 SWIFT_RUNTIME_EXPORT
 void swift_arrayAssignWithCopyBackToFront(OpaqueValue *dest, OpaqueValue *src,
                                           size_t count, const Metadata *self) {
@@ -190,7 +194,6 @@ void swift_arrayAssignWithCopyBackToFront(OpaqueValue *dest, OpaqueValue *src,
                        ArrayCopy::BackToFront>(dest, src, count, self);
 }
 
-SWIFT_CC(c)
 SWIFT_RUNTIME_EXPORT
 void swift_arrayAssignWithTake(OpaqueValue *dest, OpaqueValue *src,
                                size_t count, const Metadata *self) {
@@ -198,7 +201,6 @@ void swift_arrayAssignWithTake(OpaqueValue *dest, OpaqueValue *src,
                        ArrayCopy::NoAlias>(dest, src, count, self);
 }
 
-SWIFT_CC(c)
 SWIFT_RUNTIME_EXPORT
 void swift_arrayDestroy(OpaqueValue *begin, size_t count, const Metadata *self) {
   if (count == 0)
@@ -211,6 +213,10 @@ void swift_arrayDestroy(OpaqueValue *begin, size_t count, const Metadata *self) 
     return;
 
   auto stride = wtable->getStride();
+  if (self->hasLayoutString()) {
+      return swift_generic_arrayDestroy(begin, count, stride, self);
+  }
+
   for (size_t i = 0; i < count; ++i) {
     auto offset = i * stride;
     auto *obj = reinterpret_cast<OpaqueValue *>((char *)begin + offset);

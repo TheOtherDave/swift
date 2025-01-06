@@ -7,6 +7,20 @@
   asdf asdf asdf asdf
 #endif
 
+#if swift(<1.2)
+#endif
+
+#if swift(<4.2)
+  let a = 1
+#else
+  let a = 2
+#endif
+
+#if swift(<1.0)
+   // This shouldn't emit any diagnostics.
+   asdf asdf asdf asdf
+#endif
+
 #if swift(>=1.2)
 
 #if os(iOS)
@@ -34,13 +48,21 @@
   %#^*&
 #endif
 
-#if swift(">=7.1") // expected-error {{unexpected platform condition argument: expected a unary comparison, such as '>=2.2'}}
+#if !swift(<1000.0)
+  // This shouldn't emit any diagnostics.
+  %#^*&
 #endif
 
-#if swift(">=2n.2") // expected-error {{unexpected platform condition argument: expected a unary comparison, such as '>=2.2'}}
+#if swift(">=7.1") // expected-error@:5 {{'swift' requires a single unlabeled argument for the version comparison}}
 #endif
 
-#if swift("") // expected-error {{unexpected platform condition argument: expected a unary comparison, such as '>=2.2'}}
+#if swift("<7.1") // expected-error@:5 {{'swift' requires a single unlabeled argument for the version comparison}}
+#endif
+
+#if swift(">=2n.2") // expected-error@:5 {{'swift' requires a single unlabeled argument for the version comparison}}
+#endif
+
+#if swift("") // expected-error@:5 {{'swift' requires a single unlabeled argument for the version comparison}}
 #endif
 
 #if swift(>=2.2.1)
@@ -53,10 +75,13 @@ class C {
 #endif
 }
 
-#if swift(>=2.0, *) // expected-error {{expected only one argument to platform condition}}
+#if swift(>=2.0, *) // expected-error@:5 {{'swift' requires a single unlabeled argument for the version comparison}}
 #endif
 
-#if swift(>=, 2.0) // expected-error {{expected only one argument to platform condition}}
+#if swift(>=, 2.0) // expected-error@:5 {{'swift' requires a single unlabeled argument for the version comparison}}
+#endif
+
+#if swift(version: >=2.0) // expected-error@:5 {{'swift' requires a single unlabeled argument for the version comparison}}
 #endif
 
 protocol P {

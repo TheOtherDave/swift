@@ -1,5 +1,6 @@
 // RUN: %target-run-simple-swift
 // REQUIRES: executable_test
+// REQUIRES: reflection
 
 import StdlibUnittest
 
@@ -8,6 +9,7 @@ var StaticStringTestSuite = TestSuite("StaticString")
 
 StaticStringTestSuite.test("PointerRepresentation/ASCII/Empty") {
   let str = StaticString()
+  expectEqual(0x00, str.utf8Start[0])
   expectEqual(0, str.utf8CodeUnitCount)
   expectTrue(str.hasPointerRepresentation)
   expectTrue(str.isASCII)
@@ -26,6 +28,7 @@ StaticStringTestSuite.test("PointerRepresentation/ASCII") {
   expectEqual(0x61, str.utf8Start[0])
   expectEqual(0x62, str.utf8Start[1])
   expectEqual(0x63, str.utf8Start[2])
+  expectEqual(0x00, str.utf8Start[3])
   expectEqual(3, str.utf8CodeUnitCount)
   expectTrue(str.hasPointerRepresentation)
   expectTrue(str.isASCII)
@@ -50,6 +53,7 @@ StaticStringTestSuite.test("PointerRepresentation/NonASCII") {
   expectEqual(0xb1, str.utf8Start[3])
   expectEqual(0xd0, str.utf8Start[4])
   expectEqual(0xb2, str.utf8Start[5])
+  expectEqual(0x00, str.utf8Start[6])
   expectEqual(6, str.utf8CodeUnitCount)
   expectTrue(str.hasPointerRepresentation)
   expectFalse(str.isASCII)
@@ -69,6 +73,8 @@ StaticStringTestSuite.test("PointerRepresentation/NonASCII") {
   expectDebugPrinted("\"абв\"", str)
 }
 
+#if !os(WASI)
+// Trap tests aren't available on WASI.
 StaticStringTestSuite.test("PointerRepresentation/unicodeScalar")
   .skip(.custom(
     { _isFastAssertConfiguration() },
@@ -81,6 +87,7 @@ StaticStringTestSuite.test("PointerRepresentation/unicodeScalar")
   expectCrashLater()
   strOpaque.unicodeScalar
 }
+#endif
 
 StaticStringTestSuite.test("UnicodeScalarRepresentation/ASCII") {
   // The type checker does not call the UnicodeScalar initializer even if
@@ -119,6 +126,8 @@ StaticStringTestSuite.test("UnicodeScalarRepresentation/NonASCII") {
   expectDebugPrinted("\"Ы\"", str)
 }
 
+#if !os(WASI)
+// Trap tests aren't available on WASI.
 StaticStringTestSuite.test("UnicodeScalarRepresentation/utf8Start")
   .skip(.custom(
     { _isFastAssertConfiguration() },
@@ -144,6 +153,7 @@ StaticStringTestSuite.test("UnicodeScalarRepresentation/utf8CodeUnitCount")
   expectCrashLater()
   strOpaque.utf8CodeUnitCount
 }
+#endif
 
 runAllTests()
 

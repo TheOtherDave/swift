@@ -14,13 +14,15 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef _SWIFT_RUNTIME_DEBUG_HELPERS_
-#define _SWIFT_RUNTIME_DEBUG_HELPERS_
+#ifndef SWIFT_RUNTIME_DEBUG_HELPERS_H
+#define SWIFT_RUNTIME_DEBUG_HELPERS_H
 
-#include <llvm/Support/Compiler.h>
-#include <stdint.h>
 #include "swift/Runtime/Config.h"
-#include "swift/Runtime/Unreachable.h"
+#include "swift/Basic/Unreachable.h"
+#include <atomic>
+#include <cstdarg>
+#include <functional>
+#include <stdint.h>
 
 #ifdef SWIFT_HAVE_CRASHREPORTERCLIENT
 
@@ -39,24 +41,24 @@ struct crashreporter_annotations_t {
 };
 
 extern "C" {
-LLVM_LIBRARY_VISIBILITY
+SWIFT_RUNTIME_LIBRARY_VISIBILITY
 extern struct crashreporter_annotations_t gCRAnnotations;
 }
 
-LLVM_ATTRIBUTE_ALWAYS_INLINE
-static void CRSetCrashLogMessage(const char *message) {
+SWIFT_RUNTIME_ATTRIBUTE_ALWAYS_INLINE
+static inline void CRSetCrashLogMessage(const char *message) {
   gCRAnnotations.message = reinterpret_cast<uint64_t>(message);
 }
 
-LLVM_ATTRIBUTE_ALWAYS_INLINE
-static const char *CRGetCrashLogMessage() {
+SWIFT_RUNTIME_ATTRIBUTE_ALWAYS_INLINE
+static inline const char *CRGetCrashLogMessage() {
   return reinterpret_cast<const char *>(gCRAnnotations.message);
 }
 
 #else
 
-LLVM_ATTRIBUTE_ALWAYS_INLINE
-static void CRSetCrashLogMessage(const char *) {}
+SWIFT_RUNTIME_ATTRIBUTE_ALWAYS_INLINE
+static inline void CRSetCrashLogMessage(const char *) {}
 
 #endif
 
@@ -71,35 +73,41 @@ using Metadata = TargetMetadata<InProcess>;
 // swift::crash() halts with a crash log message, 
 // but otherwise tries not to disturb register state.
 
-LLVM_ATTRIBUTE_NORETURN
-LLVM_ATTRIBUTE_ALWAYS_INLINE // Minimize trashed registers
+SWIFT_RUNTIME_ATTRIBUTE_NORETURN
+SWIFT_RUNTIME_ATTRIBUTE_ALWAYS_INLINE // Minimize trashed registers
 static inline void crash(const char *message) {
   CRSetCrashLogMessage(message);
 
-  LLVM_BUILTIN_TRAP;
-  swift_runtime_unreachable("Expected compiler to crash.");
+  SWIFT_RUNTIME_BUILTIN_TRAP;
+  swift_unreachable("Expected compiler to crash.");
 }
 
-/// Report a corrupted type object.
-LLVM_ATTRIBUTE_NORETURN
-LLVM_ATTRIBUTE_ALWAYS_INLINE // Minimize trashed registers
-static inline void _failCorruptType(const Metadata *type) {
-  swift::crash("Corrupt Swift type object");
-}
-
-// swift::fatalError() halts with a crash log message, 
+// swift::fatalErrorv() halts with a crash log message,
 // but makes no attempt to preserve register state.
-LLVM_ATTRIBUTE_NORETURN
+SWIFT_RUNTIME_ATTRIBUTE_NORETURN
+SWIFT_VFORMAT(2)
+extern void fatalErrorv(uint32_t flags, const char *format, va_list args);
+
+// swift::fatalError() halts with a crash log message,
+// but makes no attempt to preserve register state.
+SWIFT_RUNTIME_ATTRIBUTE_NORETURN
+SWIFT_FORMAT(2, 3)
 extern void
 fatalError(uint32_t flags, const char *format, ...);
 
 /// swift::warning() emits a warning from the runtime.
 extern void
+SWIFT_VFORMAT(2)
+warningv(uint32_t flags, const char *format, va_list args);
+
+/// swift::warning() emits a warning from the runtime.
+extern void
+SWIFT_FORMAT(2, 3)
 warning(uint32_t flags, const char *format, ...);
 
 // swift_dynamicCastFailure halts using fatalError()
 // with a description of a failed cast's types.
-LLVM_ATTRIBUTE_NORETURN
+SWIFT_RUNTIME_ATTRIBUTE_NORETURN
 void
 swift_dynamicCastFailure(const Metadata *sourceType,
                          const Metadata *targetType,
@@ -107,7 +115,7 @@ swift_dynamicCastFailure(const Metadata *sourceType,
 
 // swift_dynamicCastFailure halts using fatalError()
 // with a description of a failed cast's types.
-LLVM_ATTRIBUTE_NORETURN
+SWIFT_RUNTIME_ATTRIBUTE_NORETURN
 void
 swift_dynamicCastFailure(const void *sourceType, const char *sourceName, 
                          const void *targetType, const char *targetName, 
@@ -116,17 +124,41 @@ swift_dynamicCastFailure(const void *sourceType, const char *sourceName,
 SWIFT_RUNTIME_EXPORT
 void swift_reportError(uint32_t flags, const char *message);
 
+SWIFT_RUNTIME_EXPORT
+void swift_reportWarning(uint32_t flags, const char *message);
+
+#if !defined(SWIFT_HAVE_CRASHREPORTERCLIENT)
+SWIFT_RUNTIME_EXPORT
+std::atomic<const char *> *swift_getFatalErrorMessageBuffer();
+#endif
+
 // Halt due to an overflow in swift_retain().
-LLVM_ATTRIBUTE_NORETURN LLVM_ATTRIBUTE_NOINLINE
+SWIFT_RUNTIME_ATTRIBUTE_NORETURN SWIFT_RUNTIME_ATTRIBUTE_NOINLINE
 void swift_abortRetainOverflow();
 
 // Halt due to reading an unowned reference to a dead object.
-LLVM_ATTRIBUTE_NORETURN LLVM_ATTRIBUTE_NOINLINE
+SWIFT_RUNTIME_ATTRIBUTE_NORETURN SWIFT_RUNTIME_ATTRIBUTE_NOINLINE
 void swift_abortRetainUnowned(const void *object);
 
 // Halt due to an overflow in swift_unownedRetain().
-LLVM_ATTRIBUTE_NORETURN LLVM_ATTRIBUTE_NOINLINE
+SWIFT_RUNTIME_ATTRIBUTE_NORETURN SWIFT_RUNTIME_ATTRIBUTE_NOINLINE
 void swift_abortUnownedRetainOverflow();
+
+// Halt due to an overflow in incrementWeak().
+SWIFT_RUNTIME_ATTRIBUTE_NORETURN SWIFT_RUNTIME_ATTRIBUTE_NOINLINE
+void swift_abortWeakRetainOverflow();
+
+// Halt due to enabling an already enabled dynamic replacement().
+SWIFT_RUNTIME_ATTRIBUTE_NORETURN SWIFT_RUNTIME_ATTRIBUTE_NOINLINE
+void swift_abortDynamicReplacementEnabling();
+
+// Halt due to disabling an already disabled dynamic replacement().
+SWIFT_RUNTIME_ATTRIBUTE_NORETURN SWIFT_RUNTIME_ATTRIBUTE_NOINLINE
+void swift_abortDynamicReplacementDisabling();
+
+// Halt due to trying to use unicode data on platforms that don't have it.
+SWIFT_RUNTIME_ATTRIBUTE_NORETURN SWIFT_RUNTIME_ATTRIBUTE_NOINLINE
+void swift_abortDisabledUnicodeSupport();
 
 /// This function dumps one line of a stack trace. It is assumed that \p framePC
 /// is the address of the stack frame at index \p index. If \p shortOutput is
@@ -135,7 +167,10 @@ void swift_abortUnownedRetainOverflow();
 void dumpStackTraceEntry(unsigned index, void *framePC,
                          bool shortOutput = false);
 
-LLVM_ATTRIBUTE_NOINLINE
+SWIFT_RUNTIME_ATTRIBUTE_NOINLINE
+bool withCurrentBacktrace(std::function<void(void **, int)> call);
+
+SWIFT_RUNTIME_ATTRIBUTE_NOINLINE
 void printCurrentBacktrace(unsigned framesToSkip = 1);
 
 /// Debugger breakpoint ABI. This structure is passed to the debugger (and needs
@@ -156,12 +191,12 @@ struct RuntimeErrorDetails {
   const char *currentStackDescription;
 
   // Number of frames in the current stack that should be ignored when reporting
-  // the issue (exluding the reportToDebugger/_swift_runtime_on_report frame).
+  // the issue (excluding the reportToDebugger/_swift_runtime_on_report frame).
   // The remaining top frame should point to user's code where the bug is.
   uintptr_t framesToSkip;
 
   // Address of some associated object (if there's any).
-  void *memoryAddress;
+  const void *memoryAddress;
 
   // A structure describing an extra thread (and its stack) that is related.
   struct Thread {
@@ -218,7 +253,25 @@ void _swift_reportToDebugger(uintptr_t flags, const char *message,
 SWIFT_RUNTIME_STDLIB_SPI
 bool _swift_reportFatalErrorsToDebugger;
 
+SWIFT_RUNTIME_STDLIB_SPI
+bool _swift_shouldReportFatalErrorsToDebugger();
+
+SWIFT_RUNTIME_STDLIB_SPI
+bool _swift_debug_metadataAllocationIterationEnabled;
+
+SWIFT_RUNTIME_STDLIB_SPI
+const void * const _swift_debug_allocationPoolPointer;
+
+SWIFT_RUNTIME_STDLIB_SPI
+std::atomic<const void *> _swift_debug_metadataAllocationBacktraceList;
+
+SWIFT_RUNTIME_STDLIB_SPI
+const void * const _swift_debug_protocolConformanceStatePointer;
+
+SWIFT_RUNTIME_STDLIB_SPI
+const uint64_t _swift_debug_multiPayloadEnumPointerSpareBitsMask;
+
 // namespace swift
 }
 
-#endif // _SWIFT_RUNTIME_DEBUG_HELPERS_
+#endif // SWIFT_RUNTIME_DEBUG_HELPERS_H

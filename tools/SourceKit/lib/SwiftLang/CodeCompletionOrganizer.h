@@ -15,6 +15,8 @@
 
 #include "CodeCompletion.h"
 #include "SourceKit/Core/LangSupport.h"
+//#include "swift/IDE/CodeCompletionContext.h"
+#include "swift/IDE/SwiftCompletionInfo.h"
 #include "llvm/ADT/StringMap.h"
 
 namespace swift {
@@ -22,6 +24,9 @@ class CompilerInvocation;
 }
 
 namespace SourceKit {
+
+  using TypeContextKind = swift::ide::CodeCompletionContext::TypeContextKind;
+
 namespace CodeCompletion {
 
 struct Options {
@@ -38,30 +43,26 @@ struct Options {
   bool hideLowPriority = true;
   bool hideByNameStyle = true;
   bool fuzzyMatching = true;
+  bool annotatedDescription = false;
+  bool includeObjectLiterals = true;
+  bool addCallWithNoDefaultArgs = true;
   unsigned minFuzzyLength = 2;
   unsigned showTopNonLiteralResults = 3;
 
   // Options for combining priorities.
-  unsigned semanticContextWeight = 15;
-  unsigned fuzzyMatchWeight = 10;
+  unsigned semanticContextWeight = 7;
+  unsigned fuzzyMatchWeight = 13;
   unsigned popularityBonus = 2;
-};
-
-struct SwiftCompletionInfo {
-  swift::ASTContext *swiftASTContext = nullptr;
-  swift::CompilerInvocation *invocation = nullptr;
-  swift::ide::CodeCompletionContext *completionContext = nullptr;
 };
 
 typedef llvm::StringMap<PopularityFactor> NameToPopularityMap;
 
 std::vector<Completion *>
 extendCompletions(ArrayRef<SwiftResult *> swiftResults, CompletionSink &sink,
-                  SwiftCompletionInfo &info,
+                  swift::ide::SwiftCompletionInfo &info,
                   const NameToPopularityMap *nameToPopularity,
                   const Options &options, Completion *prefix = nullptr,
-                  Optional<SemanticContextKind> overrideContext = None,
-                  Optional<SemanticContextKind> overrideOperatorContext = None);
+                  bool clearFlair = false);
 
 bool addCustomCompletions(CompletionSink &sink,
                           std::vector<Completion *> &completions,
@@ -74,7 +75,7 @@ class CodeCompletionOrganizer {
   const Options &options;
 public:
   CodeCompletionOrganizer(const Options &options, CompletionKind kind,
-                          bool hasExpectedTypes);
+                          TypeContextKind typeContextKind);
   ~CodeCompletionOrganizer();
 
   static void

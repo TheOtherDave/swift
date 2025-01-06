@@ -81,20 +81,20 @@ class SubCls : MyCls, Prot {
   var protocolProperty2 = 0
 }
 
-// CHECK: func <Func>genFn</Func><<GenericTypeParam>T</GenericTypeParam> : <Protocol@64:10>Prot</Protocol> where <GenericTypeParam@85:12>T</GenericTypeParam>.<AssociatedType@65:18>Blarg</AssociatedType> : <Protocol@71:10>Prot2</Protocol>>(_ <Param>p</Param> : <GenericTypeParam@85:12>T</GenericTypeParam>) -> <iStruct@>Int</iStruct> {}{{$}}
-func genFn<T : Prot where T.Blarg : Prot2>(_ p : T) -> Int {}
+// CHECK: func <Func>genFn</Func><<GenericTypeParam>T</GenericTypeParam> : <Protocol@64:10>Prot</Protocol>>(_ <Param>p</Param> : <GenericTypeParam@85:12>T</GenericTypeParam>) -> <iStruct@>Int</iStruct> where <GenericTypeParam@85:12>T</GenericTypeParam>.<AssociatedType@65:18>Blarg</AssociatedType> : <Protocol@71:10>Prot2</Protocol> {}{{$}}
+func genFn<T : Prot>(_ p : T) -> Int where T.Blarg : Prot2 {}
 
 func test(_ x: Int) {
-  // CHECK: <Func@[[@LINE-3]]:6>genFn</Func>(<Ctor@[[@LINE-11]]:28-Class@[[@LINE-11]]:7>SubCls</Ctor>())
+  // CHECK: <Func@[[@LINE-3]]:6>genFn</Func>(<Class@[[@LINE-11]]:7>SubCls</Class>())
   genFn(SubCls())
-  // CHECK: "This is string \(<Func@[[@LINE-5]]:6>genFn</Func>({(<Param>a</Param>:<iStruct@>Int</iStruct>) in <Ctor@[[@LINE-13]]:28-Class@[[@LINE-13]]:7>SubCls</Ctor>()}(<Param@[[@LINE-3]]:13>x</Param>))) interpolation"
+  // CHECK: "This is string \(<Func@[[@LINE-5]]:6>genFn</Func>({(<Param>a</Param>:<iStruct@>Int</iStruct>) in <Class@[[@LINE-13]]:7>SubCls</Class>()}(<Param@[[@LINE-3]]:13>x</Param>))) interpolation"
   "This is string \(genFn({(a:Int) in SubCls()}(x))) interpolation"
 }
 
 // CHECK: func <Func>bar</Func>(<Param>x</Param>: <iStruct@>Int</iStruct>) -> (<iStruct@>Int</iStruct>, <iStruct@>Float</iStruct>) {
 func bar(x: Int) -> (Int, Float) {
   // CHECK: <Ctor@[[@LINE-84]]:8-TypeAlias@[[@LINE-78]]:11>TypealiasForS</Ctor>()
-  TypealiasForS()
+  _ = TypealiasForS()
 }
 
 class C2 {
@@ -129,7 +129,7 @@ class GenCls<T> {
 }
 
 func test2() {
-  // CHECK: <Class@[[@LINE-19]]:7>GenCls</Class><<iStruct@>Int</iStruct>>()
+  // CHECK: <Ctor@[[@LINE-17]]:3-Class@[[@LINE-19]]:7>GenCls</Ctor><<iStruct@>Int</iStruct>>()
   GenCls<Int>()
 }
 
@@ -169,8 +169,6 @@ extension Array : P5 {}
 // CHECK: extension <iStruct@>Array</iStruct> : <Protocol{{.*}}>P5</Protocol> {}
 extension Optional : P5 {}
 // CHECK: extension <iEnum@>Optional</iEnum> : <Protocol{{.*}}>P5</Protocol> {}
-extension ImplicitlyUnwrappedOptional : P5 {}
-// CHECK: extension <iEnum@>ImplicitlyUnwrappedOptional</iEnum> : <Protocol{{.*}}>P5</Protocol> {}
 
 class C6 {
   func meth() {
@@ -261,7 +259,7 @@ func test7(int x: Int, andThis y: Float) {}
 test7(int: 0, andThis: 0)
 
 func test8<T : Prot2>(_ x: T) {}
-// CHECK: func <Func>test8</Func><<GenericTypeParam>T</GenericTypeParam> : <Protocol@71:10>Prot2</Protocol>>(_ <Param>x</Param>: <GenericTypeParam@263:12>T</GenericTypeParam>) {}{{$}}
+// CHECK: func <Func>test8</Func><<GenericTypeParam>T</GenericTypeParam> : <Protocol@71:10>Prot2</Protocol>>(_ <Param>x</Param>: <GenericTypeParam@261:12>T</GenericTypeParam>) {}{{$}}
 
 class C11 {
   // CHECK: var <Var>a</Var>: <iStruct@>Int</iStruct> = { var <Var>tmp</Var> = 0; return <Var@[[@LINE+1]]:22>tmp</Var> }()
@@ -341,3 +339,35 @@ test_arg_tuple2(p1:0,0)
 test_arg_tuple3(0,p2:0)
 // CHECK: <Func@[[@LINE-7]]:6>test_arg_tuple4</Func>(<Func@[[@LINE-7]]:6#p1>p1</Func>:0,<Func@[[@LINE-7]]:6#p2>p2</Func>:0)
 test_arg_tuple4(p1:0,p2:0)
+
+
+@dynamicMemberLookup
+struct Lens<T> {
+  var obj: T
+  init(_ obj: T) {
+    self.obj = obj
+  }
+  subscript<U>(dynamicMember member: WritableKeyPath<T, U>) -> Lens<U> {
+    get { return Lens<U>(obj[keyPath: member]) }
+    set { obj[keyPath: member] = newValue.obj }
+  }
+}
+struct Point {
+  var x: Int
+  var y: Int
+}
+struct Rectangle {
+  var topLeft: Point
+  var bottomRight: Point
+}
+func testDynamicMemberLookup(r: Lens<Rectangle>) {
+  _ = r.topLeft
+  // CHECK: _ = <Param@[[@LINE-2]]:30>r</Param>.<Var@[[@LINE-5]]:7>topLeft</Var>
+  _ = r.bottomRight.y
+  // CHECK: _ = <Param@[[@LINE-4]]:30>r</Param>.<Var@[[@LINE-6]]:7>bottomRight</Var>.<Var@[[@LINE-10]]:7>y</Var>
+}
+func keyPathTester<V>(keyPath: KeyPath<Lens<Rectangle>, V>) {}
+func testKeyPath() {
+  keyPathTester(keyPath: \.topLeft)
+  // CHECK: <Func@[[@LINE-3]]:6>keyPathTester</Func>(<Func@[[@LINE-3]]:6#keyPath>keyPath</Func>: \.<Var@[[@LINE-12]]:7>topLeft</Var>)
+}

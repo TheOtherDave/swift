@@ -25,17 +25,26 @@
 ///     // "Humperdinck"
 ///     // "Humperdinck"
 ///     // "Humperdinck"
-@_fixed_layout
+@frozen
 public struct Repeated<Element> {
   /// The number of elements in this collection.
   public let count: Int
 
   /// The value of every element in this collection.
   public let repeatedValue: Element
+
+  /// Creates an instance that contains `count` elements having the
+  /// value `repeatedValue`.
+  @inlinable // trivial-implementation
+  internal init(_repeating repeatedValue: Element, count: Int) {
+    _precondition(count >= 0, "Repetition count should be non-negative")
+    self.count = count
+    self.repeatedValue = repeatedValue
+  }
 }
 
 extension Repeated: RandomAccessCollection {
-  public typealias Indices = CountableRange<Int>
+  public typealias Indices = Range<Int>
 
   /// A type that represents a valid position in the collection.
   ///
@@ -43,21 +52,11 @@ extension Repeated: RandomAccessCollection {
   /// end" position that's not valid for use as a subscript.
   public typealias Index = Int
 
-  /// Creates an instance that contains `count` elements having the
-  /// value `repeatedValue`.
-  @_versioned
-  @_inlineable
-  internal init(_repeating repeatedValue: Element, count: Int) {
-    _precondition(count >= 0, "Repetition count should be non-negative")
-    self.count = count
-    self.repeatedValue = repeatedValue
-  }
-  
   /// The position of the first element in a nonempty collection.
   ///
   /// In a `Repeated` collection, `startIndex` is always equal to zero. If the
   /// collection is empty, `startIndex` is equal to `endIndex`.
-  @_inlineable
+  @inlinable // trivial-implementation
   public var startIndex: Index {
     return 0
   }
@@ -67,7 +66,7 @@ extension Repeated: RandomAccessCollection {
   ///
   /// In a `Repeated` collection, `endIndex` is always equal to `count`. If the
   /// collection is empty, `endIndex` is equal to `startIndex`.
-  @_inlineable
+  @inlinable // trivial-implementation
   public var endIndex: Index {
     return count
   }
@@ -77,7 +76,7 @@ extension Repeated: RandomAccessCollection {
   /// - Parameter position: The position of the element to access. `position`
   ///   must be a valid index of the collection that is not equal to the
   ///   `endIndex` property.
-  @_inlineable
+  @inlinable // trivial-implementation
   public subscript(position: Int) -> Element {
     _precondition(position >= 0 && position < count, "Index out of range")
     return repeatedValue
@@ -104,7 +103,9 @@ extension Repeated: RandomAccessCollection {
 ///   - count: The number of times to repeat `element`.
 /// - Returns: A collection that contains `count` elements that are all
 ///   `element`.
-@_inlineable
+@inlinable // trivial-implementation
 public func repeatElement<T>(_ element: T, count n: Int) -> Repeated<T> {
   return Repeated(_repeating: element, count: n)
 }
+
+extension Repeated: Sendable where Element: Sendable { }

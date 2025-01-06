@@ -14,9 +14,10 @@ The target audience for this document is people who want to integrate the Swift
 compiler into their build system, rather than using Xcode or the package
 manager (`swift build`). If you're looking to work on the driver itself...well,
 this is probably still useful to you, but you should also check out
-DriverInternals.rst and maybe DependencyAnalysis.rst as well. If you're just
-using Xcode or SwiftPM and want to find out what mysterious command-line
-options you could be passing, `swiftc --help` is a better choice.
+[DriverInternals.md](DriverInternals.md) and maybe
+[DependencyAnalysis.md](DependencyAnalysis.md) as well. If you're just using
+Xcode or SwiftPM and want to find out what mysterious command-line options you
+could be passing, `swiftc --help` is a better choice.
 
 If you're invoking `swift -frontend` directly, and you aren't working on the
 compiler itself...well, this document should convince you to not do that.
@@ -25,8 +26,8 @@ Some terms:
 
 - For the purposes of this document, a _module_ is a single distributable unit
   of API. (We use this term for a lot of other things too, though; check out
-  Lexicon.rst for the full list.) "Foundation" is a single module, as is the
-  Swift standard library ("Swift"). An app is a module too.
+  [Lexicon.md](Lexicon.md) for the full list.) "Foundation" is a single
+  module, as is the Swift standard library ("Swift"). An app is a module too.
 
 - A _compilation unit_ is a set of source files that are compiled together. In
   Swift, everything intended to be in the same module must be part of the same
@@ -166,10 +167,8 @@ The output file map accepts other entries, but they should not be considered
 stable. Please stick to what's shown here.
 
 (Note: In the example output file map above, all of the per-file outputs are
-being emitted to the same directory. [SR-327][] covers adding a flag that would
-infer this behavior given a directory path.)
-
-  [SR-327]: https://bugs.swift.org/browse/SR-327
+being emitted to the same directory. [#42949](https://github.com/swiftlang/swift/issues/42949)
+covers adding a flag that would infer this behavior given a directory path.)
 
 
 ## Whole-Module Optimization ##
@@ -204,14 +203,14 @@ in becoming more like non-whole-module builds.
 
 ## Incremental Builds ##
 
-Incremental builds in Swift work by primarily by cross-file dependency
-analysis, described in DependencyAnalysis.rst. Compiling a single file might be
-necessary because that file has changed, but it could also be because that file
-depends on something else that might have changed. From a build system
-perspective, the files in a particular module can't be extracted from each
-other; a top-level invocation of the compiler will result in a valid
-compilation of the entire module, but manually recompiling certain files is not
-guaranteed to do anything sensible.
+Incremental builds in Swift work primarily by cross-file dependency
+analysis, described in [DependencyAnalysis.md](DependencyAnalysis.md).
+Compiling a single file might be necessary because that file has changed, but
+it could also be because that file depends on something else that might have
+changed. From a build system perspective, the files in a particular module
+can't be extracted from each other; a top-level invocation of the compiler will
+result in a valid compilation of the entire module, but manually recompiling
+certain files is not guaranteed to do anything sensible.
 
 Performing an incremental build is easy; just pass `-incremental` and be sure to
 put "swift-dependencies" entries in your output file map.
@@ -285,22 +284,14 @@ past that, so:
      import later.
 
      If you want debugging that's more than `-gline-tables-only`, this is the
-     only supported way to do it today. ([SR-2637][] and [SR-2660][] are aimed
-     at improving on this.) On the plus side, this mode doesn't strictly need
-     an output file map if you give up incremental builds.
+     only supported way to do it today [swiftlang/llvm-project#4588](https://github.com/swiftlang/llvm-project/issues/4588)
+     and [#45265](https://github.com/swiftlang/swift/issues/45265) are aimed at
+     improving on this). On the plus side, this mode doesn't strictly need an
+     output file map if you give up incremental builds.
 
    - Invoke `swiftc -c`, then pass the resulting object files to your linker.
      All the same options from above apply, but you'll have to manually deal
      with the work the compiler would have done automatically for you.
-
-   - Invoke `swiftc -c` with `-###`. Then run all of the outputted commands
-     that include `-primary-file`, then run the remaining commands in order
-     (they may have dependencies). If none of the commands have `-primary-file`
-     in them, they're not parallelizable, sorry.
-
-     This is the most hacky approach, because (a) it involves looking for an
-     internal flag in a non-stable interface, and (b) you don't get anything
-     incremental out of this. We could stand some improvements here.
 
    Whatever you do, do *not* invoke the frontend directly.
 
@@ -310,10 +301,8 @@ past that, so:
 _Can I link all the object files together in the same binary, even if they came
 from multiple modules?_
 
-This is not currently supported, and debugging probably won't work. (See
-[SR-2637][] and [SR-2660][] for more details.) However, if you are using
-`-gnone` or `-gline-tables-only`, the worst you will suffer is more symbols
-being visible than are strictly necessary.
-
-  [SR-2637]: https://bugs.swift.org/browse/SR-2637
-  [SR-2660]: https://bugs.swift.org/browse/SR-2660
+This is not currently supported, and debugging probably won't work (see
+[swiftlang/llvm-project#4588](https://github.com/swiftlang/llvm-project/issues/4588) and
+[#45265](https://github.com/swiftlang/swift/issues/45265) for more details).
+However, if you are using `-gnone` or `-gline-tables-only`, the worst you will
+suffer is more symbols being visible than are strictly necessary.

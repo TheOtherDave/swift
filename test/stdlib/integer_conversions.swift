@@ -1,5 +1,6 @@
 // RUN: %target-run-simple-swift | %FileCheck %s
 // REQUIRES: executable_test
+// REQUIRES: reflection
 
 var a : Int
 
@@ -91,6 +92,7 @@ print(Int8._convert(from: -Double.leastNormalMagnitude))
 // CHECK:  (value: Optional(0), exact: false)
 
 print(UInt8._convert(from: -1))
+print(UInt8._convert(from: -0.9))
 print(UInt8._convert(from: 255))
 print(UInt8._convert(from: 256))
 print(UInt8._convert(from: Double.infinity))
@@ -98,6 +100,7 @@ print(UInt8._convert(from: -Double.infinity))
 print(UInt8._convert(from: Double.nan))
 
 // CHECK:  (value: nil, exact: false)
+// CHECK:  (value: Optional(0), exact: false)
 // CHECK:  (value: Optional(255), exact: true)
 // CHECK:  (value: nil, exact: false)
 // CHECK:  (value: nil, exact: false)

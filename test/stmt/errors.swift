@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -typecheck -verify %s
+// RUN: %target-typecheck-verify-swift
 enum MSV : Error {
   case Foo, Bar, Baz
 
@@ -97,6 +97,14 @@ class eight {
   }()
 }
 
+func multiPattern() {
+  do {
+    throw opaque_error()
+  } catch MSV.Foo, _ {
+    _ = e
+  }
+}
+
 protocol ThrowingProto {
   func foo() throws
   static func bar() throws
@@ -117,9 +125,9 @@ func nine() throws {
   try nine_helper(y: 0) // expected-error {{missing argument for parameter #1 in call}}
 }
 func ten_helper(_ x: Int) {}
-func ten_helper(_ x: Int, y: Int) throws {}
+func ten_helper(_ x: Int, y: Int) throws {} // expected-note {{'ten_helper(_:y:)' declared here}}
 func ten() throws {
-  try ten_helper(y: 0) // expected-error {{extraneous argument label 'y:' in call}} {{18-21=}}
+  try ten_helper(y: 0) // expected-error {{missing argument for parameter #1 in call}} {{18-18=<#Int#>, }}
 }
 
 // rdar://21074857
@@ -145,10 +153,10 @@ func eleven_two() {
 enum Twelve { case Payload(Int) }
 func twelve_helper(_ fn: (Int, Int) -> ()) {}
 func twelve() {
-  twelve_helper { (a, b) in // expected-error {{invalid conversion from throwing function of type '(_, _) throws -> ()' to non-throwing function type '(Int, Int) -> ()'}}
+  twelve_helper { (a, b) in // expected-error {{invalid conversion from throwing function of type '(Int, Int) throws -> ()' to non-throwing function type '(Int, Int) -> ()'}}
     do {
       try thrower()
-    } catch Twelve.Payload(a...b) {
+    } catch Twelve.Payload(a...b) { // expected-error {{pattern of type 'Twelve' does not conform to expected match type 'Error'}}
     }
   }
 }
@@ -158,10 +166,93 @@ func ==(a: Thirteen, b: Thirteen) -> Bool { return true }
 
 func thirteen_helper(_ fn: (Thirteen) -> ()) {}
 func thirteen() {
-  thirteen_helper { (a) in // expected-error {{invalid conversion from throwing function of type '(_) throws -> ()' to non-throwing function type '(Thirteen) -> ()'}}
+  thirteen_helper { (a) in // expected-error {{invalid conversion from throwing function of type '(Thirteen) throws -> ()' to non-throwing function type '(Thirteen) -> ()'}}
     do {
       try thrower()
-    } catch a {
+      // FIXME: Bad diagnostic (https://github.com/apple/swift/issues/63459)
+    } catch a { // expected-error {{binary operator '~=' cannot be applied to two 'any Error' operands}}
     }
   }
+}
+
+// https://github.com/apple/swift/issues/48950
+protocol ClassProto: AnyObject {}
+do {
+  enum E: Error {
+    case castError
+  }
+
+  do {
+    struct S1 {}
+    struct S2: Error {}
+
+    do {
+      throw E.castError
+    } catch is S1 {} // expected-warning {{cast from 'any Error' to unrelated type 'S1' always fails}}
+
+    do {
+      throw E.castError
+    } catch is S2 {} // Ok
+  }
+
+  do {
+    class C1 {}
+    class C2: ClassProto & Error {}
+
+    do {
+      throw E.castError
+    } catch let error as C1 { // Okay
+      print(error)
+    } catch {}
+
+    do {
+      throw E.castError
+    } catch let error as C2 { // Okay
+      print(error)
+    } catch {}
+
+    let err: Error
+    _ = err as? (C1 & Error) // Ok
+    _ = err as? (Error & ClassProto) // Ok
+  }
+
+  func f<T>(error: Error, as type: T.Type) -> Bool {
+    return (error as? T) != nil // Ok
+  }
+}
+
+// https://github.com/apple/swift/issues/53803
+protocol P {}
+do {
+  class Super {}
+  class Sub: Super, P {}
+  final class Final {}
+
+  let x: any P
+
+  if let _ = x as? Super {} // Okay
+
+  if let _ = x as? Final {} // expected-warning {{cast from 'any P' to unrelated type 'Final' always fails}}
+}
+
+// https://github.com/apple/swift/issues/56091
+do {
+  func f() throws -> String {}
+
+  func invalid_interpolation() {
+    _ = try "\(f())" // expected-error {{errors thrown from here are not handled}}
+    _ = "\(try f())" // expected-error {{errors thrown from here are not handled}}
+  }
+
+  func valid_interpolation() throws {
+    _ = try "\(f())"
+    _ = "\(try f())"
+  }
+}
+
+// rdar://problem/72748150
+func takesClosure(_: (() -> ())) throws -> Int {}
+
+func passesClosure() {
+    _ = try takesClosure { } // expected-error {{errors thrown from here are not handled}}
 }

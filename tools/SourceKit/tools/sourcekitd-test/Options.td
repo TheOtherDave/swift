@@ -16,6 +16,13 @@ def req : Separate<["-"], "req">,
   HelpText<"Request kind">;
 def req_EQ : Joined<["-"], "req=">, Alias<req>;
 
+def id : Separate<["-"], "id">,
+  HelpText<"If this is an async request, an ID that can be used to cancel the request">;
+def id_EQ : Joined<["-"], "id=">, Alias<id>;
+
+def primary_file : Separate<["-"], "primary-file">,
+  HelpText<"Primary file path">;
+
 def offset : Separate<["-"], "offset">,
   HelpText<"byte offset">;
 def offset_EQ : Joined<["-"], "offset=">, Alias<offset>;
@@ -80,6 +87,9 @@ def print_response_as_json : Flag<["-"], "print-response-as-json">,
 def print_raw_response : Flag<["-"], "print-raw-response">,
   HelpText<"Dump the response to stdout">;
 
+def dont_print_response : Flag<["-"], "dont-print-response">,
+  HelpText<"Do not print the response">;
+
 def group_name : Separate<["-"], "group-name">,
   HelpText<"Module group name to print">;
 
@@ -98,11 +108,30 @@ def interested_usr : Separate<["-"], "interested-usr">,
 def async : Flag<["-"], "async">,
   HelpText<"Perform request asynchronously">;
 
+def disable_implicit_concurrency_module_import : Flag<["-"],
+    "disable-implicit-concurrency-module-import">,
+  HelpText<"Disable implicit import of the _Concurrency module">;
+
+def disable_implicit_string_processing_module_import : Flag<["-"],
+    "disable-implicit-string-processing-module-import">,
+  HelpText<"Disable implicit import of the _StringProcessing module">;
+
+def enable_implicit_backtracing_module_import : Flag<["-"],
+    "enable-implicit-backtracing-module-import">,
+  HelpText<"Enable implicit import of the _Backtracing module">;
+
+def disable_implicit_backtracing_module_import : Flag<["-"],
+    "disable-implicit-backtracing-module-import">,
+  HelpText<"Disable implicit import of the _Backtracing module">;
+
 def end_pos : Separate<["-"], "end-pos">, HelpText<"line:col">;
 def end_pos_EQ : Joined<["-"], "end-pos=">, Alias<end_pos>;
 
 def swift_version : Separate<["-"], "swift-version">, HelpText<"the swift version to use">;
 def swift_version_EQ : Joined<["-"], "swift-version=">, Alias<swift_version>;
+
+def pass_version_as_string : Flag<["-"], "pass-version-as-string">,
+  HelpText<"Pass swift-version as string">;
 
 def swift_name : Separate<["-"], "swift-name">,
   HelpText<"Swift name to translate from">;
@@ -120,6 +149,45 @@ def cancel_on_subsequent_request : Separate<["-"], "cancel-on-subsequent-request
   HelpText<"Whether to cancel if there is a subsequent request using the same AST">;
 def cancel_on_subsequent_request_EQ : Joined<["-"], "cancel-on-subsequent-request=">,
   Alias<cancel_on_subsequent_request>;
+
+def time_request : Flag<["-"], "time-request">,
+  HelpText<"Print the time taken to process the request">;
+
+def measure_instructions : Flag<["-"], "measure-instructions">,
+  HelpText<"Measure how many instructions the execution of this request took in the SourceKit process.">;
+
+def repeat_request : Separate<["-"], "repeat-request">,
+  HelpText<"Repeat the request n times">, MetaVarName<"<n>">;
+def repeat_request_EQ : Joined<["-"], "repeat-request=">, Alias<repeat_request>;
+
+def vfs_files : CommaJoined<["-"], "vfs-files=">,
+  HelpText<"Injects a VFS into the request, overlaying files specified by the given <name>=<target> pairs over the real filesystem. Prefix destination with '@' to pass as sourcetext.">;
+
+def vfs_name : Separate<["-"], "vfs-name">,
+  HelpText<"Specify a virtual filesystem name">;
+
+def index_store_path : Separate<["-"], "index-store-path">,
+  HelpText<"Index Store path to use for indexing">;
+
+def index_unit_output_path : Separate<["-"], "index-unit-output-path">,
+  HelpText<"Index Store unit output path to use for indexing">;
+
+def suppress_config_request : Flag<["-"], "suppress-config-request">,
+  HelpText<"Suppress the default global configuration request, that is otherwise sent before any other request (except for the global-config request itself)">;
+
+def module_cache_path: Separate<["-"], "module-cache-path">, HelpText<"module cache path">;
+def module_cache_path_EQ : Joined<["-"], "module-cache-path=">, Alias<module_cache_path>;
+
+def simulate_long_request : Separate<["-"], "simulate-long-request">,
+  HelpText<"Simulate that the request takes x ms longer to execute. The request can be cancelled while waiting this duration">;
+def simulate_long_request_EQ : Joined<["-"], "simulate-long-request=">, Alias<simulate_long_request>;
+
+def shell: Flag<["-"], "shell">,
+  HelpText<"Run shell command">;
+
+def cancel : Separate<["-"], "cancel">,
+  HelpText<"Cancel all async requests with the given ID">;
+def cancel_EQ : Joined<["-"], "cancel=">, Alias<cancel>;
 
 def help : Flag<["-", "--"], "help">,
   HelpText<"Display available options">;

@@ -11,21 +11,19 @@
 //===----------------------------------------------------------------------===//
 
 #include "sourcekitd/DocSupportAnnotationArray.h"
+#include "sourcekitd/DictionaryKeys.h"
 #include "sourcekitd/CompactArray.h"
 #include "SourceKit/Core/LangSupport.h"
 #include "llvm/Support/MemoryBuffer.h"
 
-#include "DictionaryKeys.h"
 
 using namespace SourceKit;
 using namespace sourcekitd;
 
 struct DocSupportAnnotationArrayBuilder::Implementation {
-  CompactArrayBuilder<UIdent,
-                      Optional<StringRef>,
-                      Optional<StringRef>,
-                      unsigned,
-                      unsigned> Builder;
+  CompactArrayBuilder<UIdent, std::optional<StringRef>,
+                      std::optional<StringRef>, unsigned, unsigned>
+      Builder;
 };
 
 DocSupportAnnotationArrayBuilder::DocSupportAnnotationArrayBuilder()
@@ -38,10 +36,10 @@ DocSupportAnnotationArrayBuilder::~DocSupportAnnotationArrayBuilder() {
 }
 
 void DocSupportAnnotationArrayBuilder::add(const DocEntityInfo &Info) {
-  Optional<StringRef> NameOpt;
+  std::optional<StringRef> NameOpt;
   if (!Info.Name.empty())
     NameOpt = Info.Name;
-  Optional<StringRef> USROpt;
+  std::optional<StringRef> USROpt;
   if (!Info.USR.empty())
     USROpt = Info.USR;
   Impl.Builder.addEntry(Info.Kind,
@@ -53,7 +51,7 @@ void DocSupportAnnotationArrayBuilder::add(const DocEntityInfo &Info) {
 
 std::unique_ptr<llvm::MemoryBuffer>
 DocSupportAnnotationArrayBuilder::createBuffer() {
-  return Impl.Builder.createBuffer();
+  return Impl.Builder.createBuffer(CustomBufferKind::DocSupportAnnotationArray);
 }
 
 namespace {

@@ -28,6 +28,7 @@ The protocol is documented in the following format:
 | [Module interface generation](#module-interface-generation) | source.request.editor.open.interface |
 | [Indexing](#indexing) | source.request.indexsource  |
 | [Protocol Version](#protocol-version) | source.request.protocol_version |
+| [Compiler Version](#compiler-version) | source.request.compiler_version |
 
 
 # Requests
@@ -309,15 +310,19 @@ entity ::=
 ```
 diagnostic ::=
 {
-    <key.line>:        (int64)  // The line upon which the diagnostic was emitted.
-    <key.column>:      (int64)  // The column upon which the diagnostic was emitted.
-    <key.filepath>:    (string) // The absolute path to the file that was being parsed
-                                // when the diagnostic was emitted.
-    <key.severity>:    (UID)    // The severity of the diagnostic. Can be one of:
-                                //   - source.diagnostic.severity.note
-                                //   - source.diagnostic.severity.warning
-                                //   - source.diagnostic.severity.error
-    <key.description>: (string) // A description of the diagnostic.
+    <key.id>:               (string)       // The internal ID of the diagnostic.
+    <key.line>:             (int64)        // The line upon which the diagnostic was emitted.
+    <key.column>:           (int64)        // The column upon which the diagnostic was emitted.
+    <key.filepath>:         (string)       // The absolute path to the file that was being parsed
+                                           // when the diagnostic was emitted.
+    <key.severity>:         (UID)          // The severity of the diagnostic. Can be one of:
+                                           //   - source.diagnostic.severity.note
+                                           //   - source.diagnostic.severity.warning
+                                           //   - source.diagnostic.severity.error
+    <key.description>:      (string)       // A description of the diagnostic.
+    [opt] <key.categories>: (array) [UID*] // The categories of the diagnostic. Can be:
+                                           //   - source.diagnostic.category.deprecation
+                                           //   - source.diagnostic.category.no_usage
 }
 ```
 
@@ -357,6 +362,7 @@ Welcome to SourceKit.  Type ':help' for assistance.
     <key.modulename>:       (string) // Full module name, e.g. "Foundation.NSArray"
     [opt] <key.compilerargs> [string*] // array of zero or more strings for the compiler arguments
                                        // e.g ["-sdk", "/path/to/sdk"]
+    [opt] <key.enabledeclarations> (int) // 0 by default, 1 to enable the declarations array in the output
 }
 ```
 
@@ -364,9 +370,11 @@ Welcome to SourceKit.  Type ':help' for assistance.
 
 This will return the Swift interface of the specified module.
 
-- `key.sourcetext`: The pretty-printed module interface in swift source code
+- `key.sourcetext`: The pretty-printed module interface in swift source code.
 - `key.syntaxmap`: An array of syntactic annotations, same as the one returned for the source.request.editor.open request.
 - `key.annotations`: An array of semantic annotations, same as the one returned for the source.request.editor.open request.
+- `key.substructure`: An array of dictionaries representing ranges of structural elements in the result description, such as the parameters of a function.
+- (optional, only if `key.enabledeclarations: 1`) `key.declarations`: An array of declarations, containing the kind, USR (if available), offset, and length of the declaration.
 
 All SourceKit requests that don't modify the source buffer should work on the
 opened document, by passing the associated 'name' for the document.
@@ -417,6 +425,7 @@ of diagnostic entries. A diagnostic entry has this format:
     [opts] <key.fixits>:    (array) [fixit+] // one or more entries for fixits
     [opts] <key.ranges>:    (array) [range+] // one or more entries for ranges
     [opts] <key.diagnostics>: (array) [diagnostic+] // one or more sub-diagnostic entries
+    [opts] <key.educational_note_paths>: (array) [string+] // one or more absolute paths of educational notes, formatted as Markdown
 }
 ```
 
@@ -615,6 +624,45 @@ Welcome to SourceKit.  Type ':help' for assistance.
 }
 ```
 
+## Compiler Version
+
+SourceKit can provide information about the version of the compiler version that is being used.
+
+### Request
+
+```
+{
+    <key.request>: (UID) <source.request.compiler_version>
+}
+```
+
+### Response
+
+```
+{
+    <key.version_major>: (int64) // The major version number in a version string
+    <key.version_minor>: (int64) // The minor version number in a version string
+    <key.version_patch>: (int64) // The patch version number in a version string
+}
+```
+
+### Testing
+
+```
+$ sourcekitd-test -req=compiler-version
+```
+
+or
+
+```
+$ sourcekitd-repl
+Welcome to SourceKit.  Type ':help' for assistance.
+(SourceKit) {
+    key.request: source.request.compiler_version
+}
+```
+
+
 ## Cursor Info
 
 SourceKit is capable of providing information about a specific symbol at a specific cursor, or offset, position in a document.
@@ -697,7 +745,93 @@ Welcome to SourceKit.  Type ':help' for assistance.
 }
 ```
 
+## Expression Type
+This request collects the types of all expressions in a source file after type checking.
+To fulfill this task, the client must provide the path to the Swift source file under
+type checking and the necessary compiler arguments to help resolve all dependencies.
 
+### Request
+
+```
+{
+    <key.request>:                  (UID)     <source.request.expression.type>,
+    <key.sourcefile>:               (string)  // Absolute path to the file.
+    <key.compilerargs>:             [string*] // Array of zero or more strings for the compiler arguments,
+                                              // e.g ["-sdk", "/path/to/sdk"]. If key.sourcefile is provided,
+                                              // these must include the path to that file.
+    <key.expectedtypes>:            [string*] // A list of interested protocol USRs.
+                                              // When empty, we report all expressions in the file.
+                                              // When non-empty, we report expressions whose types conform to any of the give protocols.
+    [opt] <key.fully_qualified>:    (bool)    // True when fully qualified type should be returned. Defaults to False.
+}
+```
+
+### Response
+```
+{
+    <key.expression_type_list>:       (array) [expr-type-info*]   // A list of expression and type
+}
+```
+
+```
+expr-type-info ::=
+{
+  <key.expression_offset>:    (int64)    // Offset of an expression in the source file
+  <key.expression_length>:    (int64)    // Length of an expression in the source file
+  <key.expression_type>:      (string)   // Printed type of this expression
+  <key.expectedtypes>:        [string*]  // A list of interested protocol USRs this expression conforms to
+}
+```
+
+### Testing
+
+```
+$ sourcekitd-test -req=collect-type /path/to/file.swift -- /path/to/file.swift
+```
+
+## Variable Type
+
+This request collects the types of all variable declarations in a source file after type checking.
+To fulfill this task, the client must provide the path to the Swift source file under
+type checking and the necessary compiler arguments to help resolve all dependencies.
+
+### Request
+
+```
+{
+    <key.request>:                  (UID)     <source.request.variable.type>,
+    <key.sourcefile>:               (string)  // Absolute path to the file.
+    <key.compilerargs>:             [string*] // Array of zero or more strings for the compiler arguments,
+                                              // e.g ["-sdk", "/path/to/sdk"]. If key.sourcefile is provided,
+                                              // these must include the path to that file.
+    [opt] <key.offset>:             (int64)   // Offset of the requested range. Defaults to zero.
+    [opt] <key.length>:             (int64)   // Length of the requested range. Defaults to the entire file.
+    [opt] <key.fully_qualified>:    (bool)    // True when fully qualified type should be returned. Defaults to False.
+}
+```
+
+### Response
+```
+{
+    <key.variable_type_list>: (array) [var-type-info*]   // A list of variable declarations and types
+}
+```
+
+```
+var-type-info ::=
+{
+    <key.variable_offset>:       (int64)    // Offset of a variable identifier in the source file
+    <key.variable_length>:       (int64)    // Length of a variable identifier an expression in the source file
+    <key.variable_type>:         (string)   // Printed type of the variable declaration
+    <key.variable_type_explicit> (bool)     // Whether the declaration has an explicit type annotation
+}
+```
+
+### Testing
+
+```
+$ sourcekitd-test -req=collect-var-type /path/to/file.swift -- /path/to/file.swift
+```
 
 # UIDs
 

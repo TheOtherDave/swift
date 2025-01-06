@@ -5,7 +5,6 @@
 // UNSUPPORTED: OS=ios
 // UNSUPPORTED: OS=tvos
 // UNSUPPORTED: OS=watchos
-// UNSUPPORTED: OS=linux-androideabi
 
 // REQUIRES: OS=linux-gnu
 

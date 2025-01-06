@@ -14,13 +14,13 @@
 #define SWIFT_SILOPTIMIZER_PASSMANAGER_ARC_GLOBALLOOPARCSEQUENCEDATAFLOW_H
 
 #include "RefCountState.h"
+#include "swift/Basic/BlotMapVector.h"
+#include "swift/Basic/ImmutablePointerSet.h"
+#include "swift/Basic/NullablePtr.h"
 #include "swift/SILOptimizer/Analysis/LoopRegionAnalysis.h"
 #include "swift/SILOptimizer/Analysis/ProgramTerminationAnalysis.h"
-#include "swift/Basic/BlotMapVector.h"
-#include "swift/Basic/NullablePtr.h"
-#include "swift/Basic/ImmutablePointerSet.h"
 #include "llvm/ADT/MapVector.h"
-#include "llvm/ADT/Optional.h"
+#include <optional>
 
 namespace swift {
 
@@ -40,7 +40,7 @@ class LoopARCSequenceDataflowEvaluator {
   llvm::BumpPtrAllocator Allocator;
 
   /// The factory that we use to generate immutable pointer sets.
-  ImmutablePointerSetFactory<SILInstruction> SetFactory;
+  ImmutablePointerSetFactory<SILInstruction *> SetFactory;
 
   /// The SILFunction that we are applying the dataflow to.
   SILFunction &F;
@@ -71,6 +71,9 @@ class LoopARCSequenceDataflowEvaluator {
 
   /// Stashed information for each region.
   llvm::DenseMap<const LoopRegion *, ARCRegionState *> RegionStateInfo;
+
+  /// Set of unmatched RefCountInsts
+  llvm::DenseSet<SILInstruction *> UnmatchedRefCountInsts;
 
 public:
   LoopARCSequenceDataflowEvaluator(
@@ -108,6 +111,10 @@ public:
   /// Remove \p I from the interesting instruction list of its parent block.
   void removeInterestingInst(SILInstruction *I);
 
+  /// Compute if a RefCountInst was unmatched and populate the persistent
+  /// UnmatchedRefCountInsts set.
+  void saveMatchingInfo(const LoopRegion *R);
+
   /// Clear the folding node set of the set factory we have stored internally.
   void clearSetFactory() {
     SetFactory.clear();
@@ -134,6 +141,8 @@ private:
   bool processLoopTopDown(const LoopRegion *R);
   bool processLoopBottomUp(const LoopRegion *R,
                            bool FreezeOwnedArgEpilogueReleases);
+
+  void dumpDataflowResults();
 };
 
 } // end swift namespace

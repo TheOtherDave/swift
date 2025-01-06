@@ -19,7 +19,7 @@
 #define SWIFT_AST_WITNESS_H
 
 #include "swift/AST/ConcreteDeclRef.h"
-#include "swift/AST/SubstitutionList.h"
+#include "swift/Basic/Debug.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/Support/Compiler.h"
 
@@ -72,7 +72,7 @@ class ValueDecl;
 /// The witness for \c R.foo(x:) is \c X<U, V>.foo(x:), but the generic
 /// functions that describe the generic requirement in \c R and the generic
 /// method in \c X have very different signatures. To handle this case, the
-/// \c Witness class produces a "synthetic" environment that pulls together
+/// \c Witness class produces a witness thunk signature that pulls together
 /// all of the information needed to map from the requirement to the witness.
 /// It is a generic environment that combines the constraints of the
 /// requirement with the constraints from the context of the protocol
@@ -81,19 +81,23 @@ class ValueDecl;
 /// environment are those of the context of the protocol conformance (\c U
 /// and \c V, in the example above) and the innermost generic parameters are
 /// those of the generic requirement (\c T, in the example above). The
-/// \c Witness class contains this synthetic environment (both its generic
+/// \c Witness class contains this witness thunk signature (both its generic
 /// signature and a generic environment providing archetypes), a substitution
 /// map that allows one to map the interface types of the requirement into
-/// the interface types of the synthetic domain, and the set of substitutions
-/// required to use the witness from the synthetic domain (e.g., how one would
+/// the interface types of the witness thunk domain, and the set of substitutions
+/// required to use the witness from the witness thunk domain (e.g., how one would
 /// call the witness from the witness thunk).
 class Witness {
   struct StoredWitness {
     /// The witness declaration, along with the substitutions needed to use
-    /// the witness declaration from the synthetic environment.
+    /// the witness declaration from the witness thunk signature.
     ConcreteDeclRef declRef;
-    GenericEnvironment *syntheticEnvironment;
-    SubstitutionList reqToSyntheticEnvSubs;
+    GenericSignature witnessThunkSig;
+    SubstitutionMap reqToWitnessThunkSigSubs;
+    /// The derivative generic signature, when the requirement is a derivative
+    /// function.
+    GenericSignature derivativeGenSig;
+    std::optional<ActorIsolation> enterIsolation;
   };
 
   llvm::PointerUnion<ValueDecl *, StoredWitness *> storage;
@@ -118,24 +122,42 @@ public:
     return Witness(requirement);
   }
 
+  /// Create a witness for the given requirement.
+  ///
+  /// Deserialized witnesses do not have a witness thunk signature.
+  static Witness forDeserialized(ValueDecl *decl, SubstitutionMap substitutions,
+                                 std::optional<ActorIsolation> enterIsolation) {
+    // TODO: It's probably a good idea to have a separate 'deserialized' bit.
+    return Witness(
+        decl, substitutions, nullptr, SubstitutionMap(), CanGenericSignature(),
+        enterIsolation);
+  }
+
   /// Create a witness that requires substitutions.
   ///
   /// \param decl The declaration for the witness.
   ///
   /// \param substitutions The substitutions required to use the witness from
-  /// the synthetic environment.
+  /// the witness thunk signature.
   ///
-  /// \param syntheticEnv The synthetic environment.
+  /// \param witnessThunkSig The witness thunk signature.
   ///
-  /// \param reqToSyntheticEnvSubs The mapping from the interface types of the
-  /// requirement into the interface types of the synthetic environment.
-  Witness(ValueDecl *decl,
-          SubstitutionList substitutions,
-          GenericEnvironment *syntheticEnv,
-          SubstitutionList reqToSyntheticEnvSubs);
+  /// \param reqToWitnessThunkSigSubs The mapping from the interface types of the
+  /// requirement into the interface types of the witness thunk signature.
+  ///
+  /// \param derivativeGenSig The derivative generic signature, when the
+  /// requirement is a derivative function.
+  ///
+  /// \param enterIsolation The actor isolation that the witness thunk will
+  /// need to hop to before calling the witness.
+  Witness(ValueDecl *decl, SubstitutionMap substitutions,
+          GenericSignature witnessThunkSig,
+          SubstitutionMap reqToWitnessThunkSigSubs,
+          GenericSignature derivativeGenSig,
+          std::optional<ActorIsolation> enterIsolation);
 
   /// Retrieve the witness declaration reference, which includes the
-  /// substitutions needed to use the witness from the synthetic environment
+  /// substitutions needed to use the witness from the witness thunk signature
   /// (if any).
   ConcreteDeclRef getDeclRef() const {
     if (auto stored = storage.dyn_cast<StoredWitness *>())
@@ -150,36 +172,82 @@ public:
   /// Determines whether there is a witness at all.
   explicit operator bool() const { return !storage.isNull(); }
 
-  /// Determine whether this witness requires any substitutions.
-  bool requiresSubstitution() const { return storage.is<StoredWitness *>(); }
-
   /// Retrieve the substitutions required to use this witness from the
-  /// synthetic environment.
-  ///
-  /// The substitutions are substitutions for the witness, providing interface
-  /// types from the synthetic environment.
-  SubstitutionList getSubstitutions() const {
+  /// witness thunk signature.
+  SubstitutionMap getSubstitutions() const {
     return getDeclRef().getSubstitutions();
   }
 
-  /// Retrieve the synthetic generic environment.
-  GenericEnvironment *getSyntheticEnvironment() const {
-    assert(requiresSubstitution() && "No substitutions required for witness");
-    return storage.get<StoredWitness *>()->syntheticEnvironment;
+  /// Retrieve the witness thunk generic signature.
+  GenericSignature getWitnessThunkSignature() const {
+    if (auto *storedWitness = storage.dyn_cast<StoredWitness *>())
+      return storedWitness->witnessThunkSig;
+    return nullptr;
   }
 
   /// Retrieve the substitution map that maps the interface types of the
-  /// requirement to the interface types of the synthetic environment.
-  SubstitutionList getRequirementToSyntheticSubs() const {
-    assert(requiresSubstitution() && "No substitutions required for witness");
-    return storage.get<StoredWitness *>()->reqToSyntheticEnvSubs;
+  /// requirement to the interface types of the witness thunk signature.
+  SubstitutionMap getRequirementToWitnessThunkSubs() const {
+    if (auto *storedWitness = storage.dyn_cast<StoredWitness *>())
+      return storedWitness->reqToWitnessThunkSigSubs;
+    return {};
   }
 
-  LLVM_ATTRIBUTE_DEPRECATED(
-    void dump() const LLVM_ATTRIBUTE_USED,
-    "only for use within the debugger");
+  /// Retrieve the derivative generic signature.
+  GenericSignature getDerivativeGenericSignature() const {
+    if (auto *storedWitness = storage.dyn_cast<StoredWitness *>())
+      return storedWitness->derivativeGenSig;
+    return GenericSignature();
+  }
+
+  std::optional<ActorIsolation> getEnterIsolation() const {
+    if (auto *storedWitness = storage.dyn_cast<StoredWitness *>())
+      return storedWitness->enterIsolation;
+
+    return std::nullopt;
+  }
+
+  /// Retrieve a copy of the witness with an actor isolation that the
+  /// witness thunk will need to hop to.
+  Witness withEnterIsolation(ActorIsolation enterIsolation) const;
+
+  SWIFT_DEBUG_DUMP;
 
   void dump(llvm::raw_ostream &out) const;
+};
+
+struct TypeWitnessAndDecl {
+  Type witnessType;
+  TypeDecl *witnessDecl = nullptr;
+
+  TypeWitnessAndDecl() = default;
+  TypeWitnessAndDecl(Type ty, TypeDecl *decl)
+    : witnessType(ty), witnessDecl(decl) {}
+
+public:
+  Type getWitnessType() const {
+    return witnessType;
+  }
+
+  TypeDecl *getWitnessDecl() const {
+    return witnessDecl;
+  }
+
+  friend llvm::hash_code hash_value(const TypeWitnessAndDecl &owner) {
+    return llvm::hash_combine(owner.witnessType.getPointer(),
+                              owner.witnessDecl);
+  }
+
+  friend bool operator==(const TypeWitnessAndDecl &lhs,
+                         const TypeWitnessAndDecl &rhs) {
+    return lhs.witnessType.getPointer() == rhs.witnessType.getPointer() &&
+           lhs.witnessDecl == rhs.witnessDecl;
+  }
+
+  friend bool operator!=(const TypeWitnessAndDecl &lhs,
+                         const TypeWitnessAndDecl &rhs) {
+    return !(lhs == rhs);
+  }
 };
 
 } // end namespace swift

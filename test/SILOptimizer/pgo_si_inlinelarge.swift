@@ -1,12 +1,15 @@
-// RUN: rm -rf %t && mkdir %t
+// RUN: %empty-directory(%t)
 // RUN: %target-build-swift %s -profile-generate -Xfrontend -disable-incremental-llvm-codegen -module-name pgo_si_inlinelarge -o %t/main
-// RUN: env LLVM_PROFILE_FILE=%t/default.profraw %target-run %t/main
+
+// RUN: %target-codesign %t/main
+// RUN: env %env-LLVM_PROFILE_FILE=%t/default.profraw %target-run %t/main
+
 // RUN: %llvm-profdata merge %t/default.profraw -o %t/default.profdata
-// RUN: %target-swift-frontend %s -profile-use=%t/default.profdata -emit-sorted-sil -emit-sil -module-name pgo_si_inlinelarge -o - | %FileCheck %s --check-prefix=SIL
-// RUN: %target-swift-frontend %s -profile-use=%t/default.profdata -O -emit-sorted-sil -emit-sil -module-name pgo_si_inlinelarge -o - | %FileCheck %s --check-prefix=SIL-OPT
+// RUN: %target-swift-frontend %s -profile-use=%t/default.profdata -emit-sorted-sil -Xllvm -sil-print-types -emit-sil -module-name pgo_si_inlinelarge -o - | %FileCheck %s --check-prefix=SIL
+// RUN: %target-swift-frontend %s -profile-use=%t/default.profdata -O -emit-sorted-sil -Xllvm -sil-print-types -emit-sil -module-name pgo_si_inlinelarge -o - | %FileCheck %s --check-prefix=SIL-OPT
 
 // REQUIRES: profile_runtime
-// REQUIRES: OS=macosx
+// REQUIRES: executable_test
 
 public func bar(_ x: Int64) -> Int64 {
   if (x == 0) {
@@ -102,15 +105,15 @@ public func bar(_ x: Int64) -> Int64 {
   return ret
 }
 
-// SIL-LABEL: sil @_T018pgo_si_inlinelarge3fooys5Int64VF : $@convention(thin) (Int64) -> () !function_entry_count(1) {
-// SIL-OPT-LABEL: sil @_T018pgo_si_inlinelarge3fooys5Int64VF : $@convention(thin) (Int64) -> () !function_entry_count(1) {
+// SIL-LABEL: sil @$s18pgo_si_inlinelarge3fooyys5Int64VF : $@convention(thin) (Int64) -> () !function_entry_count(1) {
+// SIL-OPT-LABEL: sil @$s18pgo_si_inlinelarge3fooyys5Int64VF : $@convention(thin) (Int64) -> () !function_entry_count(1) {
 public func foo(_ x: Int64) {
-  // SIL: switch_enum {{.*}} : $Optional<Int64>, case #Optional.some!enumelt.1: {{.*}} !case_count(100), case #Optional.none!enumelt: {{.*}} !case_count(1)
+  // SIL: switch_enum {{.*}} : $Optional<Int64>, case #Optional.some!enumelt: {{.*}} !case_count(100), case #Optional.none!enumelt: {{.*}} !case_count(1)
   // SIL: cond_br {{.*}}, {{.*}}, {{.*}} !true_count(50)
   // SIL: cond_br {{.*}}, {{.*}}, {{.*}} !true_count(1)
   // SIL-OPT: integer_literal $Builtin.Int64, 93
   // SIL-OPT: integer_literal $Builtin.Int64, 42
-  // SIL-OPT: function_ref @_T018pgo_si_inlinelarge3bars5Int64VADF : $@convention(thin) (Int64) -> Int64
+  // SIL-OPT: function_ref @$s18pgo_si_inlinelarge3barys5Int64VADF : $@convention(thin) (Int64) -> Int64
 
   var sum : Int64 = 0
   for index in 1...x {
@@ -124,7 +127,7 @@ public func foo(_ x: Int64) {
   }
   print(sum)
 }
-// SIL-LABEL: } // end sil function '_T018pgo_si_inlinelarge3fooys5Int64VF'
-// SIL-OPT-LABEL: } // end sil function '_T018pgo_si_inlinelarge3fooys5Int64VF'
+// SIL-LABEL: } // end sil function '$s18pgo_si_inlinelarge3fooyys5Int64VF'
+// SIL-OPT-LABEL: } // end sil function '$s18pgo_si_inlinelarge3fooyys5Int64VF'
 
 foo(100)

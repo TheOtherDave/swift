@@ -11,7 +11,7 @@
 //===----------------------------------------------------------------------===//
 ///
 /// \file
-/// \brief Defines version macros and version-related utility functions
+/// Defines version macros and version-related utility functions
 /// for Swift.
 ///
 //===----------------------------------------------------------------------===//
@@ -19,17 +19,17 @@
 #ifndef SWIFT_BASIC_VERSION_H
 #define SWIFT_BASIC_VERSION_H
 
-
 #include "swift/Basic/LLVM.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
-#include "clang/Basic/VersionTuple.h"
+#include "llvm/Support/VersionTuple.h"
+#include <array>
+#include <optional>
 #include <string>
 
 namespace swift {
 
-class DiagnosticEngine;
+class VersionParser;
 class SourceLoc;
 
 namespace version {
@@ -52,6 +52,7 @@ namespace version {
 /// a: [0 - 999]
 /// b: [0 - 999]
 class Version {
+  friend class swift::VersionParser;
   SmallVector<unsigned, 5> Components;
 public:
   /// Create the empty compiler version - this always compares greater
@@ -62,10 +63,8 @@ public:
   /// Create a literal version from a list of components.
   Version(std::initializer_list<unsigned> Values) : Components(Values) {}
 
-  /// Create a version from a string in source code.
-  ///
-  /// Must include only groups of digits separated by a dot.
-  Version(StringRef VersionString, SourceLoc Loc, DiagnosticEngine *Diags);
+  /// Create a version from an llvm::VersionTuple.
+  Version(const llvm::VersionTuple &version);
 
   /// Return a string to be used as an internal preprocessor define.
   ///
@@ -93,9 +92,9 @@ public:
     return Components.empty();
   }
 
-  /// Convert to a (maximum-4-element) clang::VersionTuple, truncating
+  /// Convert to a (maximum-4-element) llvm::VersionTuple, truncating
   /// away any 5th component that might be in this version.
-  operator clang::VersionTuple() const;
+  operator llvm::VersionTuple() const;
 
   /// Returns the concrete version to use when \e this version is provided as
   /// an argument to -swift-version.
@@ -105,37 +104,28 @@ public:
   /// support for. It's also common for valid versions to produce a different
   /// result; for example "-swift-version 3" at one point instructed the
   /// compiler to act as if it is version 3.1.
-  Optional<Version> getEffectiveLanguageVersion() const;
-
-  /// Whether this version is in the Swift 3 family
-  bool isVersion3() const { return !empty() && Components[0] == 3; }
+  std::optional<Version> getEffectiveLanguageVersion() const;
 
   /// Whether this version is greater than or equal to the given major version
   /// number.
-  bool isVersionAtLeast(unsigned major) const {
-    return !empty() && Components[0] >= major;
+  bool isVersionAtLeast(unsigned major, unsigned minor = 0) const {
+    switch (size()) {
+    case 0:
+      return false;
+    case 1:
+      return ((Components[0] == major && 0 == minor) ||
+              (Components[0] > major));
+    default:
+      return ((Components[0] == major && Components[1] >= minor) ||
+              (Components[0] > major));
+    }
   }
 
   /// Return this Version struct with minor and sub-minor components stripped
   Version asMajorVersion() const;
 
-  /// Parse a version in the form used by the _compiler_version \#if condition.
-  static Optional<Version> parseCompilerVersionString(StringRef VersionString,
-                                                      SourceLoc Loc,
-                                                      DiagnosticEngine *Diags);
-
-  /// Parse a generic version string of the format [0-9]+(.[0-9]+)*
-  ///
-  /// Version components can be any unsigned 64-bit number.
-  static Optional<Version> parseVersionString(StringRef VersionString,
-                                              SourceLoc Loc,
-                                              DiagnosticEngine *Diags);
-
-  /// Returns a version from the currently defined SWIFT_COMPILER_VERSION.
-  ///
-  /// If SWIFT_COMPILER_VERSION is undefined, this will return the empty
-  /// compiler version.
-  static Version getCurrentCompilerVersion();
+  /// Return this Version struct as the appropriate version string for APINotes.
+  std::string asAPINotesVersionString() const;
 
   /// Returns a version from the currently defined SWIFT_VERSION_MAJOR and
   /// SWIFT_VERSION_MINOR.
@@ -143,12 +133,13 @@ public:
 
   // List of backward-compatibility versions that we permit passing as
   // -swift-version <vers>
-  static std::array<StringRef, 3> getValidEffectiveVersions() {
-    return {{"3", "4", "5"}};
+  static std::array<StringRef, 4> getValidEffectiveVersions() {
+    return {{"4", "4.2", "5", "6"}};
   };
 };
 
 bool operator>=(const Version &lhs, const Version &rhs);
+bool operator<(const Version &lhs, const Version &rhs);
 bool operator==(const Version &lhs, const Version &rhs);
 inline bool operator!=(const Version &lhs, const Version &rhs) {
   return !(lhs == rhs);
@@ -171,7 +162,34 @@ std::string getSwiftFullVersion(Version effectiveLanguageVersion =
 
 /// Retrieves the repository revision number (or identifier) from which
 /// this Swift was built.
-std::string getSwiftRevision();
+StringRef getSwiftRevision();
+
+/// Is the running compiler built with a version tag for distribution?
+/// When true, \c version::getCurrentCompilerVersion returns a valid version
+/// and \c getCurrentCompilerTag returns the version tuple in string format.
+bool isCurrentCompilerTagged();
+
+/// Retrieves the distribution tag of the running compiler, if any.
+StringRef getCurrentCompilerTag();
+
+/// Retrieves the distribution tag of the running compiler for serialization,
+/// if any. This can hold more information than \c getCurrentCompilerTag
+/// depending on the vendor.
+StringRef getCurrentCompilerSerializationTag();
+
+/// Distribution channel of the running compiler for distributed swiftmodules.
+/// Helps to distinguish swiftmodules between different compilers using the
+/// same serialization tag.
+StringRef getCurrentCompilerChannel();
+
+/// Retrieves the value of the upcoming C++ interoperability compatibility
+/// version that's going to be presented as some new concrete version to the
+/// users.
+unsigned getUpcomingCxxInteropCompatVersion();
+
+/// Retrieves the version of the running compiler. It could be a tag or
+/// a "development" version that only has major/minor.
+std::string getCompilerVersion();
 
 } // end namespace version
 } // end namespace swift

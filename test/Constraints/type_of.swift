@@ -78,3 +78,12 @@ func bar() -> UInt {}   // expected-note {{found this candidate}}
 foo(type(of: G.T.self)) // Ok
 let _: Any = type(of: G.T.self) // Ok
 foo(type(of: bar())) // expected-error {{ambiguous use of 'bar()'}}
+
+// https://github.com/apple/swift/issues/53093
+do {
+  struct S {
+    func bar(_ s: S.Type) {
+      type(of: s)() // expected-error {{type 'S.Type' has no member 'init'}}
+    }
+  }
+}

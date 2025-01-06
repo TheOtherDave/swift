@@ -16,39 +16,40 @@
 #ifndef SWIFT_RUNTIME_RUNTIMEFNWRAPPERSGEN_H
 #define SWIFT_RUNTIME_RUNTIMEFNWRAPPERSGEN_H
 
-#include "llvm/IR/Module.h"
+#include "swift/SIL/RuntimeEffect.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/IR/Module.h"
 
 namespace swift {
+
+class AvailabilityRange;
+class ASTContext;
+
+namespace irgen {
+class IRGenModule;
+}
+
+enum class RuntimeAvailability {
+  AlwaysAvailable,
+  AvailableByCompatibilityLibrary,
+  ConditionallyAvailable
+};
 
 /// Generate an llvm declaration for a runtime entry with a
 /// given name, return types, argument types, attributes and
 /// a calling convention.
-llvm::Constant *getRuntimeFn(llvm::Module &Module,
-                      llvm::Constant *&cache,
-                      char const *name,
-                      llvm::CallingConv::ID cc,
-                      llvm::ArrayRef<llvm::Type*> retTypes,
-                      llvm::ArrayRef<llvm::Type*> argTypes,
-                      llvm::ArrayRef<llvm::Attribute::AttrKind> attrs);
-
-/// Generate an llvm wrapper for a runtime entry with a
-/// given name, return types, argument types, attributes and a
-/// calling convention.
-///
-/// Symbol is the name of a global symbol containing the
-/// address of the runtime entry implementation.
-/// The wrapper simply invokes a corresponding entry point
-/// by means of an indirect call of the function currently
-/// referenced by the symbol.
-///
-/// Each wrapper has a hidden linkage and marked as ODR, so that
-/// a linker can merge all wrappers with the same name.
-llvm::Constant *getWrapperFn(llvm::Module &Module, llvm::Constant *&cache,
-                             char const *name, char const *symbol,
-                             llvm::CallingConv::ID cc,
+llvm::Constant *getRuntimeFn(llvm::Module &Module, llvm::Constant *&cache,
+                             char const *name, llvm::CallingConv::ID cc,
+                             RuntimeAvailability availability,
                              llvm::ArrayRef<llvm::Type *> retTypes,
                              llvm::ArrayRef<llvm::Type *> argTypes,
-                             llvm::ArrayRef<llvm::Attribute::AttrKind> attrs);
-} /* Namespace swift */
+                             llvm::ArrayRef<llvm::Attribute::AttrKind> attrs,
+                             llvm::ArrayRef<llvm::MemoryEffects> memEffects,
+                             irgen::IRGenModule *IGM = nullptr);
+
+llvm::FunctionType *getRuntimeFnType(llvm::Module &Module,
+                             llvm::ArrayRef<llvm::Type *> retTypes,
+                             llvm::ArrayRef<llvm::Type *> argTypes);
+
+} // namespace swift
 #endif

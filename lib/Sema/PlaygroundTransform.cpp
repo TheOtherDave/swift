@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2023 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -22,6 +22,9 @@
 #include "swift/AST/DeclContext.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/Pattern.h"
+#include "swift/AST/SourceFile.h"
+#include "swift/Basic/Assertions.h"
+#include "swift/Basic/PlaygroundOption.h"
 
 #include <random>
 #include <forward_list>
@@ -35,13 +38,33 @@ using namespace swift::instrumenter_support;
 
 namespace {
 
+struct TransformOptions {
+  bool LogScopeEvents;
+  bool LogFunctionParameters;
+
+  TransformOptions(const PlaygroundOptionSet &opts) :
+    LogScopeEvents(opts.contains(PlaygroundOption::ScopeEvents)),
+    LogFunctionParameters(opts.contains(PlaygroundOption::FunctionParameters)) {}
+};
+
 class Instrumenter : InstrumenterBase {
 private:
   std::mt19937_64 &RNG;
-  ASTContext &Context;
-  DeclContext *TypeCheckDC;
   unsigned &TmpNameIndex;
-  bool HighPerformance;
+  TransformOptions Options;
+  bool ExtendedCallbacks;
+
+  DeclNameRef DebugPrintName;
+  DeclNameRef PrintName;
+  DeclNameRef PostPrintName;
+  DeclNameRef PostPrintExtendedName;
+  DeclNameRef LogWithIDName;
+  DeclNameRef LogWithIDExtendedName;
+  DeclNameRef LogScopeExitName;
+  DeclNameRef LogScopeExitExtendedName;
+  DeclNameRef LogScopeEntryName;
+  DeclNameRef LogScopeEntryExtendedName;
+  DeclNameRef SendDataName;
 
   struct BracePair {
   public:
@@ -52,7 +75,7 @@ private:
     BracePair(const SourceRange &BR) : BraceRange(BR) {}
   };
 
-  typedef std::forward_list<BracePair> BracePairStack;
+  using BracePairStack = std::forward_list<BracePair>;
 
   BracePairStack BracePairs;
   class BracePairPusher {
@@ -95,13 +118,13 @@ private:
     }
   };
 
-  typedef SmallVector<swift::ASTNode, 3> ElementVector;
+  using ElementVector = SmallVector<swift::ASTNode, 3>;
 
   // Before a "return," "continue" or similar statement, emit pops of
   // all the braces up to its target.
   size_t escapeToTarget(BracePair::TargetKinds TargetKind,
                         ElementVector &Elements, size_t EI) {
-    if (HighPerformance)
+    if (!Options.LogScopeEvents)
       return EI;
 
     for (const BracePair &BP : BracePairs) {
@@ -115,10 +138,21 @@ private:
   }
 
 public:
-  Instrumenter(ASTContext &C, DeclContext *DC, std::mt19937_64 &RNG, bool HP,
-               unsigned &TmpNameIndex)
-      : RNG(RNG), Context(C), TypeCheckDC(DC), TmpNameIndex(TmpNameIndex),
-        HighPerformance(HP) {}
+  Instrumenter(ASTContext &C, DeclContext *DC, std::mt19937_64 &RNG,
+               TransformOptions OPT, unsigned &TmpNameIndex)
+      : InstrumenterBase(C, DC), RNG(RNG), TmpNameIndex(TmpNameIndex), Options(OPT),
+        ExtendedCallbacks(C.LangOpts.hasFeature(Feature::PlaygroundExtendedCallbacks)),
+        DebugPrintName(C.getIdentifier("__builtin_debugPrint")),
+        PrintName(C.getIdentifier("__builtin_print")),
+        PostPrintName(C.getIdentifier("__builtin_postPrint")),
+        PostPrintExtendedName(C.getIdentifier("__builtin_postPrint_extended")),
+        LogWithIDName(C.getIdentifier("__builtin_log_with_id")),
+        LogWithIDExtendedName(C.getIdentifier("__builtin_log_with_id_extended")),
+        LogScopeExitName(C.getIdentifier("__builtin_log_scope_exit")),
+        LogScopeExitExtendedName(C.getIdentifier("__builtin_log_scope_exit_extended")),
+        LogScopeEntryName(C.getIdentifier("__builtin_log_scope_entry")),
+        LogScopeEntryExtendedName(C.getIdentifier("__builtin_log_scope_entry_extended")),
+        SendDataName(C.getIdentifier("__builtin_send_data")) { }
 
   Stmt *transformStmt(Stmt *S) {
     switch (S->getKind()) {
@@ -126,6 +160,8 @@ public:
       return S;
     case StmtKind::Brace:
       return transformBraceStmt(cast<BraceStmt>(S));
+    case StmtKind::Defer:
+      return transformDeferStmt(cast<DeferStmt>(S));
     case StmtKind::If:
       return transformIfStmt(cast<IfStmt>(S));
     case StmtKind::Guard:
@@ -153,13 +189,27 @@ public:
     }
   }
 
+  DeferStmt *transformDeferStmt(DeferStmt *DS) {
+    if (auto *FD = DS->getTempDecl()) {
+      // Temporarily unmark the DeferStmt's FuncDecl as implicit so it is
+      // transformed (as typically implicit Decls are skipped by the
+      // transformer).
+      auto Implicit = FD->isImplicit();
+      FD->setImplicit(false);
+      auto *D = transformDecl(FD);
+      D->setImplicit(Implicit);
+      assert(D == FD);
+    }
+    return DS;
+  }
+
   // transform*() return their input if it's unmodified,
   // or a modified copy of their input otherwise.
   IfStmt *transformIfStmt(IfStmt *IS) {
-    if (Stmt *TS = IS->getThenStmt()) {
-      Stmt *NTS = transformStmt(TS);
+    if (auto *TS = IS->getThenStmt()) {
+      auto *NTS = transformStmt(TS);
       if (NTS != TS) {
-        IS->setThenStmt(NTS);
+        IS->setThenStmt(cast<BraceStmt>(NTS));
       }
     }
 
@@ -174,8 +224,8 @@ public:
   }
 
   GuardStmt *transformGuardStmt(GuardStmt *GS) {
-    if (Stmt *BS = GS->getBody())
-      GS->setBody(transformStmt(BS));
+    if (BraceStmt *BS = GS->getBody())
+      GS->setBody(transformBraceStmt(BS));
     return GS;
   }
 
@@ -244,7 +294,7 @@ public:
         DCS->setBody(NB);
       }
     }
-    for (CatchStmt *C : DCS->getCatches()) {
+    for (CaseStmt *C : DCS->getCatches()) {
       if (auto *CB = dyn_cast_or_null<BraceStmt>(C->getBody())) {
         BraceStmt *NCB = transformBraceStmt(CB);
         if (NCB != CB) {
@@ -258,19 +308,24 @@ public:
   Decl *transformDecl(Decl *D) {
     if (D->isImplicit())
       return D;
-    if (auto *FD = dyn_cast<FuncDecl>(D)) {
-      if (BraceStmt *B = FD->getBody()) {
+    if (auto *FD = dyn_cast<AbstractFunctionDecl>(D)) {
+      if (BraceStmt *B = FD->getTypecheckedBody()) {
+        const ParameterList *PL = FD->getParameters();
         TargetKindSetter TKS(BracePairs, BracePair::TargetKinds::Return);
-        BraceStmt *NB = transformBraceStmt(B);
+        BraceStmt *NB = transformBraceStmt(B, PL);
         if (NB != B) {
-          FD->setBody(NB);
-          TypeChecker(Context).checkFunctionErrorHandling(FD);
+          FD->setBody(NB, AbstractFunctionDecl::BodyKind::TypeChecked);
+          TypeChecker::checkFunctionEffects(FD);
         }
       }
     } else if (auto *NTD = dyn_cast<NominalTypeDecl>(D)) {
       for (Decl *Member : NTD->getMembers()) {
         transformDecl(Member);
       }
+    } else if (auto *VD = dyn_cast<AbstractStorageDecl>(D)) {
+      VD->visitParsedAccessors([&](AccessorDecl * ACC) {
+        transformDecl(ACC);
+      });
     }
 
     return D;
@@ -305,56 +360,56 @@ public:
     }
     case ExprKind::Load:
       return digForVariable(cast<LoadExpr>(E)->getSubExpr());
-    case ExprKind::ForceValue:
-      return digForVariable(cast<ForceValueExpr>(E)->getSubExpr());
+    case ExprKind::ForceValue: {
+      std::pair<Added<Expr *>, ValueDecl *> BaseVariable =
+          digForVariable(cast<ForceValueExpr>(E)->getSubExpr());
+      if (!*BaseVariable.first || !BaseVariable.second)
+        return std::make_pair(nullptr, nullptr);
+
+      Added<Expr *> Forced(
+          new (Context) ForceValueExpr(*BaseVariable.first, SourceLoc()));
+      return std::make_pair(Forced, BaseVariable.second);
+    }
     case ExprKind::InOut:
       return digForVariable(cast<InOutExpr>(E)->getSubExpr());
     }
   }
 
-  std::string digForName(Expr *E) {
+  DeclBaseName digForName(Expr *E) {
     Added<Expr *> RE = nullptr;
     ValueDecl *VD = nullptr;
     std::tie(RE, VD) = digForVariable(E);
     if (VD) {
-      return VD->getBaseName().getIdentifier().str();
+      return VD->getBaseName();
     } else {
-      return std::string("");
+      return DeclBaseName();
     }
   }
 
-  static DeclRefExpr *digForInoutDeclRef(Expr *E) {
-    if (auto inout = dyn_cast<InOutExpr>(E)) {
-      return dyn_cast<DeclRefExpr>(
-          inout->getSubExpr()->getSemanticsProvidingExpr());
+  static DeclRefExpr *digForInoutDeclRef(ArgumentList *args) {
+    DeclRefExpr *uniqueRef = nullptr;
+    for (auto arg : *args) {
+      if (auto *inout = dyn_cast<InOutExpr>(arg.getExpr())) {
+        auto *ref = dyn_cast<DeclRefExpr>(
+            inout->getSubExpr()->getSemanticsProvidingExpr());
+        if (!ref)
+          continue;
 
-      // Drill through tuple shuffles, ignoring non-default-argument inouts.
-    } else if (auto shuffle = dyn_cast<TupleShuffleExpr>(E)) {
-      return digForInoutDeclRef(shuffle->getSubExpr());
+        // If we already have a reference, it's not unique.
+        if (uniqueRef)
+          return nullptr;
 
-      // Try to find a unique inout argument in a tuple.
-    } else if (auto tuple = dyn_cast<TupleExpr>(E)) {
-      DeclRefExpr *uniqueRef = nullptr;
-      for (Expr *elt : tuple->getElements()) {
-        if (auto ref = digForInoutDeclRef(elt)) {
-          // If we already have a reference, it's not unique.
-          if (uniqueRef)
-            return nullptr;
-          uniqueRef = ref;
-        }
+        uniqueRef = ref;
       }
-      return uniqueRef;
-
-      // Look through parens.
-    } else {
-      auto subExpr = E->getSemanticsProvidingExpr();
-      return (E == subExpr ? nullptr : digForInoutDeclRef(subExpr));
     }
+    return uniqueRef;
   }
 
-  BraceStmt *transformBraceStmt(BraceStmt *BS, bool TopLevel = false) override {
+  BraceStmt *transformBraceStmt(BraceStmt *BS,
+                                const ParameterList *PL = nullptr,
+                                bool TopLevel = false) override {
     ArrayRef<ASTNode> OriginalElements = BS->getElements();
-    typedef SmallVector<swift::ASTNode, 3> ElementVector;
+    using ElementVector = SmallVector<swift::ASTNode, 3>;
     ElementVector Elements(OriginalElements.begin(), OriginalElements.end());
 
     SourceRange SR = BS->getSourceRange();
@@ -379,7 +434,7 @@ public:
                 ++EI;
               }
             }
-          } else {
+          } else if (shouldLog(AE->getSrc())) {
             std::pair<PatternBindingDecl *, VarDecl *> PV =
                 buildPatternAndVariable(AE->getSrc());
             DeclRefExpr *DRE = new (Context)
@@ -391,14 +446,14 @@ public:
                                          true); // implicit
             NAE->setType(Context.TheEmptyTupleType);
             AE->setImplicit(true);
-            std::string Name = digForName(AE->getDest());
 
-            Added<Stmt *> Log(buildLoggerCall(
-                new (Context) DeclRefExpr(
-                    ConcreteDeclRef(PV.second), DeclNameLoc(),
-                    true, // implicit
-                    AccessSemantics::Ordinary, AE->getSrc()->getType()),
-                AE->getSrc()->getSourceRange(), Name.c_str()));
+            DeclBaseName Name = digForName(AE->getDest());
+            Expr * PVVarRef = new (Context) DeclRefExpr(
+                ConcreteDeclRef(PV.second), DeclNameLoc(), /*implicit=*/ true,
+                AccessSemantics::Ordinary, AE->getSrc()->getType());
+            Added<Stmt *> Log(
+                buildLoggerCall(PVVarRef, AE->getSrc()->getSourceRange(),
+                                Name.getIdentifier().str()));
 
             if (*Log) {
               Elements[EI] = PV.first;
@@ -410,14 +465,21 @@ public:
           }
         } else if (auto *AE = dyn_cast<ApplyExpr>(E)) {
           bool Handled = false;
-          if (auto *DRE = dyn_cast<DeclRefExpr>(AE->getFn())) {
+          DeclRefExpr *DRE = nullptr;
+          // With Swift 6 the print() function decl is a sub expression
+          // of a function conversion expression.
+          if (auto *FCE = dyn_cast<FunctionConversionExpr>(AE->getFn()))
+            DRE = dyn_cast<DeclRefExpr>(FCE->getSubExpr());
+          else
+            DRE = dyn_cast<DeclRefExpr>(AE->getFn());
+          if (DRE) {
             auto *FnD = dyn_cast<AbstractFunctionDecl>(DRE->getDecl());
             if (FnD && FnD->getModuleContext() == Context.TheStdlibModule) {
-              StringRef FnName = FnD->getNameStr();
-              if (FnName.equals("print") || FnName.equals("debugPrint")) {
+              DeclBaseName FnName = FnD->getBaseName();
+              if (FnName == "print" || FnName == "debugPrint") {
                 const bool isOldStyle = false;
                 if (isOldStyle) {
-                  const bool isDebugPrint = FnName.equals("debugPrint");
+                  const bool isDebugPrint = (FnName == "debugPrint");
                   PatternBindingDecl *ArgPattern = nullptr;
                   VarDecl *ArgVariable = nullptr;
                   Added<Stmt *> Log =
@@ -445,7 +507,7 @@ public:
           if (!Handled &&
               AE->getType()->isEqual(Context.TheEmptyTupleType)) {
             if (auto *DSCE = dyn_cast<DotSyntaxCallExpr>(AE->getFn())) {
-              Expr *TargetExpr = DSCE->getArg();
+              Expr *TargetExpr = DSCE->getBase();
               Added<Expr *> Target_RE;
               ValueDecl *TargetVD = nullptr;
 
@@ -461,7 +523,7 @@ public:
               }
             }
             if (!Handled) {
-              if (DeclRefExpr *DRE = digForInoutDeclRef(AE->getArg())) {
+              if (DeclRefExpr *DRE = digForInoutDeclRef(AE->getArgs())) {
                 Added<Stmt *> Log = logDeclOrMemberRef(DRE);
                 if (*Log) {
                   Elements.insert(Elements.begin() + (EI + 1), *Log);
@@ -471,7 +533,7 @@ public:
             }
             Handled = true; // Never log ()
           }
-          if (!Handled) {
+          if (!Handled && shouldLog(E)) {
             // do the same as for all other expressions
             std::pair<PatternBindingDecl *, VarDecl *> PV =
                 buildPatternAndVariable(E);
@@ -489,7 +551,7 @@ public:
             }
           }
         } else {
-          if (E->getType()->getCanonicalType() != Context.TheEmptyTupleType) {
+          if (E->getType()->getCanonicalType() != Context.TheEmptyTupleType && shouldLog(E)) {
             std::pair<PatternBindingDecl *, VarDecl *> PV =
                 buildPatternAndVariable(E);
             Added<Stmt *> Log = buildLoggerCall(
@@ -509,15 +571,14 @@ public:
       } else if (auto *S = Element.dyn_cast<Stmt *>()) {
         S->walk(CF);
         if (auto *RS = dyn_cast<ReturnStmt>(S)) {
-          if (RS->hasResult()) {
+          if (RS->hasResult() && shouldLog(RS->getResult())) {
             std::pair<PatternBindingDecl *, VarDecl *> PV =
                 buildPatternAndVariable(RS->getResult());
             DeclRefExpr *DRE = new (Context) DeclRefExpr(
                 ConcreteDeclRef(PV.second), DeclNameLoc(),
                 true, // implicit
                 AccessSemantics::Ordinary, RS->getResult()->getType());
-            ReturnStmt *NRS = new (Context) ReturnStmt(SourceLoc(), DRE,
-                                                       true); // implicit
+            ReturnStmt *NRS = ReturnStmt::createImplicit(Context, DRE);
             Added<Stmt *> Log = buildLoggerCall(
                 new (Context) DeclRefExpr(
                     ConcreteDeclRef(PV.second), DeclNameLoc(),
@@ -548,12 +609,14 @@ public:
       } else if (auto *D = Element.dyn_cast<Decl *>()) {
         D->walk(CF);
         if (auto *PBD = dyn_cast<PatternBindingDecl>(D)) {
-          if (VarDecl *VD = PBD->getSingleVar()) {
-            if (VD->getParentInitializer()) {
-              Added<Stmt *> Log = logVarDecl(VD);
-              if (*Log) {
-                Elements.insert(Elements.begin() + (EI + 1), *Log);
-                ++EI;
+          if (!PBD->isAsyncLet()) {
+            if (VarDecl *VD = PBD->getSingleVar()) {
+              if (VD->getParentExecutableInitializer()) {
+                Added<Stmt *> Log = logVarDecl(VD);
+                if (*Log) {
+                  Elements.insert(Elements.begin() + (EI + 1), *Log);
+                  ++EI;
+                }
               }
             }
           }
@@ -563,7 +626,28 @@ public:
       }
     }
 
-    if (!TopLevel && !HighPerformance) {
+    // If we were given any parameters that apply to this brace block, we insert
+    // log calls for them now (before any of the other statements). We only log
+    // named parameters (not `{ _ in ... }`, for example).
+    if (PL && Options.LogFunctionParameters) {
+      size_t EI = 0;
+      for (const auto &PD : *PL) {
+        if (PD->hasName() && shouldLog(PD)) {
+          DeclBaseName Name = PD->getName();
+          Expr *PVVarRef = new (Context)
+              DeclRefExpr(PD, DeclNameLoc(), /*implicit=*/true,
+                          AccessSemantics::Ordinary, PD->getTypeInContext());
+          Added<Stmt *> Log(buildLoggerCall(PVVarRef, PD->getSourceRange(),
+                                            Name.getIdentifier().str()));
+          if (*Log) {
+            Elements.insert(Elements.begin() + EI, *Log);
+            EI++;
+          }
+        }
+      }
+    }
+
+    if (!TopLevel && Options.LogScopeEvents && !BS->isImplicit()) {
       Elements.insert(Elements.begin(), *buildScopeEntry(BS->getSourceRange()));
       Elements.insert(Elements.end(), *buildScopeExit(BS->getSourceRange()));
     }
@@ -585,7 +669,11 @@ public:
   // after or instead of the expression they're looking at.  Only call this
   // if the variable has an initializer.
   Added<Stmt *> logVarDecl(VarDecl *VD) {
-    if (isa<ConstructorDecl>(TypeCheckDC) && VD->getNameStr().equals("self")) {
+    if (!shouldLog(VD)) {
+      return nullptr;
+    }
+
+    if (isa<ConstructorDecl>(TypeCheckDC) && VD->getNameStr() == "self") {
       // Don't log "self" in a constructor
       return nullptr;
     }
@@ -594,39 +682,44 @@ public:
         new (Context) DeclRefExpr(ConcreteDeclRef(VD), DeclNameLoc(),
                                   true, // implicit
                                   AccessSemantics::Ordinary, Type()),
-        VD->getSourceRange(), VD->getName().str().str().c_str());
+        VD->getSourceRange(), VD->getName().str());
   }
 
   Added<Stmt *> logDeclOrMemberRef(Added<Expr *> RE) {
     if (auto *DRE = dyn_cast<DeclRefExpr>(*RE)) {
       VarDecl *VD = cast<VarDecl>(DRE->getDecl());
 
-      if (isa<ConstructorDecl>(TypeCheckDC) &&
-          VD->getNameStr().equals("self")) {
+      if (!shouldLog(VD)) {
+        return nullptr;
+      }
+
+      if (isa<ConstructorDecl>(TypeCheckDC) && VD->getBaseName() == "self") {
         // Don't log "self" in a constructor
         return nullptr;
       }
 
       return buildLoggerCall(
           new (Context) DeclRefExpr(ConcreteDeclRef(VD), DeclNameLoc(),
-                                    true, // implicit
-                                    AccessSemantics::Ordinary, Type()),
-          DRE->getSourceRange(), VD->getName().str().str().c_str());
+                                    /*implicit=*/true),
+          DRE->getSourceRange(), VD->getName().str());
     } else if (auto *MRE = dyn_cast<MemberRefExpr>(*RE)) {
       Expr *B = MRE->getBase();
       ConcreteDeclRef M = MRE->getMember();
 
-      if (isa<ConstructorDecl>(TypeCheckDC) && !digForName(B).compare("self")) {
+      if (!shouldLog(M.getDecl())) {
+        return nullptr;
+      }
+
+      if (isa<ConstructorDecl>(TypeCheckDC) && digForName(B) == "self") {
         // Don't log attributes of "self" in a constructor
         return nullptr;
       }
 
       return buildLoggerCall(
           new (Context) MemberRefExpr(B, SourceLoc(), M, DeclNameLoc(),
-                                      true, // implicit
-                                      AccessSemantics::Ordinary),
+                                      /*implicit=*/true),
           MRE->getSourceRange(),
-          M.getDecl()->getBaseName().getIdentifier().str().str().c_str());
+          M.getDecl()->getBaseName().userFacingName());
     } else {
       return nullptr;
     }
@@ -634,91 +727,66 @@ public:
 
   std::pair<PatternBindingDecl *, VarDecl *>
   maybeFixupPrintArgument(ApplyExpr *Print) {
-    Expr *ArgTuple = Print->getArg();
-    if (auto *PE = dyn_cast<ParenExpr>(ArgTuple)) {
-      std::pair<PatternBindingDecl *, VarDecl *> PV =
-          buildPatternAndVariable(PE->getSubExpr());
-      PE->setSubExpr(new (Context) DeclRefExpr(
+    auto *args = Print->getArgs();
+    if (args->empty())
+      return std::make_pair(nullptr, nullptr);
+
+    // Are we using print() specialized to handle a single argument,
+    // or is actually only the first argument of interest and the rest are
+    // extra information for print()?
+    if (args->hasAnyArgumentLabels() || args->hasAnyInOutArgs()) {
+      auto *argExpr = args->front().getExpr();
+      auto PV = buildPatternAndVariable(argExpr);
+      args->setExpr(0, new (Context) DeclRefExpr(
           ConcreteDeclRef(PV.second), DeclNameLoc(),
           true, // implicit
-          AccessSemantics::Ordinary, PE->getSubExpr()->getType()));
+          AccessSemantics::Ordinary, argExpr->getType()));
       return PV;
-    } else if (auto *TE = dyn_cast<TupleExpr>(ArgTuple)) {
-      if (TE->getNumElements() == 0) {
-        return std::make_pair(nullptr, nullptr);
-      } else {
-        // Are we using print() specialized to handle a single argument,
-        // or is actually only the first argument of interest and the rest are
-        // extra information for print()?
-        bool useJustFirst = false;
-        if (TE->hasElementNames()) {
-          useJustFirst = true;
-        } else {
-          for (Expr *Arg : TE->getElements()) {
-            if (Arg->isSemanticallyInOutExpr()) {
-              useJustFirst = true;
-              break;
-            }
-          }
-        }
-        if (useJustFirst) {
-          std::pair<PatternBindingDecl *, VarDecl *> PV =
-              buildPatternAndVariable(TE->getElement(0));
-          TE->setElement(0, new (Context) DeclRefExpr(
-                                ConcreteDeclRef(PV.second), DeclNameLoc(),
-                                true, // implicit
-                                AccessSemantics::Ordinary,
-                                TE->getElement(0)->getType()));
-          return PV;
-        } else {
-          std::pair<PatternBindingDecl *, VarDecl *> PV =
-              buildPatternAndVariable(TE);
-          Print->setArg(new (Context) DeclRefExpr(
-              ConcreteDeclRef(PV.second), DeclNameLoc(),
-              true, // implicit
-              AccessSemantics::Ordinary, TE->getType()));
-          return PV;
-        }
-      }
-    } else {
-      return std::make_pair(nullptr, nullptr);
     }
+
+    auto *packedArg = args->packIntoImplicitTupleOrParen(Context);
+    auto PV = buildPatternAndVariable(packedArg);
+    auto newArg = new (Context)
+        DeclRefExpr(ConcreteDeclRef(PV.second), DeclNameLoc(),
+                    true, // implicit
+                    AccessSemantics::Ordinary, packedArg->getType());
+    Print->setArgs(ArgumentList::createImplicit(Context, args->getLParenLoc(),
+                                                {Argument::unlabeled(newArg)},
+                                                args->getRParenLoc()));
+    return PV;
   }
 
   Added<Stmt *> logPrint(bool isDebugPrint, ApplyExpr *AE,
                          PatternBindingDecl *&ArgPattern,
                          VarDecl *&ArgVariable) {
-    const char *LoggerName =
-        isDebugPrint ? "$builtin_debugPrint" : "$builtin_print";
+    DeclNameRef LoggerName = isDebugPrint ? DebugPrintName : PrintName;
 
     UnresolvedDeclRefExpr *LoggerRef = new (Context) UnresolvedDeclRefExpr(
-        Context.getIdentifier(LoggerName), DeclRefKind::Ordinary,
+        LoggerName, DeclRefKind::Ordinary,
         DeclNameLoc(AE->getSourceRange().End));
 
     std::tie(ArgPattern, ArgVariable) = maybeFixupPrintArgument(AE);
 
     AE->setFn(LoggerRef);
-    Added<ApplyExpr *> AddedApply(AE); // safe because we've fixed up the args
 
-    if (!doTypeCheck(Context, TypeCheckDC, AddedApply)) {
+    Expr *E = AE;
+    if (!doTypeCheckExpr(Context, TypeCheckDC, E)) {
       return nullptr;
     }
 
-    return buildLoggerCallWithApply(AddedApply, AE->getSourceRange());
+    Added<Expr *> AddedExpr(E); // safe because we've fixed up the args
+
+    return buildLoggerCallWithAddedExpr(AddedExpr, E->getSourceRange());
   }
 
   Added<Stmt *> logPostPrint(SourceRange SR) {
-    return buildLoggerCallWithArgs("$builtin_postPrint",
-                                   MutableArrayRef<Expr *>(), SR);
+    return buildLoggerCallWithArgs(ExtendedCallbacks ? PostPrintExtendedName : PostPrintName, {}, SR);
   }
 
   std::pair<PatternBindingDecl *, VarDecl *>
   buildPatternAndVariable(Expr *InitExpr) {
-    // This is 14 because "tmp" is 3 chars, %u is at most 10 digits long plus a
-    // null terminator.
-    char NameBuf[14] = {0};
-    snprintf(NameBuf, sizeof(NameBuf), "tmp%u", TmpNameIndex);
-    TmpNameIndex++;
+    SmallString<16> NameBuf;
+    (Twine("tmp") + Twine(TmpNameIndex++)).toVector(NameBuf);
 
     Expr *MaybeLoadInitExpr = nullptr;
 
@@ -730,61 +798,54 @@ public:
     }
 
     VarDecl *VD =
-        new (Context) VarDecl(/*IsStatic*/false, VarDecl::Specifier::Let,
-                              /*IsCaptureList*/false, SourceLoc(),
-                              Context.getIdentifier(NameBuf),
-                              MaybeLoadInitExpr->getType(), TypeCheckDC);
-    VD->setInterfaceType(VD->getType()->mapTypeOutOfContext());
+        new (Context) VarDecl(/*IsStatic*/false, VarDecl::Introducer::Let,
+                              SourceLoc(), Context.getIdentifier(NameBuf),
+                              TypeCheckDC);
+    VD->setInterfaceType(MaybeLoadInitExpr->getType()->mapTypeOutOfContext());
     VD->setImplicit();
 
-    NamedPattern *NP = new (Context) NamedPattern(VD, /*implicit*/ true);
-    PatternBindingDecl *PBD = PatternBindingDecl::create(
-        Context, SourceLoc(), StaticSpellingKind::None, SourceLoc(), NP,
-        MaybeLoadInitExpr, TypeCheckDC);
-    PBD->setImplicit();
+    NamedPattern *NP = NamedPattern::createImplicit(Context, VD, VD->getTypeInContext());
+    PatternBindingDecl *PBD = PatternBindingDecl::createImplicit(
+        Context, StaticSpellingKind::None, NP, MaybeLoadInitExpr, TypeCheckDC);
 
     return std::make_pair(PBD, VD);
   }
 
+  bool shouldLog(ASTNode node) {
+    // Don't try to log ~Copyable types, as we can't pass them to the generic logging functions yet.
+    if (auto *VD = dyn_cast_or_null<ValueDecl>(node.dyn_cast<Decl *>())) {
+      auto interfaceTy = VD->getInterfaceType();
+      auto contextualTy = VD->getInnermostDeclContext()->mapTypeIntoContext(interfaceTy);
+      return !contextualTy->isNoncopyable();
+    } else if (auto *E = node.dyn_cast<Expr *>()) {
+      return !E->getType()->isNoncopyable();
+    } else {
+      return true;
+    }
+  }
+
   Added<Stmt *> buildLoggerCall(Added<Expr *> E, SourceRange SR,
-                                const char *Name) {
-    assert(Name);
-    std::string *NameInContext = Context.AllocateObjectCopy(std::string(Name));
+                                StringRef Name) {
+    Expr *NameExpr = new (Context) StringLiteralExpr(
+        Context.AllocateCopy(Name), SourceRange(), /*implicit=*/true);
 
-    Expr *NameExpr =
-        new (Context) StringLiteralExpr(NameInContext->c_str(), SourceRange());
-    NameExpr->setImplicit(true);
-
-    const size_t buf_size = 11;
-    char *const id_buf = (char *)Context.Allocate(buf_size, 1);
     std::uniform_int_distribution<unsigned> Distribution(0, 0x7fffffffu);
     const unsigned id_num = Distribution(RNG);
-    ::snprintf(id_buf, buf_size, "%u", id_num);
-    Expr *IDExpr = new (Context) IntegerLiteralExpr(id_buf, SourceLoc(), true);
+    Expr *IDExpr = IntegerLiteralExpr::createFromUnsigned(Context, id_num, SourceLoc());
 
-    Expr *LoggerArgExprs[] = {*E, NameExpr, IDExpr};
-
-    return buildLoggerCallWithArgs("$builtin_log_with_id",
-                                   MutableArrayRef<Expr *>(LoggerArgExprs), SR);
+    return buildLoggerCallWithArgs(ExtendedCallbacks ? LogWithIDExtendedName : LogWithIDName, { *E, NameExpr, IDExpr }, SR);
   }
 
   Added<Stmt *> buildScopeEntry(SourceRange SR) {
-    return buildScopeCall(SR, false);
+    return buildLoggerCallWithArgs(ExtendedCallbacks ? LogScopeEntryExtendedName : LogScopeEntryName, {}, SR);
   }
 
   Added<Stmt *> buildScopeExit(SourceRange SR) {
-    return buildScopeCall(SR, true);
+    return buildLoggerCallWithArgs(ExtendedCallbacks ? LogScopeExitExtendedName : LogScopeExitName, {}, SR);
   }
 
-  Added<Stmt *> buildScopeCall(SourceRange SR, bool IsExit) {
-    const char *LoggerName =
-        IsExit ? "$builtin_log_scope_exit" : "$builtin_log_scope_entry";
-
-    return buildLoggerCallWithArgs(LoggerName, MutableArrayRef<Expr *>(), SR);
-  }
-
-  Added<Stmt *> buildLoggerCallWithArgs(const char *LoggerName,
-                                        MutableArrayRef<Expr *> Args,
+  Added<Stmt *> buildLoggerCallWithArgs(DeclNameRef LoggerName,
+                                        ArrayRef<Expr *> Args,
                                         SourceRange SR) {
     // If something doesn't have a valid source range it can not be playground
     // logged. For example, a PC Macro event.
@@ -793,77 +854,84 @@ public:
     }
 
     std::pair<unsigned, unsigned> StartLC =
-        Context.SourceMgr.getLineAndColumn(SR.Start);
+        Context.SourceMgr.getPresumedLineAndColumnForLoc(SR.Start);
 
-    std::pair<unsigned, unsigned> EndLC = Context.SourceMgr.getLineAndColumn(
-        Lexer::getLocForEndOfToken(Context.SourceMgr, SR.End));
+    std::pair<unsigned, unsigned> EndLC =
+        Context.SourceMgr.getPresumedLineAndColumnForLoc(
+            Lexer::getLocForEndOfToken(Context.SourceMgr, SR.End));
 
-    const size_t buf_size = 8;
+    Expr *StartLine = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.first, SR.Start);
+    Expr *EndLine = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.first, SR.End);
+    Expr *StartColumn = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.second, SR.Start);
+    Expr *EndColumn = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.second, SR.End);
 
-    char *start_line_buf = (char *)Context.Allocate(buf_size, 1);
-    char *end_line_buf = (char *)Context.Allocate(buf_size, 1);
-    char *start_column_buf = (char *)Context.Allocate(buf_size, 1);
-    char *end_column_buf = (char *)Context.Allocate(buf_size, 1);
-
-    ::snprintf(start_line_buf, buf_size, "%u", StartLC.first);
-    ::snprintf(start_column_buf, buf_size, "%u", StartLC.second);
-    ::snprintf(end_line_buf, buf_size, "%u", EndLC.first);
-    ::snprintf(end_column_buf, buf_size, "%u", EndLC.second);
-
-    Expr *StartLine =
-        new (Context) IntegerLiteralExpr(start_line_buf, SR.End, true);
-    Expr *EndLine =
-        new (Context) IntegerLiteralExpr(end_line_buf, SR.End, true);
-    Expr *StartColumn =
-        new (Context) IntegerLiteralExpr(start_column_buf, SR.End, true);
-    Expr *EndColumn =
-        new (Context) IntegerLiteralExpr(end_column_buf, SR.End, true);
+    Expr *ModuleExpr = buildIDArgumentExpr(ModuleIdentifier, SR);
+    Expr *FileExpr = buildIDArgumentExpr(FileIdentifier, SR);
 
     llvm::SmallVector<Expr *, 6> ArgsWithSourceRange(Args.begin(), Args.end());
 
-    ArgsWithSourceRange.append({StartLine, EndLine, StartColumn, EndColumn});
-
     UnresolvedDeclRefExpr *LoggerRef = new (Context)
-        UnresolvedDeclRefExpr(Context.getIdentifier(LoggerName),
-                              DeclRefKind::Ordinary, DeclNameLoc(SR.End));
-
+        UnresolvedDeclRefExpr(LoggerName, DeclRefKind::Ordinary,
+                              DeclNameLoc(SR.End));
     LoggerRef->setImplicit(true);
 
-    SmallVector<Identifier, 4> ArgLabels(ArgsWithSourceRange.size(),
-                                         Identifier());
-    ApplyExpr *LoggerCall = CallExpr::createImplicit(
-        Context, LoggerRef, ArgsWithSourceRange, ArgLabels);
-    Added<ApplyExpr *> AddedLogger(LoggerCall);
+    if (ExtendedCallbacks) {
+      StringRef filePath = Context.SourceMgr.getDisplayNameForLoc(SR.Start);
 
-    if (!doTypeCheck(Context, TypeCheckDC, AddedLogger)) {
+      Expr *FilePathExpr = new (Context) StringLiteralExpr(
+          Context.AllocateCopy(filePath), SourceRange(), /*implicit=*/true);
+
+      std::string moduleName = std::string(TypeCheckDC->getParentModule()->getName());
+      Expr *ModuleNameExpr = new (Context) StringLiteralExpr(
+          Context.AllocateCopy(moduleName), SourceRange(), /*implicit=*/true);
+
+      ArgsWithSourceRange.append(
+          {StartLine, EndLine, StartColumn, EndColumn, ModuleNameExpr, FilePathExpr});
+    } else {
+      ArgsWithSourceRange.append(
+          {StartLine, EndLine, StartColumn, EndColumn, ModuleExpr, FileExpr});
+    }
+
+    auto *ArgList =
+        ArgumentList::forImplicitUnlabeled(Context, ArgsWithSourceRange);
+    ApplyExpr *LoggerCall =
+        CallExpr::createImplicit(Context, LoggerRef, ArgList);
+
+    Expr *E = LoggerCall;
+    // Type-check the newly created logger call. Note that the type-checker is
+    // free to change the expression type, so type-checking is performed
+    // before wrapping in Added<>.
+    if (!doTypeCheckExpr(Context, TypeCheckDC, E)) {
       return nullptr;
     }
 
-    return buildLoggerCallWithApply(AddedLogger, SR);
+    Added<Expr *> AddedLogger(E);
+
+    return buildLoggerCallWithAddedExpr(AddedLogger, SR);
   }
 
-  // Assumes Apply has already been type-checked.
-  Added<Stmt *> buildLoggerCallWithApply(Added<ApplyExpr *> Apply,
-                                         SourceRange SR) {
+  // Assumes expr has already been type-checked.
+  Added<Stmt *> buildLoggerCallWithAddedExpr(Added<Expr *> AddedExpr,
+                                             SourceRange SR) {
     std::pair<PatternBindingDecl *, VarDecl *> PV =
-        buildPatternAndVariable(*Apply);
+        buildPatternAndVariable(*AddedExpr);
 
-    DeclRefExpr *DRE =
-        new (Context) DeclRefExpr(ConcreteDeclRef(PV.second), DeclNameLoc(),
-                                  true, // implicit
-                                  AccessSemantics::Ordinary, Apply->getType());
+    DeclRefExpr *DRE = new (Context)
+        DeclRefExpr(ConcreteDeclRef(PV.second), DeclNameLoc(),
+                    true, // implicit
+                    AccessSemantics::Ordinary, AddedExpr->getType());
 
     UnresolvedDeclRefExpr *SendDataRef = new (Context)
-        UnresolvedDeclRefExpr(Context.getIdentifier("$builtin_send_data"),
-                              DeclRefKind::Ordinary, DeclNameLoc());
+        UnresolvedDeclRefExpr(SendDataName, DeclRefKind::Ordinary,
+                              DeclNameLoc());
 
     SendDataRef->setImplicit(true);
 
+    auto *ArgList = ArgumentList::forImplicitUnlabeled(Context, {DRE});
     Expr *SendDataCall =
-        CallExpr::createImplicit(Context, SendDataRef, {DRE}, {Identifier()});
-    Added<Expr *> AddedSendData(SendDataCall);
+        CallExpr::createImplicit(Context, SendDataRef, ArgList);
 
-    if (!doTypeCheck(Context, TypeCheckDC, AddedSendData)) {
+    if (!doTypeCheckExpr(Context, TypeCheckDC, SendDataCall)) {
       return nullptr;
     }
 
@@ -878,50 +946,72 @@ public:
 
 } // end anonymous namespace
 
-void swift::performPlaygroundTransform(SourceFile &SF, bool HighPerformance) {
+void swift::performPlaygroundTransform(SourceFile &SF, PlaygroundOptionSet Opts) {
   class ExpressionFinder : public ASTWalker {
   private:
+    ASTContext &ctx;
+    TransformOptions Options;
     std::mt19937_64 RNG;
-    bool HighPerformance;
     unsigned TmpNameIndex = 0;
 
   public:
-    ExpressionFinder(bool HP) : HighPerformance(HP) {}
+    ExpressionFinder(ASTContext &ctx, PlaygroundOptionSet Opts) :
+      ctx(ctx), Options(Opts) {}
 
-    bool walkToDeclPre(Decl *D) override {
+    // FIXME: Remove this
+    bool shouldWalkAccessorsTheOldWay() override { return true; }
+
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Expansion;
+    }
+
+    PreWalkAction walkToDeclPre(Decl *D) override {
       if (auto *FD = dyn_cast<AbstractFunctionDecl>(D)) {
-        if (!FD->isImplicit()) {
+        // Skip any functions that do not have user-written source code.
+        if (!FD->isImplicit() && !FD->isBodySkipped() &&
+            !FD->isInMacroExpansionInContext()) {
           if (BraceStmt *Body = FD->getBody()) {
-            ASTContext &ctx = FD->getASTContext();
-            Instrumenter I(ctx, FD, RNG, HighPerformance, TmpNameIndex);
-            BraceStmt *NewBody = I.transformBraceStmt(Body);
+            const ParameterList *PL = FD->getParameters();
+            Instrumenter I(ctx, FD, RNG, Options, TmpNameIndex);
+            BraceStmt *NewBody = I.transformBraceStmt(Body, PL);
             if (NewBody != Body) {
-              FD->setBody(NewBody);
-              TypeChecker(ctx).checkFunctionErrorHandling(FD);
+              FD->setBody(NewBody, AbstractFunctionDecl::BodyKind::TypeChecked);
+              TypeChecker::checkFunctionEffects(FD);
             }
-            return false;
+            return Action::SkipNode();
           }
         }
       } else if (auto *TLCD = dyn_cast<TopLevelCodeDecl>(D)) {
         if (!TLCD->isImplicit()) {
           if (BraceStmt *Body = TLCD->getBody()) {
-            ASTContext &ctx = static_cast<Decl *>(TLCD)->getASTContext();
-            Instrumenter I(ctx, TLCD, RNG, HighPerformance, TmpNameIndex);
-            BraceStmt *NewBody = I.transformBraceStmt(Body, true);
+            Instrumenter I(ctx, TLCD, RNG, Options, TmpNameIndex);
+            BraceStmt *NewBody = I.transformBraceStmt(Body, nullptr, true);
             if (NewBody != Body) {
               TLCD->setBody(NewBody);
-              TypeChecker(ctx).checkTopLevelErrorHandling(TLCD);
+              TypeChecker::checkTopLevelEffects(TLCD);
             }
-            return false;
+            return Action::SkipNode();
           }
         }
       }
-      return true;
+      return Action::Continue();
     }
   };
 
-  ExpressionFinder EF(HighPerformance);
-  for (Decl *D : SF.Decls) {
-    D->walk(EF);
-  }
+  ExpressionFinder EF(SF.getASTContext(), Opts);
+  SF.walk(EF);
+}
+
+/// This function is provided for backward compatibility with the old API, since
+/// LLDB and others call it directly, passing it a boolean to control whether to
+/// only apply "high performance" options. We emulate that here.
+void swift::performPlaygroundTransform(SourceFile &SF, bool HighPerformance) {
+  PlaygroundOptionSet HighPerfTransformOpts;
+  // Enable any playground options that are marked as being applicable to high
+  // performance mode.
+#define PLAYGROUND_OPTION(OptionName, Description, DefaultOn, HighPerfOn) \
+  if (HighPerfOn) \
+    HighPerfTransformOpts.insert(PlaygroundOption::OptionName);
+#include "swift/Basic/PlaygroundOptions.def"
+  swift::performPlaygroundTransform(SF, HighPerfTransformOpts);
 }

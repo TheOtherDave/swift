@@ -1,41 +1,8 @@
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=NO_CONTEXT_0 | %FileCheck %s -check-prefix=NO_CONTEXT_0
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=NIL_0 | %FileCheck %s -check-prefix=NIL_0
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=NIL_1 | %FileCheck %s -check-prefix=NIL_1
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=NIL_2 | %FileCheck %s -check-prefix=NIL_2
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=BOOL_0 | %FileCheck %s -check-prefix=BOOL_0
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=BOOL_1 | %FileCheck %s -check-prefix=BOOL_1
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=BOOL_2 | %FileCheck %s -check-prefix=BOOL_2
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=BOOL_3 | %FileCheck %s -check-prefix=BOOL_3
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=BOOL_4 | %FileCheck %s -check-prefix=BOOL_4
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=INT_0 | %FileCheck %s -check-prefix=INT_0
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=INT_1 | %FileCheck %s -check-prefix=INT_1
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=INT_2 | %FileCheck %s -check-prefix=INT_2
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=DOUBLE_0 | %FileCheck %s -check-prefix=DOUBLE_0
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=STRING_0 | %FileCheck %s -check-prefix=STRING_0
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=STRING_1 | %FileCheck %s -check-prefix=STRING_1
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=STRING_2 | %FileCheck %s -check-prefix=STRING_2
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=STRING_3 | %FileCheck %s -check-prefix=STRING_3
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=STRING_4 | %FileCheck %s -check-prefix=STRING_4
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=STRING_5 | %FileCheck %s -check-prefix=STRING_5
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=ARRAY_0 | %FileCheck %s -check-prefix=ARRAY_0
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=ARRAY_1 | %FileCheck %s -check-prefix=ARRAY_1
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=ARRAY_2 | %FileCheck %s -check-prefix=ARRAY_2
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=DICT_0 | %FileCheck %s -check-prefix=DICT_0
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=DICT_1 | %FileCheck %s -check-prefix=DICT_1
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=DICT_2 | %FileCheck %s -check-prefix=DICT_2
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=TUPLE_0 | %FileCheck %s -check-prefix=TUPLE_0
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=TUPLE_1 | %FileCheck %s -check-prefix=TUPLE_1
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=TUPLE_2 | %FileCheck %s -check-prefix=TUPLE_2
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=COLOR_0 | %FileCheck %s -check-prefix=COLOR_0
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=COLOR_1 | %FileCheck %s -check-prefix=COLOR_1
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=COLOR_2 | %FileCheck %s -check-prefix=COLOR_2
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=IMAGE_0 | %FileCheck %s -check-prefix=IMAGE_0
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=IMAGE_1 | %FileCheck %s -check-prefix=IMAGE_1
+// RUN: %batch-code-completion
 
 func testAll0() {
   // Not type context.
   let x = #^NO_CONTEXT_0^#
-// NO_CONTEXT_0-DAG: Begin completions
 // NO_CONTEXT_0-DAG: Literal[Integer]/None:              0[#Int#];
 // NO_CONTEXT_0-DAG: Literal[Boolean]/None:              true[#Bool#];
 // NO_CONTEXT_0-DAG: Literal[Boolean]/None:              false[#Bool#];
@@ -45,7 +12,6 @@ func testAll0() {
 // NO_CONTEXT_0-DAG: Literal[Dictionary]/None:           [{#(key)#}: {#(value)#}][#Dictionary#];
 // NO_CONTEXT_0-DAG: Literal[_Color]/None:               #colorLiteral({#red: Float#}, {#green: Float#}, {#blue: Float#}, {#alpha: Float#});
 // NO_CONTEXT_0-DAG: Literal[_Image]/None:               #imageLiteral({#resourceName: String#});
-// NO_CONTEXT_0: End completions
 }
 
 struct MyNil1: ExpressibleByNilLiteral {
@@ -92,12 +58,12 @@ func testNil0() {
 func testNil1() {
   let x: MyNil1 = #^NIL_1^#
 }
-// NIL_1: Literal[Nil]/None/TypeRelation[Identical]: nil[#MyNil1#];
+// NIL_1: Literal[Nil]/None/TypeRelation[Convertible]: nil[#MyNil1#];
 
 func testNil2() {
   let x: Int? = #^NIL_2^#
 }
-// NIL_2: Literal[Nil]/None/TypeRelation[Identical]: nil[#Int?#];
+// NIL_2: Literal[Nil]/None/TypeRelation[Convertible]: nil[#Int?#];
 
 func testBool0() {
   let x: Int = #^BOOL_0^#
@@ -108,14 +74,14 @@ func testBool0() {
 func testBool1() {
   let x: MyBool1 = #^BOOL_1^#
 }
-// BOOL_1: Literal[Boolean]/None/TypeRelation[Identical]: true[#MyBool1#];
-// BOOL_1: Literal[Boolean]/None/TypeRelation[Identical]: false[#MyBool1#];
+// BOOL_1: Literal[Boolean]/None/TypeRelation[Convertible]: true[#MyBool1#];
+// BOOL_1: Literal[Boolean]/None/TypeRelation[Convertible]: false[#MyBool1#];
 
 func testBool2() {
   let x: Bool = #^BOOL_2^#
 }
-// BOOL_2: Literal[Boolean]/None/TypeRelation[Identical]: true[#Bool#];
-// BOOL_2: Literal[Boolean]/None/TypeRelation[Identical]: false[#Bool#];
+// BOOL_2: Literal[Boolean]/None/TypeRelation[Convertible]: true[#Bool#];
+// BOOL_2: Literal[Boolean]/None/TypeRelation[Convertible]: false[#Bool#];
 
 func testBool3() {
   let x: Bool? = #^BOOL_3^#
@@ -137,17 +103,17 @@ func testInt0() {
 func testInt1() {
   let x: MyInt1 = #^INT_1^#
 }
-// INT_1: Literal[Integer]/None/TypeRelation[Identical]: 0[#MyInt1#];
+// INT_1: Literal[Integer]/None/TypeRelation[Convertible]: 0[#MyInt1#];
 
 func testInt2() {
   let x: Int = #^INT_2^#
 }
-// INT_2: Literal[Integer]/None/TypeRelation[Identical]: 0[#Int#];
+// INT_2: Literal[Integer]/None/TypeRelation[Convertible]: 0[#Int#];
 
 func testDouble0() {
   let x: Double = #^DOUBLE_0^#
 }
-// DOUBLE_0: Literal[Integer]/None/TypeRelation[Identical]: 0[#Double#];
+// DOUBLE_0: Literal[Integer]/None/TypeRelation[Convertible]: 0[#Double#];
 
 func testString0() {
   let x: Int = #^STRING_0^#
@@ -157,25 +123,25 @@ func testString0() {
 func testString1() {
   let x: MyString1 = #^STRING_1^#
 }
-// STRING_1: Literal[String]/None/TypeRelation[Identical]: "{#(abc)#}"[#MyString1#];
+// STRING_1: Literal[String]/None/TypeRelation[Convertible]: "{#(abc)#}"[#MyString1#];
 
 func testString2() {
   let x: String = #^STRING_2^#
 }
-// STRING_2: Literal[String]/None/TypeRelation[Identical]: "{#(abc)#}"[#String#];
+// STRING_2: Literal[String]/None/TypeRelation[Convertible]: "{#(abc)#}"[#String#];
 
 func testString3() {
   let x: MyUnicodeScalar1 = #^STRING_3^#
 }
-// STRING_3: Literal[String]/None/TypeRelation[Identical]: "{#(abc)#}"[#MyUnicodeScalar1#];
+// STRING_3: Literal[String]/None/TypeRelation[Convertible]: "{#(abc)#}"[#MyUnicodeScalar1#];
 func testString4() {
   let x: MyCharacter1 = #^STRING_4^#
 }
-// STRING_4: Literal[String]/None/TypeRelation[Identical]: "{#(abc)#}"[#MyCharacter1#];
+// STRING_4: Literal[String]/None/TypeRelation[Convertible]: "{#(abc)#}"[#MyCharacter1#];
 func testString5() {
   let x: Character = #^STRING_5^#
 }
-// STRING_5: Literal[String]/None/TypeRelation[Identical]: "{#(abc)#}"[#Character#];
+// STRING_5: Literal[String]/None/TypeRelation[Convertible]: "{#(abc)#}"[#Character#];
 
 func testArray0() {
   let x: Int = #^ARRAY_0^#
@@ -185,12 +151,12 @@ func testArray0() {
 func testArray1() {
   let x: MyArray1<MyInt1> = #^ARRAY_1^#
 }
-// ARRAY_1: Literal[Array]/None/TypeRelation[Identical]: [{#(values)#}][#MyArray1<MyInt1>#];
+// ARRAY_1: Literal[Array]/None/TypeRelation[Convertible]: [{#(values)#}][#MyArray1<MyInt1>#];
 
 func testArray2() {
   let x: [MyInt1] = #^ARRAY_2^#
 }
-// ARRAY_2: Literal[Array]/None/TypeRelation[Identical]: [{#(values)#}][#[MyInt1]#];
+// ARRAY_2: Literal[Array]/None/TypeRelation[Convertible]: [{#(values)#}][#[MyInt1]#];
 
 func testDict0() {
   let x: Int = #^DICT_0^#
@@ -200,12 +166,12 @@ func testDict0() {
 func testDict1() {
   let x: MyDict1<MyInt1, MyString1> = #^DICT_1^#
 }
-// DICT_1: Literal[Dictionary]/None/TypeRelation[Identical]: [{#(key)#}: {#(value)#}][#MyDict1<MyInt1, MyString1>#];
+// DICT_1: Literal[Dictionary]/None/TypeRelation[Convertible]: [{#(key)#}: {#(value)#}][#MyDict1<MyInt1, MyString1>#];
 
 func testDict2() {
   let x: [MyInt1: MyString1] = #^DICT_2^#
 }
-// DICT_2: Literal[Dictionary]/None/TypeRelation[Identical]: [{#(key)#}: {#(value)#}][#[MyInt1 : MyString1]#];
+// DICT_2: Literal[Dictionary]/None/TypeRelation[Convertible]: [{#(key)#}: {#(value)#}][#[MyInt1 : MyString1]#];
 
 func testTuple0() {
   let x: Int = #^TUPLE_0^#
@@ -215,13 +181,13 @@ func testTuple0() {
 func testTuple1() {
   let x: (MyInt1, MyString1) = #^TUPLE_1^#
 }
-// TUPLE_1: Literal[Tuple]/None/TypeRelation[Identical]: ({#(values)#})[#(MyInt1, MyString1)#];
+// TUPLE_1: Literal[Tuple]/None/TypeRelation[Convertible]: ({#(values)#})[#(MyInt1, MyString1)#];
 
 func testTuple2() {
   let x: (MyInt1, MyString1, MyDouble1) = #^TUPLE_2^#
 }
 // FIXME: should we extend the tuple to have the right number of elements?
-// TUPLE_2: Literal[Tuple]/None/TypeRelation[Identical]: ({#(values)#})[#(MyInt1, MyString1, MyDouble1)#];
+// TUPLE_2: Literal[Tuple]/None/TypeRelation[Convertible]: ({#(values)#})[#(MyInt1, MyString1, MyDouble1)#];
 
 struct MyColor1: _ExpressibleByColorLiteral {
   init(_colorLiteralRed: Float, green: Float, blue: Float, alpha: Float) {}
@@ -234,7 +200,7 @@ func testColor0() {
 func testColor1() {
   let x: MyColor1 = #^COLOR_1^#
 }
-// COLOR_1: Literal[_Color]/None/TypeRelation[Identical]: #colorLiteral({#red: Float#}, {#green: Float#}, {#blue: Float#}, {#alpha: Float#})[#MyColor1#];
+// COLOR_1: Literal[_Color]/None/TypeRelation[Convertible]: #colorLiteral({#red: Float#}, {#green: Float#}, {#blue: Float#}, {#alpha: Float#})[#MyColor1#];
 
 func testColor2() {
   let x: MyColor1? = #^COLOR_2^#
@@ -252,4 +218,4 @@ func testImage0() {
 func testImage1() {
   let x: MyImage1 = #^IMAGE_1^#
 }
-// IMAGE_1: Literal[_Image]/None/TypeRelation[Identical]: #imageLiteral({#resourceName: String#})[#MyImage1#];
+// IMAGE_1: Literal[_Image]/None/TypeRelation[Convertible]: #imageLiteral({#resourceName: String#})[#MyImage1#];

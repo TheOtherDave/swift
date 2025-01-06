@@ -25,17 +25,17 @@ using namespace swift::migrator;
 #pragma mark - MigrationState
 
 std::string MigrationState::getInputText() const {
-  return SrcMgr.getEntireTextForBuffer(InputBufferID);
+  return SrcMgr.getEntireTextForBuffer(InputBufferID).str();
 }
 
 std::string MigrationState::getOutputText() const {
-  return SrcMgr.getEntireTextForBuffer(OutputBufferID);
+  return SrcMgr.getEntireTextForBuffer(OutputBufferID).str();
 }
 
 static bool quickDumpText(StringRef OutFilename, StringRef Text) {
   std::error_code Error;
   llvm::raw_fd_ostream FileOS(OutFilename,
-                              Error, llvm::sys::fs::F_Text);
+                              Error, llvm::sys::fs::OF_Text);
   if (FileOS.has_error()) {
     return true;
   }

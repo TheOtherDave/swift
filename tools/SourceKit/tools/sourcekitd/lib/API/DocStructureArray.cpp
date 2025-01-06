@@ -11,10 +11,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "sourcekitd/DocStructureArray.h"
-#include "DictionaryKeys.h"
+#include "sourcekitd/CompactArray.h"
+#include "sourcekitd/DictionaryKeys.h"
 #include "SourceKit/Core/LLVM.h"
 #include "SourceKit/Support/UIdent.h"
-#include "sourcekitd/CompactArray.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -65,25 +65,25 @@ struct DocStructureArrayBuilder::Implementation {
   typedef CompactArrayBuilder<unsigned> StructureArrayBuilder;
   SmallVector<char, 256> structureArrayBuffer;
 
-  CompactArrayBuilder<unsigned,            // Offset
-                      unsigned,            // Length
-                      UIdent,              // Kind
-                      UIdent,              // AccessLevel
-                      UIdent,              // SetterAccessLevel
-                      unsigned,            // NameOffset
-                      unsigned,            // NameLength
-                      unsigned,            // BodyOffset
-                      unsigned,            // BodyLength
-                      unsigned,            // DocOffset
-                      unsigned,            // DocLength
-                      Optional<StringRef>, // DisplayName
-                      Optional<StringRef>, // TypeName
-                      Optional<StringRef>, // RuntimeName
-                      Optional<StringRef>, // SelectorName
-                      unsigned,            // InheritedTypesOffset
-                      unsigned,            // AttrsOffset
-                      unsigned,            // ElementsOffset
-                      unsigned             // ChildrenOffset
+  CompactArrayBuilder<unsigned,                 // Offset
+                      unsigned,                 // Length
+                      UIdent,                   // Kind
+                      UIdent,                   // AccessLevel
+                      UIdent,                   // SetterAccessLevel
+                      unsigned,                 // NameOffset
+                      unsigned,                 // NameLength
+                      unsigned,                 // BodyOffset
+                      unsigned,                 // BodyLength
+                      unsigned,                 // DocOffset
+                      unsigned,                 // DocLength
+                      std::optional<StringRef>, // DisplayName
+                      std::optional<StringRef>, // TypeName
+                      std::optional<StringRef>, // RuntimeName
+                      std::optional<StringRef>, // SelectorName
+                      unsigned,                 // InheritedTypesOffset
+                      unsigned,                 // AttrsOffset
+                      unsigned,                 // ElementsOffset
+                      unsigned                  // ChildrenOffset
                       >
       structureBuilder;
 
@@ -193,10 +193,10 @@ void DocStructureArrayBuilder::beginSubStructure(
       BodyLength,
       DocOffset,
       DocLength,
-      DisplayName,
-      TypeName,
-      RuntimeName,
-      SelectorName,
+      DisplayName.str(),
+      TypeName.str(),
+      RuntimeName.str(),
+      SelectorName.str(),
       impl.addInheritedTypes(InheritedTypes),
       impl.addAttrs(Attrs),
       {}, // elements
@@ -220,9 +220,9 @@ void DocStructureArrayBuilder::endSubStructure() {
     impl.topIndices.push_back(index);
   }
 
-  // Canonicalize empty strings to None for the CompactArray.
-  auto str = [](StringRef str) -> Optional<StringRef> {
-    return str.empty() ? None : Optional<StringRef>(str);
+  // Canonicalize empty strings to std::nullopt for the CompactArray.
+  auto str = [](StringRef str) -> std::optional<StringRef> {
+    return str.empty() ? std::nullopt : std::optional<StringRef>(str);
   };
 
   impl.structureBuilder.addEntry(
@@ -244,16 +244,21 @@ std::unique_ptr<llvm::MemoryBuffer> DocStructureArrayBuilder::createBuffer() {
   size_t structureArrayBufferSize = impl.structureArrayBuffer.size();
   size_t structureBufferSize = impl.structureBuilder.sizeInBytes();
 
+  size_t kindSize = sizeof(uint64_t);
+
   // Header:
   // * offset of each section start (5)
   // * offset of top structure array (relative to structure array section) (1)
   size_t headerSize = sizeof(uint64_t) * 6;
 
-  auto result = llvm::MemoryBuffer::getNewUninitMemBuffer(
+  auto result = llvm::WritableMemoryBuffer::getNewUninitMemBuffer(
       inheritedTypesBufferSize + attrsBufferSize + elementsBufferSize +
-      structureArrayBufferSize + structureBufferSize + headerSize);
+      structureArrayBufferSize + structureBufferSize + headerSize + kindSize);
 
-  char *start = const_cast<char *>(result->getBufferStart());
+  *reinterpret_cast<uint64_t *>(result->getBufferStart()) =
+      (uint64_t)CustomBufferKind::DocStructureArray;
+
+  char *start = result->getBufferStart() + kindSize;
   char *headerPtr = start;
   char *ptr = start + headerSize;
 
@@ -277,7 +282,7 @@ std::unique_ptr<llvm::MemoryBuffer> DocStructureArrayBuilder::createBuffer() {
   assert(headerPtr == start + (headerSize - sizeof(topOffset)));
   memcpy(headerPtr, &topOffset, sizeof(topOffset));
 
-  return result;
+  return std::move(result);
 }
 
 namespace {
@@ -477,8 +482,10 @@ struct DocStructureReader {
       APPLY(KeyAccessLevel, UID, node.AccessLevel);
     if (node.SetterAccessLevel)
       APPLY(KeySetterAccessLevel, UID, node.SetterAccessLevel);
-    APPLY(KeyNameOffset, Int, node.NameOffset);
-    APPLY(KeyNameLength, Int, node.NameLength);
+    if (node.NameOffset || node.NameLength) {
+      APPLY(KeyNameOffset, Int, node.NameOffset);
+      APPLY(KeyNameLength, Int, node.NameLength);
+    }
     if (node.BodyOffset || node.BodyLength) {
       APPLY(KeyBodyOffset, Int, node.BodyOffset);
       APPLY(KeyBodyLength, Int, node.BodyLength);
@@ -579,7 +586,9 @@ VariantFunctions DocStructureArrayFuncs::funcs = {
     nullptr /*AnnotArray_string_get_length*/,
     nullptr /*AnnotArray_string_get_ptr*/,
     nullptr /*AnnotArray_int64_get_value*/,
-    nullptr /*AnnotArray_uid_get_value*/
+    nullptr /*AnnotArray_uid_get_value*/,
+    nullptr /*Annot_data_get_size*/,
+    nullptr /*Annot_data_get_ptr*/,
 };
 
 VariantFunctions *sourcekitd::getVariantFunctionsForDocStructureElementArray() {

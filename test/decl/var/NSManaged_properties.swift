@@ -12,6 +12,7 @@ class X : NSObject {
 
 @NSManaged var global: Int // expected-error {{@NSManaged only allowed on an instance property or method}}
 
+// expected-error@+1 {{@NSManaged method cannot have a body; it must be provided at runtime}}
 @NSManaged     // expected-error {{@NSManaged only allowed on an instance property or method}}
 func managedFunction() {}
 
@@ -38,8 +39,9 @@ class SwiftGizmo : A {
   // expected-error@+1{{property cannot be marked @NSManaged because its type cannot be represented in Objective-C}}
   @NSManaged var nonobjc_var: SwiftProto?
 
-  @NSManaged class var d: Int = 4  // expected-error {{@NSManaged only allowed on an instance property or method}}
-  // expected-error@-1 {{class stored properties not supported in classes; did you mean 'static'?}}
+  // expected-error@+2 {{@NSManaged only allowed on an instance property or method}}
+  // expected-error@+1 {{@NSManaged property cannot have an initial value}}
+  @NSManaged class var d: Int = 4
 
   @NSManaged var e: Int { return 4 } // expected-error {{@NSManaged not allowed on computed properties}}
 
@@ -48,8 +50,9 @@ class SwiftGizmo : A {
   @NSManaged func mutableArrayValueForA() // no-warning
   @NSManaged func mutableArrayValueForB() {} // expected-error {{NSManaged method cannot have a body; it must be provided at runtime}}
   @NSManaged class func mutableArrayValueForA() {} // expected-error {{@NSManaged only allowed on an instance property or method}}
+  // expected-error@-1 {{@NSManaged method cannot have a body; it must be provided at runtime}}
 
-  // SR-1050: don't assert
+  // (https://github.com/apple/swift/issues/43662) Don't assert.
   @NSManaged var multiA, multiB, multiC : NSNumber?
 
   override init() {}

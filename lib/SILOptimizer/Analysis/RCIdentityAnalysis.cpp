@@ -12,7 +12,10 @@
 
 #include "swift/SILOptimizer/Analysis/RCIdentityAnalysis.h"
 #include "swift/SILOptimizer/Analysis/DominanceAnalysis.h"
+#include "swift/SILOptimizer/Utils/InstOptUtils.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILInstruction.h"
+#include "swift/SIL/DynamicCasts.h"
 #include "llvm/Support/CommandLine.h"
 
 using namespace swift;
@@ -42,20 +45,26 @@ static bool isNoPayloadEnum(SILValue V) {
 /// necessarily preserve RC identity because it may cast from a
 /// reference-counted type to a non-reference counted type, or from a larger to
 /// a smaller struct with fewer references.
-static bool isRCIdentityPreservingCast(ValueKind Kind) {
-  switch (Kind) {
+static SILValue getRCIdentityPreservingCastOperand(SILValue V) {
+  switch (V->getKind()) {
   case ValueKind::UpcastInst:
   case ValueKind::UncheckedRefCastInst:
-  case ValueKind::UnconditionalCheckedCastInst:
   case ValueKind::InitExistentialRefInst:
   case ValueKind::OpenExistentialRefInst:
   case ValueKind::RefToBridgeObjectInst:
   case ValueKind::BridgeObjectToRefInst:
   case ValueKind::ConvertFunctionInst:
-    return true;
-  default:
-    return false;
+    return cast<SingleValueInstruction>(V)->getOperand(0);
+  case ValueKind::UnconditionalCheckedCastInst: {
+    auto *castInst = cast<UnconditionalCheckedCastInst>(V);
+    if (SILDynamicCastInst(castInst).isRCIdentityPreserving())
+      return castInst->getOperand();
+    break;
   }
+  default:
+    break;
+  }
+  return SILValue();
 }
 
 //===----------------------------------------------------------------------===//
@@ -64,34 +73,39 @@ static bool isRCIdentityPreservingCast(ValueKind Kind) {
 
 static SILValue stripRCIdentityPreservingInsts(SILValue V) {
   // First strip off RC identity preserving casts.
-  if (isRCIdentityPreservingCast(V->getKind()))
-    return cast<SingleValueInstruction>(V)->getOperand(0);
+  if (SILValue castOp = getRCIdentityPreservingCastOperand(V))
+    return castOp;
 
   // Then if we have a struct_extract that is extracting a non-trivial member
   // from a struct with no other non-trivial members, a ref count operation on
   // the struct is equivalent to a ref count operation on the extracted
   // member. Strip off the extract.
   if (auto *SEI = dyn_cast<StructExtractInst>(V))
-    if (SEI->isFieldOnlyNonTrivialField())
+    if (SEI->isFieldOnlyNonTrivialField() && !SEI->getOperand()->getType().isMoveOnly()) {
+      assert(!hasValueDeinit(SEI->getOperand()));
       return SEI->getOperand();
+    }
 
   // If we have a struct instruction with only one non-trivial stored field, the
   // only reference count that can be modified is the non-trivial field. Return
   // the non-trivial field.
-  if (auto *SI = dyn_cast<StructInst>(V))
-    if (SILValue NewValue = SI->getUniqueNonTrivialFieldValue())
-      return NewValue;
-
+  if (auto *SI = dyn_cast<StructInst>(V)) {
+    if (!hasValueDeinit(SI)) {
+      if (SILValue NewValue = SI->getUniqueNonTrivialFieldValue())
+        return NewValue;
+    }
+  }
   // If we have an unchecked_enum_data, strip off the unchecked_enum_data.
-  if (auto *UEDI = dyn_cast<UncheckedEnumDataInst>(V))
-    return UEDI->getOperand();
-
+  if (auto *UEDI = dyn_cast<UncheckedEnumDataInst>(V)) {
+    if (!hasValueDeinit(UEDI->getOperand()))
+      return UEDI->getOperand();
+  }
   // If we have an enum instruction with a payload, strip off the enum to
   // expose the enum's payload.
-  if (auto *EI = dyn_cast<EnumInst>(V))
-    if (EI->hasOperand())
+  if (auto *EI = dyn_cast<EnumInst>(V)) {
+    if (EI->hasOperand() && !hasValueDeinit(EI))
       return EI->getOperand();
-
+  }
   // If we have a tuple_extract that is extracting the only non trivial member
   // of a tuple, a retain_value on the tuple is equivalent to a retain_value on
   // the extracted value.
@@ -106,19 +120,19 @@ static SILValue stripRCIdentityPreservingInsts(SILValue V) {
     if (SILValue NewValue = TI->getUniqueNonTrivialElt())
       return NewValue;
 
-  // Any SILArgument with a single predecessor from a "phi" perspective is
-  // dead. In such a case, the SILArgument must be rc-identical.
-  //
-  // This is the easy case. The difficult case is when you have an argument with
-  // /multiple/ predecessors.
-  //
-  // We do not need to insert this SILArgument into the visited SILArgument set
-  // since we will only visit it twice if we go around a back edge due to a
-  // different SILArgument that is actually being used for its phi node like
-  // purposes.
-  if (auto *A = dyn_cast<SILPHIArgument>(V))
-    if (SILValue Result = A->getSingleIncomingValue())
-      return Result;
+  if (auto *result = SILArgument::isTerminatorResult(V)) {
+    if (auto *forwardedOper = result->forwardedTerminatorResultOperand()) {
+      if (!hasValueDeinit(forwardedOper->get()))
+        return forwardedOper->get();
+    }
+  }
+
+  // Handle useless single-predecessor phis for legacy reasons. (Although these
+  // should have been removed as a standard SIL cleanup).
+  if (auto phi = PhiValue(V)) {
+    if (auto *singlePred = phi.phiBlock->getSinglePredecessorBlock())
+      return phi.getOperand(singlePred)->get();
+  }
 
   return SILValue();
 }
@@ -162,26 +176,26 @@ SILValue RCIdentityFunctionInfo::stripOneRCIdentityIncomingValue(SILArgument *A,
 /// Returns true if we proved that RCIdentity has a non-payloaded enum case,
 /// false if RCIdentity has a payloaded enum case, and None if we failed to find
 /// anything.
-static llvm::Optional<bool> proveNonPayloadedEnumCase(SILBasicBlock *BB,
-                                                      SILValue RCIdentity) {
+static std::optional<bool> proveNonPayloadedEnumCase(SILBasicBlock *BB,
+                                                     SILValue RCIdentity) {
   // Then see if BB has one predecessor... if it does not, return None so we
   // keep searching up the domtree.
   SILBasicBlock *SinglePred = BB->getSinglePredecessorBlock();
   if (!SinglePred)
-    return None;
+    return std::nullopt;
 
   // Check if SinglePred has a switch_enum terminator switching on
   // RCIdentity... If it does not, return None so we keep searching up the
   // domtree.
   auto *SEI = dyn_cast<SwitchEnumInst>(SinglePred->getTerminator());
   if (!SEI || SEI->getOperand() != RCIdentity)
-    return None;
+    return std::nullopt;
 
   // Then return true if along the edge from the SEI to BB, RCIdentity has a
   // non-payloaded enum value.
   NullablePtr<EnumElementDecl> Decl = SEI->getUniqueCaseForDestination(BB);
   if (Decl.isNull())
-    return None;
+    return std::nullopt;
   return !Decl.get()->hasAssociatedValues();
 }
 
@@ -233,13 +247,13 @@ findDominatingNonPayloadedEdge(SILBasicBlock *IncomingEdgeBB,
     // Search for uses of RCIdentity in Node->getBlock() that will enable us to
     // know that it has a non-payloaded enum case.
     SILBasicBlock *DominatingBB = Node->getBlock();
-    llvm::Optional<bool> Result =
+    std::optional<bool> Result =
         proveNonPayloadedEnumCase(DominatingBB, RCIdentity);
 
     // If we found either a signal of a payloaded or a non-payloaded enum,
     // return that value.
-    if (Result.hasValue())
-      return Result.getValue();
+    if (Result.has_value())
+      return Result.value();
 
     // If we didn't reach RCIdentityBB, keep processing up the DomTree.
     if (DominatingBB != RCIdentityBB)
@@ -301,8 +315,8 @@ static SILValue allIncomingValuesEqual(
 /// potentially mismatch
 SILValue RCIdentityFunctionInfo::stripRCIdentityPreservingArgs(SILValue V,
                                                       unsigned RecursionDepth) {
-  auto *A = dyn_cast<SILPHIArgument>(V);
-  if (!A) {
+  auto *A = dyn_cast<SILPhiArgument>(V);
+  if (!A || !A->isPhi()) {
     return SILValue();
   }
 
@@ -315,14 +329,21 @@ SILValue RCIdentityFunctionInfo::stripRCIdentityPreservingArgs(SILValue V,
   // SILArgument's incoming values. If we don't have an incoming value for each
   // one of our predecessors, just return SILValue().
   llvm::SmallVector<std::pair<SILBasicBlock *, SILValue>, 8> IncomingValues;
-  if (!A->getIncomingValues(IncomingValues) || IncomingValues.empty()) {
+  if (!A->getSingleTerminatorOperands(IncomingValues)
+      || IncomingValues.empty()) {
     return SILValue();
   }
 
   unsigned IVListSize = IncomingValues.size();
-
-  assert(IVListSize != 1 && "Should have been handled in "
-         "stripRCIdentityPreservingInsts");
+  if (IVListSize == 1) {
+#ifndef NDEBUG
+      auto dynCast = SILDynamicCastInst::getAs(A->getSingleTerminator());
+      assert((dynCast && !dynCast.isRCIdentityPreserving())
+             && "Should have been handled in stripRCIdentityPreservingInsts");
+#endif
+      return SILValue();
+    
+  }
 
   // Ok, we have multiple predecessors. See if all of them are the same
   // value. If so, just return that value.
@@ -491,10 +512,27 @@ static bool isNonOverlappingTrivialAccess(SILValue value) {
   if (auto *SEI = dyn_cast<StructExtractInst>(value)) {
     // If the struct we are extracting from only has one non trivial element and
     // we are not extracting from that element, this is an ARC escape.
-    return SEI->isTrivialFieldOfOneRCIDStruct();
+    return SEI->isTrivialFieldOfOneRCIDStruct() && !hasValueDeinit(SEI);
   }
 
   return false;
+}
+
+void RCIdentityFunctionInfo::getRCUsers(
+    SILValue V, llvm::SmallVectorImpl<SILInstruction *> &Users) {
+  // We assume that Users is empty.
+  assert(Users.empty() && "Expected an empty out variable.");
+
+  // First grab our RC uses.
+  llvm::SmallVector<Operand *, 32> TmpUsers;
+  getRCUses(V, TmpUsers);
+
+  // Then map our operands out of TmpUsers into Users.
+  llvm::transform(TmpUsers, std::back_inserter(Users),
+                  [](Operand *Op) { return Op->getUser(); });
+
+  // Finally sort/unique our users array.
+  sortUnique(Users);
 }
 
 /// Return all recursive users of V, looking through users which propagate
@@ -502,14 +540,20 @@ static bool isNonOverlappingTrivialAccess(SILValue value) {
 /// user of the RC is not managed by ARC.
 ///
 /// We only use the instruction analysis here.
-void RCIdentityFunctionInfo::getRCUsers(
-    SILValue InputValue, llvm::SmallVectorImpl<SILInstruction *> &Users) {
+void RCIdentityFunctionInfo::getRCUses(SILValue InputValue,
+                                       llvm::SmallVectorImpl<Operand *> &Uses) {
+  return visitRCUses(InputValue,
+                     [&](Operand *op) { return Uses.push_back(op); });
+}
+
+void RCIdentityFunctionInfo::visitRCUses(
+    SILValue InputValue, function_ref<void(Operand *)> Visitor) {
   // Add V to the worklist.
-  llvm::SmallVector<SILValue, 8> Worklist;
+  SmallVector<SILValue, 8> Worklist;
   Worklist.push_back(InputValue);
 
-  // A set used to ensure we only visit users once.
-  llvm::SmallPtrSet<SILInstruction *, 8> VisitedInsts;
+  // A set used to ensure we only visit uses once.
+  SmallPtrSet<Operand *, 8> VisitedOps;
 
   // Then until we finish the worklist...
   while (!Worklist.empty()) {
@@ -518,34 +562,34 @@ void RCIdentityFunctionInfo::getRCUsers(
 
     // For each user of V...
     for (auto *Op : V->getUses()) {
-      SILInstruction *User = Op->getUser();
-
       // If we have already visited this user, continue.
-      if (!VisitedInsts.insert(User).second)
+      if (!VisitedOps.insert(Op).second)
         continue;
 
-      for (auto value : User->getResults()) {
+      auto *User = Op->getUser();
+
+      if (auto *SVI = dyn_cast<SingleValueInstruction>(User)) {
         // Otherwise attempt to strip off one layer of RC identical instructions
         // from User.
-        SILValue StrippedRCID = stripRCIdentityPreservingInsts(value);
+        SILValue StrippedRCID = stripRCIdentityPreservingInsts(SVI);
 
-        // If StrippedRCID is not V, then we know that User's result is
-        // conservatively not RCIdentical to V.
-        if (StrippedRCID != V) {
-          // If the user is extracting a trivial field of an aggregate structure
-          // that does not overlap with the ref counted part of the aggregate, we
-          // can ignore it.
-          if (isNonOverlappingTrivialAccess(value))
-            continue;
-
-          // Otherwise, it is an RC user that our user wants.
-          Users.push_back(User);
+        // If the User's result has the same RC identity as its operand, V, then
+        // it must still be RC identical to InputValue, so transitively search
+        // for more users.
+        if (StrippedRCID == V) {
+          Worklist.push_back(SILValue(SVI));
           continue;
         }
 
-        // Otherwise, add the result to our list to continue searching.
-        Worklist.push_back(value);
+        // If the user is extracting a trivial field of an aggregate structure
+        // that does not overlap with the ref counted part of the aggregate, we
+        // can ignore it.
+        if (isNonOverlappingTrivialAccess(SVI))
+          continue;
       }
+
+      // Otherwise, stop searching and report this RC operand.
+      Visitor(Op);
     }
   }
 }

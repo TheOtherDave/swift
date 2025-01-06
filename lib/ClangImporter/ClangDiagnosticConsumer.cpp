@@ -11,10 +11,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "ClangDiagnosticConsumer.h"
+#include "ClangSourceBufferImporter.h"
 #include "ImporterImpl.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsClangImporter.h"
+#include "swift/Basic/Assertions.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/Frontend/DiagnosticRenderer.h"
 #include "clang/Frontend/FrontendDiagnostic.h"
@@ -22,6 +24,7 @@
 #include "llvm/ADT/STLExtras.h"
 
 using namespace swift;
+using namespace swift::importer;
 
 namespace {
   class ClangDiagRenderer final : public clang::DiagnosticNoteRenderer {
@@ -66,8 +69,18 @@ namespace {
                                StringRef Message,
                                ArrayRef<clang::CharSourceRange> Ranges,
                                clang::DiagOrStoredDiag Info) override {
-      if (shouldSuppressDiagInSwiftBuffers(Info) && isInSwiftBuffers(Loc))
-        return;
+      if (isInSwiftBuffers(Loc)) {
+        // FIXME: Ideally, we'd report non-suppressed diagnostics on synthetic
+        // buffers, printing their names (eg. <swift-imported-modules>:...) but
+        // this risks printing _excerpts_ of those buffers to stderr too; at
+        // present the synthetic buffers are "large blocks of null bytes" which
+        // we definitely don't want to print out. So until we have some clever
+        // way to print the name but suppress printing excerpts, we just replace
+        // the Loc with an invalid one here, which suppresses both.
+        Loc = clang::FullSourceLoc();
+        if (shouldSuppressDiagInSwiftBuffers(Info))
+          return;
+      }
       callback(Loc, Level, Message);
     }
 
@@ -99,79 +112,6 @@ ClangDiagnosticConsumer::ClangDiagnosticConsumer(
   : TextDiagnosticPrinter(llvm::errs(), &clangDiagOptions),
     ImporterImpl(impl), DumpToStderr(dumpToStderr) {}
 
-static SourceLoc findEndOfLine(SourceManager &SM, SourceLoc loc,
-                               unsigned bufferID) {
-  CharSourceRange entireBuffer = SM.getRangeForBuffer(bufferID);
-  CharSourceRange rangeFromLoc{SM, loc, entireBuffer.getEnd()};
-  StringRef textFromLoc = SM.extractText(rangeFromLoc);
-  size_t newlineOffset = textFromLoc.find_first_of({"\r\n\0", 3});
-  if (newlineOffset == StringRef::npos)
-    return entireBuffer.getEnd();
-  return loc.getAdvancedLoc(newlineOffset);
-}
-
-SourceLoc ClangDiagnosticConsumer::resolveSourceLocation(
-    const clang::SourceManager &clangSrcMgr,
-    clang::SourceLocation clangLoc) {
-  SourceManager &swiftSrcMgr = ImporterImpl.SwiftContext.SourceMgr;
-  SourceLoc loc;
-
-  clangLoc = clangSrcMgr.getFileLoc(clangLoc);
-  auto decomposedLoc = clangSrcMgr.getDecomposedLoc(clangLoc);
-  if (decomposedLoc.first.isInvalid())
-    return loc;
-
-  auto buffer = clangSrcMgr.getBuffer(decomposedLoc.first);
-  unsigned mirrorID;
-
-  auto mirrorIter = mirroredBuffers.find(buffer);
-  if (mirrorIter != mirroredBuffers.end()) {
-    mirrorID = mirrorIter->second;
-  } else {
-    std::unique_ptr<llvm::MemoryBuffer> mirrorBuffer{
-      llvm::MemoryBuffer::getMemBuffer(buffer->getBuffer(),
-                                       buffer->getBufferIdentifier(),
-                                       /*RequiresNullTerminator=*/true)
-    };
-    mirrorID = swiftSrcMgr.addNewSourceBuffer(std::move(mirrorBuffer));
-    mirroredBuffers[buffer] = mirrorID;
-  }
-  loc = swiftSrcMgr.getLocForOffset(mirrorID, decomposedLoc.second);
-
-  auto presumedLoc = clangSrcMgr.getPresumedLoc(clangLoc);
-  if (!presumedLoc.getFilename())
-    return loc;
-  if (presumedLoc.getLine() == 0)
-    return SourceLoc();
-
-  unsigned bufferLineNumber =
-    clangSrcMgr.getLineNumber(decomposedLoc.first, decomposedLoc.second);
-
-  StringRef presumedFile = presumedLoc.getFilename();
-  SourceLoc startOfLine = loc.getAdvancedLoc(-presumedLoc.getColumn() + 1);
-  bool isNewVirtualFile =
-    swiftSrcMgr.openVirtualFile(startOfLine, presumedFile,
-                                presumedLoc.getLine() - bufferLineNumber);
-  if (isNewVirtualFile) {
-    SourceLoc endOfLine = findEndOfLine(swiftSrcMgr, loc, mirrorID);
-    swiftSrcMgr.closeVirtualFile(endOfLine);
-  }
-
-  using SourceManagerRef = llvm::IntrusiveRefCntPtr<const clang::SourceManager>;
-  auto iter = std::lower_bound(sourceManagersWithDiagnostics.begin(),
-                               sourceManagersWithDiagnostics.end(),
-                               &clangSrcMgr,
-                               [](const SourceManagerRef &inArray,
-                                  const clang::SourceManager *toInsert) {
-    return std::less<const clang::SourceManager *>()(inArray.get(), toInsert);
-  });
-  if (iter->get() != &clangSrcMgr)
-    sourceManagersWithDiagnostics.insert(iter, &clangSrcMgr);
-
-  return loc;
-}
-
-
 void ClangDiagnosticConsumer::HandleDiagnostic(
     clang::DiagnosticsEngine::Level clangDiagLevel,
     const clang::Diagnostic &clangDiag) {
@@ -179,21 +119,17 @@ void ClangDiagnosticConsumer::HandleDiagnostic(
   // we're looking for.
   if (clangDiag.getID() == clang::diag::err_module_not_found &&
       CurrentImport && clangDiag.getArgStdStr(0) == CurrentImport->getName()) {
+    CurrentImportNotFound = true;
     return;
   }
 
-  const ASTContext &ctx = ImporterImpl.SwiftContext;
-
   if (clangDiag.getID() == clang::diag::err_module_not_built &&
       CurrentImport && clangDiag.getArgStdStr(0) == CurrentImport->getName()) {
-    SourceLoc loc = DiagLoc;
-    if (clangDiag.getLocation().isValid())
-      loc = resolveSourceLocation(clangDiag.getSourceManager(),
-                                  clangDiag.getLocation());
-
-    ctx.Diags.diagnose(loc, diag::clang_cannot_build_module,
-                       ctx.LangOpts.EnableObjCInterop,
-                       CurrentImport->getName());
+    HeaderLoc loc(clangDiag.getLocation(), DiagLoc,
+                  &clangDiag.getSourceManager());
+    ImporterImpl.diagnose(loc, diag::clang_cannot_build_module,
+                          ImporterImpl.SwiftContext.LangOpts.EnableObjCInterop,
+                          CurrentImport->getName());
     return;
   }
 
@@ -204,9 +140,9 @@ void ClangDiagnosticConsumer::HandleDiagnostic(
     DiagnosticConsumer::HandleDiagnostic(clangDiagLevel, clangDiag);
 
   // FIXME: Map over source ranges in the diagnostic.
-  auto emitDiag = [&ctx, this](clang::FullSourceLoc clangNoteLoc,
-                      clang::DiagnosticsEngine::Level clangDiagLevel,
-                      StringRef message) {
+  auto emitDiag = [this](clang::FullSourceLoc clangNoteLoc,
+                         clang::DiagnosticsEngine::Level clangDiagLevel,
+                         StringRef message) {
     decltype(diag::error_from_clang) diagKind;
     switch (clangDiagLevel) {
     case clang::DiagnosticsEngine::Ignored:
@@ -215,8 +151,8 @@ void ClangDiagnosticConsumer::HandleDiagnostic(
       diagKind = diag::note_from_clang;
       break;
     case clang::DiagnosticsEngine::Remark:
-      // FIXME: We don't handle remarks yet.
-      return;
+      diagKind = diag::remark_from_clang;
+      break;
     case clang::DiagnosticsEngine::Warning:
       diagKind = diag::warning_from_clang;
       break;
@@ -227,11 +163,9 @@ void ClangDiagnosticConsumer::HandleDiagnostic(
       break;
     }
 
-    SourceLoc noteLoc;
-    if (clangNoteLoc.isValid())
-      noteLoc = resolveSourceLocation(clangNoteLoc.getManager(),
-                                      clangNoteLoc);
-    ctx.Diags.diagnose(noteLoc, diagKind, message);
+    HeaderLoc noteLoc(clangNoteLoc, SourceLoc(),
+              clangNoteLoc.hasManager() ? &clangNoteLoc.getManager() : nullptr);
+    ImporterImpl.diagnose(noteLoc, diagKind, message);
   };
 
   llvm::SmallString<128> message;

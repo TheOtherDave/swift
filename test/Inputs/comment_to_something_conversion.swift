@@ -15,7 +15,7 @@
 
 /// Aaa.  subscript(i: Int).
 @objc public subscript(i: Int) -> Int {
-// CHECK: {{.*}}DocCommentAsXML=[<Other file="{{.*}}" line="{{.*}}" column="{{.*}}"><Name>subscript(_:)</Name><USR>s:14comment_to_xml21A010_AttachToEntitiesCS2icip</USR><Declaration>@objc public subscript(i: Int) -&gt; Int { get set }</Declaration><CommentParts><Abstract><Para>Aaa.  subscript(i: Int).</Para></Abstract></CommentParts></Other>]
+// CHECK: {{.*}}DocCommentAsXML=[<Other file="{{.*}}" line="{{.*}}" column="{{.*}}"><Name>subscript(_:)</Name><USR>s:14comment_to_xml21A010_AttachToEntitiesCyS2icip</USR><Declaration>@objc public subscript(i: Int) -&gt; Int { get set }</Declaration><CommentParts><Abstract><Para>Aaa.  subscript(i: Int).</Para></Abstract></CommentParts></Other>]
     get {
 // CHECK: {{.*}}DocCommentAsXML=none
       return 0
@@ -60,6 +60,15 @@ public enum A012_AttachToEntities {
   /// ---------
   @objc public func f0() {}
 // CHECK: {{.*}}DocCommentAsXML=[<Function file="{{.*}}" line="{{.*}}" column="{{.*}}"><Name>f0()</Name><USR>c:@M@comment_to_xml@objc(cs)ATXHeaders(im)f0</USR><Declaration>@objc public func f0()</Declaration><CommentParts><Discussion><rawHTML><![CDATA[<h1>]]></rawHTML>LEVEL ONE<rawHTML><![CDATA[</h1>]]></rawHTML><rawHTML><![CDATA[<h2>]]></rawHTML>LEVEL TWO<rawHTML><![CDATA[</h2>]]></rawHTML></Discussion></CommentParts></Function>]
+}
+
+@objc public class Attributes {
+// CHECK: {{.*}}DocCommentAsXML=none
+    /// Here is an attribute:
+    ///
+    /// ^[Attribute text](string: "attributed")
+    @objc public func f0() {}
+    // CHECK: {{.*}}DocCommentAsXML=[<Function file="{{.*}}" line="{{.*}}" column="{{.*}}"><Name>f0()</Name><USR>c:@M@comment_to_xml@objc(cs)Attributes(im)f0</USR><Declaration>@objc public func f0()</Declaration><CommentParts><Abstract><Para>Here is an attribute:</Para></Abstract><Discussion><Para><InlineAttributes attributes="string: &quot;attributed&quot;">Attribute text</InlineAttributes></Para></Discussion></CommentParts></Function>]
 }
 
 @objc public class AutomaticLink {
@@ -196,6 +205,18 @@ public enum A012_AttachToEntities {
    */
   @objc public func f4() {}
 // CHECK: {{.*}}DocCommentAsXML=[<Function file="{{.*}}" line="{{.*}}" column="{{.*}}"><Name>f4()</Name><USR>c:@M@comment_to_xml@objc(cs)EmptyComments(im)f4</USR><Declaration>@objc public func f4()</Declaration><CommentParts><Abstract><Para>Aaa.</Para></Abstract></CommentParts></Function>]
+}
+
+@objc public class Footnotes {
+// CHECK: {{.*}}DocCommentAsXML=none
+    /// Has some footnotes.
+    ///
+    /// Footnotes aren't handled by swiftMarkup yet[^footnote], but they may in the future.
+    ///
+    /// [^footnote]: Footnotes aren't parsed by default in swift-cmark, and swiftMarkup doesn't
+    ///     enable the feature.
+    @objc public func f0() {}
+    // CHECK: {{.*}}DocCommentAsXML=[<Function file="{{.*}}" line="{{.*}}" column="{{.*}}"><Name>f0()</Name><USR>c:@M@comment_to_xml@objc(cs)Footnotes(im)f0</USR><Declaration>@objc public func f0()</Declaration><CommentParts><Abstract><Para>Has some footnotes.</Para></Abstract><Discussion><Para>Footnotes aren’t handled by swiftMarkup yet[^footnote], but they may in the future.</Para><Para>[^footnote]: Footnotes aren’t parsed by default in swift-cmark, and swiftMarkup doesn’t enable the feature.</Para></Discussion></CommentParts></Function>]
 }
 
 @objc public class HasThrowingFunction {
@@ -492,3 +513,10 @@ public func localizationKeyShouldNotAppearInDocComments2() {}
 /// - TAG: TAG_C
 public func tags() {}
 // CHECK: DocCommentAsXML=[<Function file="{{.*}}" line="{{.*}}" column="{{.*}}"><Name>tags()</Name><USR>s:14comment_to_xml4tagsyyF</USR><Declaration>public func tags()</Declaration><CommentParts><Abstract><Para>Brief.</Para></Abstract><Tags><Tag>Tag_A</Tag><Tag>Tag B</Tag><Tag>Dedupe tag</Tag><Tag>TAG_C</Tag></Tags><Discussion><Para>Intentional break</Para></Discussion></CommentParts></Function>]
+
+
+#sourceLocation(file: "custom.swuft", line: 20)
+/// Oooh, custom!
+public func customLocation() {}
+// CHECK: DocCommentAsXML=[<Function file="custom.swuft" line="21" column="{{.*}}"><Name>customLocation()</Name><USR>s:14comment_to_xml14customLocationyyF</USR><Declaration>public func customLocation()</Declaration><CommentParts><Abstract><Para>Oooh, custom!</Para></Abstract></CommentParts></Function>]
+#sourceLocation() // reset

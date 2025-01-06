@@ -61,7 +61,7 @@ public:
   }
 
   const_reverse_range getReversePostOrder(SILBasicBlock *StartBlock) const {
-    unsigned RPONumber = getRPONumber(StartBlock).getValue();
+    unsigned RPONumber = getRPONumber(StartBlock).value();
     return getReversePostOrder(RPONumber);
   }
 
@@ -70,28 +70,20 @@ public:
                       PostOrder.rend());
   }
 
-  using enumerated_range = EnumeratorRange<decltype(PostOrder)::iterator>;
-  enumerated_range getEnumeratedPostOrder() { return enumerate(PostOrder); }
-  using reverse_enumerated_range =
-      EnumeratorRange<decltype(PostOrder)::reverse_iterator>;
-  reverse_enumerated_range getEnumeratedReversePostOrder() {
-    return enumerate(PostOrder.rbegin(), PostOrder.rend());
-  }
-
   unsigned size() const { return PostOrder.size(); }
 
-  Optional<unsigned> getPONumber(SILBasicBlock *BB) const {
+  std::optional<unsigned> getPONumber(SILBasicBlock *BB) const {
     auto Iter = BBToPOMap.find(BB);
     if (Iter != BBToPOMap.end())
       return Iter->second;
-    return None;
+    return std::nullopt;
   }
 
-  Optional<unsigned> getRPONumber(SILBasicBlock *BB) const {
+  std::optional<unsigned> getRPONumber(SILBasicBlock *BB) const {
     auto Iter = BBToPOMap.find(BB);
     if (Iter != BBToPOMap.end())
       return PostOrder.size() - Iter->second - 1;
-    return None;
+    return std::nullopt;
   }
 };
 

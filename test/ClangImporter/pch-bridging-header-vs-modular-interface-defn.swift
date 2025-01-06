@@ -63,7 +63,7 @@
 // ~~~~~~~~~~~~~~
 //
 // One might hope that this can be fixed by having the merge-modules step take a
-// PCH as well as other steps in the compilation. That unfortuantely only
+// PCH as well as other steps in the compilation. That unfortunately only
 // inverts the problem, which resurfaces in the definition-order of Bar itself:
 // an XRef to __ObjC.Bar gets serialized, and then _it_ can't be found during
 // merge-modules, because the *last-read* defn of Bar -- the modular one, M.Bar
@@ -77,8 +77,7 @@
 // RUN: rm -rf %t
 // RUN: mkdir -p %t/Headers/Simple
 // RUN: ln -s %S/Inputs/frameworks/Simple.framework/Headers/Simple.h %t/Headers/Simple/Simple.h
-// RUN: %target-build-swift -emit-module -module-name test -Xfrontend -disable-deserialization-recovery -v -F %S/Inputs/frameworks -Xcc "-I%t/Headers" -module-cache-path %t/clang-module-cache -import-objc-header %S/Inputs/pch-bridging-header-with-non-modular-import.h %S/Inputs/other.swift %s
-// REQUIRES: objc_interop
+// RUN: %target-build-swift -emit-module -module-name test -Xfrontend -enable-objc-interop -Xfrontend -disable-deserialization-recovery -v -F %S/Inputs/frameworks -Xcc "-I%t/Headers" -module-cache-path %t/clang-module-cache -import-objc-header %S/Inputs/pch-bridging-header-with-non-modular-import.h %S/Inputs/other.swift %s
 
 import Simple
 class Foo: SimpleProtocol {

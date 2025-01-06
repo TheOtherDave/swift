@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -15,9 +15,14 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
+#include "swift/AST/ASTBridging.h"
+#include "swift/AST/DiagnosticBridge.h"
+#include "swift/AST/DiagnosticEngine.h"
+#include "swift/Basic/ColorUtils.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/SourceManager.h"
-#include "swift/AST/DiagnosticEngine.h"
+#include "swift/Bridging/ASTGen.h"
+#include "swift/Markup/Markup.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
@@ -25,75 +30,297 @@
 #include "llvm/Support/raw_ostream.h"
 
 using namespace swift;
+using namespace swift::markup;
 
 namespace {
-  class ColoredStream : public raw_ostream {
-    raw_ostream &Underlying;
-  public:
-    explicit ColoredStream(raw_ostream &underlying) : Underlying(underlying) {}
-    ~ColoredStream() override { flush(); }
+// MARK: Markdown Printing
+    class TerminalMarkupPrinter : public MarkupASTVisitor<TerminalMarkupPrinter> {
+      llvm::raw_ostream &OS;
+      unsigned Indent;
+      unsigned ShouldBold;
 
-    raw_ostream &changeColor(Colors color, bool bold = false,
-                             bool bg = false) override {
-      Underlying.changeColor(color, bold, bg);
-      return *this;
-    }
-    raw_ostream &resetColor() override {
-      Underlying.resetColor();
-      return *this;
-    }
-    raw_ostream &reverseColor() override {
-      Underlying.reverseColor();
-      return *this;
-    }
-    bool has_colors() const override {
-      return true;
-    }
+      void indent(unsigned Amount = 2) { Indent += Amount; }
 
-    void write_impl(const char *ptr, size_t size) override {
-      Underlying.write(ptr, size);
-    }
-    uint64_t current_pos() const override {
-      return Underlying.tell() - GetNumBytesInBuffer();
-    }
+      void dedent(unsigned Amount = 2) {
+        assert(Indent >= Amount && "dedent without matching indent");
+        Indent -= Amount;
+      }
 
-    size_t preferred_buffer_size() const override {
-      return 0;
+      void bold() {
+        ++ShouldBold;
+        updateFormatting();
+      }
+
+      void unbold() {
+        assert(ShouldBold > 0 && "unbolded without matching bold");
+        --ShouldBold;
+        updateFormatting();
+      }
+
+      void updateFormatting() {
+        OS.resetColor();
+        if (ShouldBold > 0)
+          OS.changeColor(raw_ostream::Colors::SAVEDCOLOR, true);
+      }
+
+      void print(StringRef Str) {
+        for (auto c : Str) {
+          OS << c;
+          if (c == '\n')
+            for (unsigned i = 0; i < Indent; ++i)
+              OS << ' ';
+        }
+      }
+
+    public:
+      TerminalMarkupPrinter(llvm::raw_ostream &OS)
+          : OS(OS), Indent(0), ShouldBold(0) {}
+
+      void printNewline() { print("\n"); }
+
+      void visitDocument(const Document *D) {
+        for (const auto *Child : D->getChildren()) {
+          if (Child->getKind() == markup::ASTNodeKind::Paragraph) {
+            // Add a newline before top-level paragraphs
+            printNewline();
+          }
+          visit(Child);
+        }
+      }
+
+      void visitInlineAttributes(const InlineAttributes *A) {
+        print("^[");
+        for (const auto *Child : A->getChildren())
+          visit(Child);
+        print("](");
+        print(A->getAttributes());
+        print(")");
+      }
+
+      void visitBlockQuote(const BlockQuote *BQ) {
+        indent();
+        printNewline();
+        for (const auto *Child : BQ->getChildren())
+          visit(Child);
+        dedent();
+      }
+
+      void visitList(const List *BL) {
+        indent();
+        printNewline();
+        for (const auto *Child : BL->getChildren())
+          visit(Child);
+        dedent();
+      }
+
+      void visitItem(const Item *I) {
+        print("- ");
+        for (const auto *N : I->getChildren())
+          visit(N);
+      }
+
+      void visitCodeBlock(const CodeBlock *CB) {
+        indent();
+        printNewline();
+        print(CB->getLiteralContent());
+        dedent();
+      }
+
+      void visitCode(const Code *C) {
+        print("'");
+        print(C->getLiteralContent());
+        print("'");
+      }
+
+      void visitHTML(const HTML *H) { print(H->getLiteralContent()); }
+
+      void visitInlineHTML(const InlineHTML *IH) {
+        print(IH->getLiteralContent());
+      }
+
+      void visitSoftBreak(const SoftBreak *SB) { printNewline(); }
+
+      void visitLineBreak(const LineBreak *LB) {
+        printNewline();
+        printNewline();
+      }
+
+      void visitLink(const Link *L) {
+        print("[");
+        for (const auto *Child : L->getChildren())
+          visit(Child);
+        print("](");
+        print(L->getDestination());
+        print(")");
+      }
+
+      void visitImage(const Image *I) { llvm_unreachable("unsupported"); }
+
+      void visitParagraph(const Paragraph *P) {
+        for (const auto *Child : P->getChildren())
+          visit(Child);
+        printNewline();
+      }
+
+      // TODO: add raw_ostream support for italics ANSI codes in LLVM.
+      void visitEmphasis(const Emphasis *E) {
+        for (const auto *Child : E->getChildren())
+          visit(Child);
+      }
+
+      void visitStrong(const Strong *E) {
+        bold();
+        for (const auto *Child : E->getChildren())
+          visit(Child);
+        unbold();
+      }
+
+      void visitHRule(const HRule *HR) {
+        print("--------------");
+        printNewline();
+      }
+
+      void visitHeader(const Header *H) {
+        bold();
+        for (const auto *Child : H->getChildren())
+          visit(Child);
+        unbold();
+        printNewline();
+      }
+
+      void visitText(const Text *T) { print(T->getLiteralContent()); }
+
+      void visitPrivateExtension(const PrivateExtension *PE) {
+        llvm_unreachable("unsupported");
+      }
+
+      void visitParamField(const ParamField *PF) {
+        llvm_unreachable("unsupported");
+      }
+
+      void visitReturnField(const ReturnsField *RF) {
+        llvm_unreachable("unsupported");
+      }
+
+      void visitThrowField(const ThrowsField *TF) {
+        llvm_unreachable("unsupported");
+      }
+
+  #define MARKUP_SIMPLE_FIELD(Id, Keyword, XMLKind)                              \
+    void visit##Id(const Id *Field) { llvm_unreachable("unsupported"); }
+  #include "swift/Markup/SimpleFields.def"
+    };
+
+    static void printMarkdown(StringRef Content, raw_ostream &Out,
+                              bool UseColor) {
+      markup::MarkupContext ctx;
+      auto document = markup::parseDocument(ctx, Content);
+      if (UseColor) {
+        ColoredStream stream{Out};
+        TerminalMarkupPrinter printer(stream);
+        printer.visit(document);
+      } else {
+        NoColorStream stream{Out};
+        TerminalMarkupPrinter printer(stream);
+        printer.visit(document);
+      }
     }
-  };
 } // end anonymous namespace
 
-llvm::SMLoc DiagnosticConsumer::getRawLoc(SourceLoc loc) {
-  return loc.Value;
-}
-
-void PrintingDiagnosticConsumer::handleDiagnostic(
-    SourceManager &SM, SourceLoc Loc, DiagnosticKind Kind,
-    StringRef FormatString, ArrayRef<DiagnosticArgument> FormatArgs,
-    const DiagnosticInfo &Info) {
-  // Determine what kind of diagnostic we're emitting.
-  llvm::SourceMgr::DiagKind SMKind;
-  switch (Kind) {
-    case DiagnosticKind::Error:
-      SMKind = llvm::SourceMgr::DK_Error;
-      break;
-    case DiagnosticKind::Warning: 
-      SMKind = llvm::SourceMgr::DK_Warning; 
-      break;
-
-    case DiagnosticKind::Note:
-      SMKind = llvm::SourceMgr::DK_Note;
-      break;
-
-    case DiagnosticKind::Remark:
-      SMKind = llvm::SourceMgr::DK_Remark;
-      break;
-  }
-
-  if (Kind == DiagnosticKind::Error) {
+// MARK: Main DiagnosticConsumer entrypoint.
+void PrintingDiagnosticConsumer::handleDiagnostic(SourceManager &SM,
+                                                  const DiagnosticInfo &Info) {
+  if (Info.Kind == DiagnosticKind::Error) {
     DidErrorOccur = true;
   }
-  
+
+  if (SuppressOutput)
+    return;
+
+  if (Info.IsChildNote)
+    return;
+
+  switch (FormattingStyle) {
+  case DiagnosticOptions::FormattingStyle::Swift: {
+#if SWIFT_BUILD_SWIFT_SYNTAX
+    // Use the swift-syntax formatter.
+    auto bufferStack = DiagnosticBridge::getSourceBufferStack(SM, Info.Loc);
+    if (!bufferStack.empty()) {
+      if (Info.Kind != DiagnosticKind::Note)
+        DiagBridge.flush(Stream, /*includeTrailingBreak=*/true,
+                         /*forceColors=*/ForceColors);
+
+      DiagBridge.enqueueDiagnostic(SM, Info, bufferStack.front());
+      break;
+    }
+#endif
+
+    // Fall through when we don't have the new diagnostics renderer available.
+    LLVM_FALLTHROUGH;
+  }
+
+  case DiagnosticOptions::FormattingStyle::LLVM:
+    printDiagnostic(SM, Info);
+
+    if (PrintEducationalNotes) {
+      for (auto path : Info.EducationalNotePaths) {
+        if (auto buffer = SM.getFileSystem()->getBufferForFile(path)) {
+          printMarkdown(buffer->get()->getBuffer(), Stream, ForceColors);
+          Stream << "\n";
+        }
+      }
+    }
+
+    for (auto ChildInfo : Info.ChildDiagnosticInfo) {
+      printDiagnostic(SM, *ChildInfo);
+    }
+    break;
+  }
+}
+
+void PrintingDiagnosticConsumer::flush(bool includeTrailingBreak) {
+#if SWIFT_BUILD_SWIFT_SYNTAX
+  DiagBridge.flush(Stream, includeTrailingBreak,
+                   /*forceColors=*/ForceColors);
+#endif
+
+  for (auto note : BufferedEducationalNotes) {
+    printMarkdown(note, Stream, ForceColors);
+    Stream << "\n";
+  }
+
+  BufferedEducationalNotes.clear();
+}
+
+bool PrintingDiagnosticConsumer::finishProcessing() {
+  // If there's an in-flight snippet, flush it.
+  flush(false);
+  return false;
+}
+
+// MARK: LLVM style diagnostic printing
+void PrintingDiagnosticConsumer::printDiagnostic(SourceManager &SM,
+                                                 const DiagnosticInfo &Info) {
+
+  // Determine what kind of diagnostic we're emitting.
+  llvm::SourceMgr::DiagKind SMKind;
+  switch (Info.Kind) {
+  case DiagnosticKind::Error:
+    SMKind = llvm::SourceMgr::DK_Error;
+    break;
+  case DiagnosticKind::Warning:
+    SMKind = llvm::SourceMgr::DK_Warning;
+    break;
+
+  case DiagnosticKind::Note:
+    SMKind = llvm::SourceMgr::DK_Note;
+    break;
+
+  case DiagnosticKind::Remark:
+    SMKind = llvm::SourceMgr::DK_Remark;
+    break;
+  }
+
   // Translate ranges.
   SmallVector<llvm::SMRange, 2> Ranges;
   for (auto R : Info.Ranges)
@@ -113,18 +340,21 @@ void PrintingDiagnosticConsumer::handleDiagnostic(
   llvm::SmallString<256> Text;
   {
     llvm::raw_svector_ostream Out(Text);
-    DiagnosticEngine::formatDiagnosticText(Out, FormatString, FormatArgs);
+    DiagnosticEngine::formatDiagnosticText(Out, Info.FormatString,
+                                           Info.FormatArgs);
   }
-  
-  auto Msg = SM.GetMessage(Loc, SMKind, Text, Ranges, FixIts);
-  rawSM.PrintMessage(out, Msg);
+
+  auto Msg = SM.GetMessage(Info.Loc, SMKind, Text, Ranges, FixIts,
+                           EmitMacroExpansionFiles);
+  rawSM.PrintMessage(out, Msg, ForceColors);
 }
 
 llvm::SMDiagnostic
 SourceManager::GetMessage(SourceLoc Loc, llvm::SourceMgr::DiagKind Kind,
                           const Twine &Msg,
                           ArrayRef<llvm::SMRange> Ranges,
-                          ArrayRef<llvm::SMFixIt> FixIts) const {
+                          ArrayRef<llvm::SMFixIt> FixIts,
+                          bool EmitMacroExpansionFiles) const {
 
   // First thing to do: find the current buffer containing the specified
   // location to pull out the source line.
@@ -134,7 +364,7 @@ SourceManager::GetMessage(SourceLoc Loc, llvm::SourceMgr::DiagKind Kind,
   std::string LineStr;
 
   if (Loc.isValid()) {
-    BufferID = getBufferIdentifierForLoc(Loc);
+    BufferID = getDisplayNameForLoc(Loc, EmitMacroExpansionFiles);
     auto CurMB = LLVMSourceMgr.getMemoryBuffer(findBufferContainingLoc(Loc));
 
     // Scan backward to find the start of the line.
@@ -173,7 +403,7 @@ SourceManager::GetMessage(SourceLoc Loc, llvm::SourceMgr::DiagKind Kind,
                                          R.End.getPointer()-LineStart));
     }
 
-    LineAndCol = getLineAndColumn(Loc);
+    LineAndCol = getPresumedLineAndColumnForLoc(Loc);
   }
 
   return llvm::SMDiagnostic(LLVMSourceMgr, Loc.Value, BufferID,
@@ -182,3 +412,10 @@ SourceManager::GetMessage(SourceLoc Loc, llvm::SourceMgr::DiagKind Kind,
                             LineStr, ColRanges, FixIts);
 }
 
+// These must come after the declaration of AnnotatedSourceSnippet due to the
+// `currentSnippet` member.
+PrintingDiagnosticConsumer::PrintingDiagnosticConsumer(
+    llvm::raw_ostream &stream)
+    : Stream(stream) {}
+
+PrintingDiagnosticConsumer::~PrintingDiagnosticConsumer() {}

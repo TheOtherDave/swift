@@ -1,4 +1,5 @@
 // RUN: %target-run-simple-swift
+// RUN: %target-run-simple-swift(-Xfrontend -unavailable-decl-optimization=complete)
 // REQUIRES: executable_test
 
 import StdlibUnittest
@@ -17,6 +18,25 @@ enum Combo<T: Hashable, U: Hashable>: Hashable {
   case both(T, U)
 }
 
+@available(*, unavailable)
+struct UnavailableStruct: Hashable {}
+
+enum HasUnavailableCases: Hashable {
+  case available
+  case availablePayload(Int)
+
+  @available(*, unavailable)
+  case unavailable
+
+  @available(*, unavailable)
+  case unavailablePayload(UnavailableStruct)
+}
+
+enum AllUnavailableCases: Hashable {
+  @available(*, unavailable)
+  case nope
+}
+
 var EnumSynthesisTests = TestSuite("EnumSynthesis")
 
 EnumSynthesisTests.test("BasicEquatability/Hashability") {
@@ -28,7 +48,7 @@ EnumSynthesisTests.test("BasicEquatability/Hashability") {
   ], equalityOracle: { $0 == $1 })
 }
 
-// Not guaranteed by the semantics of Hashable, but we sanity check that the
+// Not guaranteed by the semantics of Hashable, but we soundness check that the
 // synthesized hash function is good enough to not let nearby values collide.
 EnumSynthesisTests.test("CloseValuesDoNotCollide") {
   expectNotEqual(Token.string("foo").hashValue, Token.string("goo").hashValue)
@@ -52,17 +72,36 @@ EnumSynthesisTests.test("CloseGenericValuesDoNotCollide") {
   expectNotEqual(Combo<String, Int>.both("foo", 3).hashValue, Combo<String, Int>.both("goo", 4).hashValue)
 }
 
+EnumSynthesisTests.test("HasUnavailableCasesEquatability/Hashability") {
+  checkHashable([
+    HasUnavailableCases.available,
+    HasUnavailableCases.availablePayload(2),
+  ], equalityOracle: { $0 == $1 })
+}
+
+func hashEncode(_ body: (inout Hasher) -> ()) -> Int {
+  var hasher = Hasher()
+  body(&hasher)
+  return hasher.finalize()
+}
+
 // Make sure that if the user overrides the synthesized member, that one gets
 // used instead.
 enum Overrides: Hashable {
   case a(Int), b(String)
   var hashValue: Int { return 2 }
+  func hash(into hasher: inout Hasher) {
+    hasher.combine(2)
+  }
   static func == (lhs: Overrides, rhs: Overrides) -> Bool { return true }
 }
 
 EnumSynthesisTests.test("ExplicitOverridesSynthesized") {
   checkHashable(expectedEqual: true, Overrides.a(4), .b("foo"))
   expectEqual(Overrides.a(4).hashValue, 2)
+  expectEqual(
+    hashEncode { $0.combine(Overrides.a(4)) },
+    hashEncode { $0.combine(2) })
 }
 
 // ...even in an extension.
@@ -71,12 +110,18 @@ enum OverridesInExtension: Hashable {
 }
 extension OverridesInExtension {
   var hashValue: Int { return 2 }
+  func hash(into hasher: inout Hasher) {
+    hasher.combine(2)
+  }
   static func == (lhs: OverridesInExtension, rhs: OverridesInExtension) -> Bool { return true }
 }
 
 EnumSynthesisTests.test("ExplicitOverridesSynthesizedInExtension") {
   checkHashable(expectedEqual: true, OverridesInExtension.a(4), .b("foo"))
   expectEqual(OverridesInExtension.a(4).hashValue, 2)
+  expectEqual(
+    hashEncode { $0.combine(OverridesInExtension.a(4)) },
+    hashEncode { $0.combine(2) })
 }
 
 // Try an indirect enum.

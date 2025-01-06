@@ -17,8 +17,8 @@ var cat = {(a: Int) in aStruct . /*ivar-x*/x}
 var aTuple = (1, 1)
 
 switch aTuple {
-case (let /*pattern-a:def*/axolotl, let b):
-	print(/*pattern-a*/axolotl + b)
+case (let /*pattern-a:def*/<base>a</base>, let b):
+	print(/*pattern-a*/<base>a</base> + b)
 }
 
 var opt = Optional.some(1)
@@ -30,4 +30,11 @@ if let i = opt, let /*var-j:def*/j = opt2 {
 
 var (a, /*pattern-b:def*/b) = (1, 2)
 print(a + /*pattern-b*/b)
+
+struct S {
+	lazy var lazyVal: Int = {
+		let /*lazy:def*/myVal = 0
+		return /*lazy:ref*/myVal
+	}()
+}
 

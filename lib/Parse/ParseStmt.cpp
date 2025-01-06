@@ -14,27 +14,31 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/Parse/Parser.h"
+#include "swift/AST/ASTWalker.h"
 #include "swift/AST/Attr.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/FileUnit.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/Version.h"
+#include "swift/Parse/IDEInspectionCallbacks.h"
 #include "swift/Parse/Lexer.h"
-#include "swift/Parse/CodeCompletionCallbacks.h"
+#include "swift/Parse/Parser.h"
 #include "swift/Subsystems.h"
-#include "swift/Syntax/TokenSyntax.h"
-#include "swift/Syntax/SyntaxParsingContext.h"
 #include "llvm/ADT/PointerUnion.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/SaveAndRestore.h"
 
 using namespace swift;
-using namespace swift::syntax;
 
 /// isStartOfStmt - Return true if the current token starts a statement.
 ///
-bool Parser::isStartOfStmt() {
+bool Parser::isStartOfStmt(bool preferExpr) {
+  // This needs to be kept in sync with `Parser::parseStmt()`. If a new token
+  // kind is accepted here as start of statement, it should also be handled in
+  // `Parser::parseStmt()`.
   switch (Tok.getKind()) {
   default: return false;
   case tok::kw_return:
@@ -44,7 +48,6 @@ bool Parser::isStartOfStmt() {
   case tok::kw_guard:
   case tok::kw_while:
   case tok::kw_do:
-  case tok::kw_repeat:
   case tok::kw_for:
   case tok::kw_break:
   case tok::kw_continue:
@@ -52,9 +55,21 @@ bool Parser::isStartOfStmt() {
   case tok::kw_switch:
   case tok::kw_case:
   case tok::kw_default:
+  case tok::kw_yield:
+  case tok::kw_discard:
+  case tok::pound_assert:
   case tok::pound_if:
+  case tok::pound_warning:
+  case tok::pound_error:
   case tok::pound_sourceLocation:
     return true;
+
+  case tok::kw_repeat:
+    // 'repeat' followed by anything other than a brace stmt
+    // is a pack expansion expression.
+    // FIXME: 'repeat' followed by '{' could be a pack expansion
+    // with a closure pattern.
+    return peekToken().is(tok::l_brace);
 
   case tok::pound_line:
     // #line at the start of a line is a directive, when within, it is an expr.
@@ -62,15 +77,29 @@ bool Parser::isStartOfStmt() {
 
   case tok::kw_try: {
     // "try" cannot actually start any statements, but we parse it there for
-    // better recovery.
+    // better recovery in cases like 'try return'.
+
+    // For 'if', 'switch', and 'do' we can parse as an expression.
+    if (peekToken().isAny(tok::kw_if, tok::kw_switch) ||
+        (peekToken().is(tok::kw_do) &&
+         Context.LangOpts.hasFeature(Feature::DoExpressions))) {
+      return false;
+    }
     Parser::BacktrackingScope backtrack(*this);
     consumeToken(tok::kw_try);
-    return isStartOfStmt();
+    return isStartOfStmt(preferExpr);
   }
       
   case tok::identifier: {
     // "identifier ':' for/while/do/switch" is a label on a loop/switch.
-    if (!peekToken().is(tok::colon)) return false;
+    if (!peekToken().is(tok::colon)) {
+      // "yield", "discard", and "then" in the right context begins a statement.
+      if (isContextualYieldKeyword() || isContextualDiscardKeyword() ||
+          isContextualThenKeyword(preferExpr)) {
+        return true;
+      }
+      return false;
+    }
 
     // To disambiguate other cases of "identifier :", which might be part of a
     // question colon expression or something else, we look ahead to the second
@@ -78,9 +107,27 @@ bool Parser::isStartOfStmt() {
     Parser::BacktrackingScope backtrack(*this);
     consumeToken(tok::identifier);
     consumeToken(tok::colon);
+
+    // We treating IDENTIFIER: { as start of statement to provide missed 'do'
+    // diagnostics. This case will be handled in parseStmt().
+    if (Tok.is(tok::l_brace)) {
+      return true;
+    }
     // For better recovery, we just accept a label on any statement.  We reject
     // putting a label on something inappropriate in parseStmt().
-    return isStartOfStmt();
+    return isStartOfStmt(preferExpr);
+  }
+
+  case tok::at_sign: {
+    // Might be a statement or case attribute. The only one of these we have
+    // right now is `@unknown default`, so hardcode a check for an attribute
+    // without any parens.
+    if (!peekToken().is(tok::identifier))
+      return false;
+    Parser::BacktrackingScope backtrack(*this);
+    consumeToken(tok::at_sign);
+    consumeToken(tok::identifier);
+    return isStartOfStmt(preferExpr);
   }
   }
 }
@@ -92,11 +139,42 @@ ParserStatus Parser::parseExprOrStmt(ASTNode &Result) {
     consumeToken();
     return makeParserError();
   }
-  
-  if (isStartOfStmt()) {
+
+  if (Tok.is(tok::pound) && Tok.isAtStartOfLine() &&
+      peekToken().is(tok::code_complete)) {
+    consumeToken();
+    if (CodeCompletionCallbacks) {
+      CodeCompletionCallbacks->completeAfterPoundDirective();
+    }
+    consumeToken(tok::code_complete);
+    return makeParserCodeCompletionStatus();
+  }
+
+  if (isStartOfStmt(/*preferExpr*/ false)) {
     ParserResult<Stmt> Res = parseStmt();
-    if (Res.isNonNull())
-      Result = Res.get();
+    if (Res.isNonNull()) {
+      auto *S = Res.get();
+
+      // Special case: An 'if' or 'switch' statement followed by an 'as' must
+      // be an if/switch expression in a coercion.
+      // We could also achieve this by more eagerly attempting to parse an 'if'
+      // or 'switch' as an expression when in statement position, but that
+      // could result in less useful recovery behavior.
+      if ((isa<IfStmt>(S) || isa<SwitchStmt>(S) ||
+           ((isa<DoStmt>(S) || isa<DoCatchStmt>(S)) &&
+            Context.LangOpts.hasFeature(Feature::DoExpressions))) &&
+          Tok.is(tok::kw_as)) {
+        auto *SVE = SingleValueStmtExpr::createWithWrappedBranches(
+            Context, S, CurDeclContext, /*mustBeExpr*/ true);
+        auto As = parseExprAs();
+        if (As.isParseErrorOrHasCompletion())
+          return As;
+
+        Result = SequenceExpr::create(Context, {SVE, As.get(), As.get()});
+      } else {
+        Result = S;
+      }
+    }
     return Res;
   }
 
@@ -104,12 +182,16 @@ ParserStatus Parser::parseExprOrStmt(ASTNode &Result) {
   StructureMarkerRAII ParsingStmt(*this, Tok.getLoc(),
                                   StructureMarkerKind::Statement);
 
-  if (CodeCompletion)
-    CodeCompletion->setExprBeginning(getParserPosition());
+  if (CodeCompletionCallbacks) {
+    CodeCompletionCallbacks->setExprBeginning(getParserPosition());
+  }
 
   if (Tok.is(tok::code_complete)) {
-    if (CodeCompletion)
-      CodeCompletion->completeStmtOrExpr();
+    auto *CCE = new (Context) CodeCompletionExpr(Tok.getLoc());
+    Result = CCE;
+    if (CodeCompletionCallbacks) {
+      CodeCompletionCallbacks->completeStmtOrExpr(CCE);
+    }
     consumeToken(tok::code_complete);
     return makeParserCodeCompletionStatus();
   }
@@ -126,52 +208,58 @@ ParserStatus Parser::parseExprOrStmt(ASTNode &Result) {
     }
   }
 
-  if (ResultExpr.hasCodeCompletion() && CodeCompletion) {
-    CodeCompletion->completeExpr();
+  return ResultExpr;
+}
+
+/// Returns whether the parser's current position is the start of a switch case,
+/// given that we're in the middle of a switch already.
+static bool isAtStartOfSwitchCase(Parser &parser,
+                                  bool needsToBacktrack = true) {
+  std::optional<Parser::BacktrackingScope> backtrack;
+
+  // Check for and consume attributes. The only valid attribute is `@unknown`
+  // but that's a semantic restriction.
+  while (parser.Tok.is(tok::at_sign)) {
+    if (!parser.peekToken().is(tok::identifier))
+      return false;
+
+    if (needsToBacktrack && !backtrack)
+      backtrack.emplace(parser);
+
+    parser.consumeToken(tok::at_sign);
+    parser.consumeToken(tok::identifier);
+    if (parser.Tok.is(tok::l_paren))
+      parser.skipSingle();
   }
 
-  return ResultExpr;
+  return parser.Tok.isAny(tok::kw_case, tok::kw_default);
 }
 
 bool Parser::isTerminatorForBraceItemListKind(BraceItemListKind Kind,
                                               ArrayRef<ASTNode> ParsedDecls) {
   switch (Kind) {
   case BraceItemListKind::Brace:
+  case BraceItemListKind::TopLevelCode:
+  case BraceItemListKind::TopLevelLibrary:
+  case BraceItemListKind::MacroExpansion:
     return false;
-  case BraceItemListKind::Case:
+  case BraceItemListKind::Case: {
     if (Tok.is(tok::pound_if)) {
+      // Backtracking scopes are expensive, so avoid setting one up if possible.
+      Parser::BacktrackingScope Backtrack(*this);
       // '#if' here could be to guard 'case:' or statements in cases.
       // If the next non-directive line starts with 'case' or 'default', it is
       // for 'case's.
-      Parser::BacktrackingScope Backtrack(*this);
       do {
         consumeToken();
-        while (!Tok.isAtStartOfLine() && Tok.isNot(tok::eof))
-          skipSingle();
+
+        // just find the end of the line
+        skipUntilTokenOrEndOfLine(tok::NUM_TOKENS);
       } while (Tok.isAny(tok::pound_if, tok::pound_elseif, tok::pound_else));
-      return Tok.isAny(tok::kw_case, tok::kw_default);
+      return isAtStartOfSwitchCase(*this, /*needsToBacktrack*/false);
     }
-    return Tok.isAny(tok::kw_case, tok::kw_default);
-  case BraceItemListKind::TopLevelCode:
-    // When parsing the top level executable code for a module, if we parsed
-    // some executable code, then we're done.  We want to process (name bind,
-    // type check, etc) decls one at a time to make sure that there are not
-    // forward type references, etc.  There is an outer loop around the parser
-    // that will reinvoke the parser at the top level on each statement until
-    // EOF.  In contrast, it is ok to have forward references between classes,
-    // functions, etc.
-    for (auto I : ParsedDecls) {
-      if (isa<TopLevelCodeDecl>(I.get<Decl*>()))
-        // Only bail out if the next token is at the start of a line.  If we
-        // don't, then we may accidentally allow things like "a = 1 b = 4".
-        // FIXME: This is really dubious.  This will reject some things, but
-        // allow other things we don't want.
-        if (Tok.isAtStartOfLine())
-          return true;
-    }
-    return false;
-  case BraceItemListKind::TopLevelLibrary:
-    return false;
+    return isAtStartOfSwitchCase(*this);
+  }
   case BraceItemListKind::ActiveConditionalBlock:
   case BraceItemListKind::InactiveConditionalBlock:
     return Tok.isNot(tok::pound_else) && Tok.isNot(tok::pound_endif) &&
@@ -183,24 +271,18 @@ bool Parser::isTerminatorForBraceItemListKind(BraceItemListKind Kind,
 
 void Parser::consumeTopLevelDecl(ParserPosition BeginParserPosition,
                                  TopLevelCodeDecl *TLCD) {
+  SourceLoc EndLoc = PreviousLoc;
   backtrackToPosition(BeginParserPosition);
   SourceLoc BeginLoc = Tok.getLoc();
-  // Consume tokens up to code completion token.
-  while (Tok.isNot(tok::code_complete, tok::eof)) {
-    consumeToken();
-  }
-  // Consume the code completion token, if there is one.
-  consumeIf(tok::code_complete);
-  // Also perform the same recovery as the main parser to capture tokens from
-  // this decl that are past the code completion token.
-  skipUntilDeclStmtRBrace(tok::l_brace);
-  SourceLoc EndLoc = Tok.getLoc();
-  State->delayTopLevel(TLCD, { BeginLoc, EndLoc },
-                       BeginParserPosition.PreviousLoc);
+  State->setIDEInspectionDelayedDeclState(
+      SourceMgr, L->getBufferID(),
+      IDEInspectionDelayedDeclKind::TopLevelCodeDecl, TLCD, {BeginLoc, EndLoc},
+      BeginParserPosition.PreviousLoc);
 
   // Skip the rest of the file to prevent the parser from constructing the AST
   // for it.  Forward references are not allowed at the top level.
-  skipUntil(tok::eof);
+  while (!Tok.is(tok::eof))
+    consumeToken();
 }
 
 ///   brace-item:
@@ -225,61 +307,55 @@ void Parser::consumeTopLevelDecl(ParserPosition BeginParserPosition,
 ///     expr '=' expr
 ParserStatus Parser::parseBraceItems(SmallVectorImpl<ASTNode> &Entries,
                                      BraceItemListKind Kind,
-                                     BraceItemListKind ConditionalBlockKind) {
-  SyntaxParsingContext StmtListContext(SyntaxContext, SyntaxKind::StmtList);
-
+                                     BraceItemListKind ConditionalBlockKind,
+                                     bool &IsFollowingGuard) {
   bool IsTopLevel = (Kind == BraceItemListKind::TopLevelCode) ||
-                    (Kind == BraceItemListKind::TopLevelLibrary);
+                    (Kind == BraceItemListKind::TopLevelLibrary ||
+                    (Kind == BraceItemListKind::MacroExpansion &&
+                     isa<FileUnit>(CurDeclContext)));
   bool isActiveConditionalBlock =
     ConditionalBlockKind == BraceItemListKind::ActiveConditionalBlock;
   bool isConditionalBlock = isActiveConditionalBlock ||
     ConditionalBlockKind == BraceItemListKind::InactiveConditionalBlock;
 
-  // If we're not parsing an active #if block, form a new lexical scope.
-  Optional<Scope> initScope;
-  if (!isActiveConditionalBlock) {
-    auto scopeKind =  IsTopLevel ? ScopeKind::TopLevel : ScopeKind::Brace;
-    initScope.emplace(this, scopeKind,
-                      ConditionalBlockKind ==
-                        BraceItemListKind::InactiveConditionalBlock);
-  }
-
   ParserStatus BraceItemsStatus;
-  SmallVector<Decl*, 8> TmpDecls;
 
   bool PreviousHadSemi = true;
-  while ((Kind == BraceItemListKind::TopLevelLibrary ||
-          Tok.isNot(tok::r_brace)) &&
+  while ((IsTopLevel || Tok.isNot(tok::r_brace)) &&
          Tok.isNot(tok::pound_endif) &&
          Tok.isNot(tok::pound_elseif) &&
          Tok.isNot(tok::pound_else) &&
          Tok.isNot(tok::eof) &&
-         Tok.isNot(tok::kw_sil) &&
-         Tok.isNot(tok::kw_sil_scope) &&
-         Tok.isNot(tok::kw_sil_stage) &&
-         Tok.isNot(tok::kw_sil_vtable) &&
-         Tok.isNot(tok::kw_sil_global) &&
-         Tok.isNot(tok::kw_sil_witness_table) &&
-         Tok.isNot(tok::kw_sil_default_witness_table) &&
+         !isStartOfSILDecl() &&
          (isConditionalBlock ||
           !isTerminatorForBraceItemListKind(Kind, Entries))) {
 
-    SyntaxParsingContext StmtContext(SyntaxContext, SyntaxContextKind::Stmt);
-
-    if (Kind == BraceItemListKind::TopLevelLibrary &&
-        skipExtraTopLevelRBraces())
+    if (Tok.is(tok::r_brace)) {
+      assert(IsTopLevel);
+      diagnose(Tok, diag::extra_rbrace)
+        .fixItRemove(Tok.getLoc());
+      consumeToken();
       continue;
+    }
 
     // Eat invalid tokens instead of allowing them to produce downstream errors.
-    if (consumeIf(tok::unknown))
+    if (Tok.is(tok::unknown)) {
+      if (startsWithMultilineStringDelimiter(Tok)) {
+        // This was due to unterminated multi-line string.
+        IsInputIncomplete = true;
+      }
+      consumeToken();
       continue;
+    }
            
     bool NeedParseErrorRecovery = false;
     ASTNode Result;
 
     // If the previous statement didn't have a semicolon and this new
     // statement doesn't start a line, complain.
-    if (!PreviousHadSemi && !Tok.isAtStartOfLine()) {
+    const bool IsAtStartOfLineOrPreviousHadSemi =
+        PreviousHadSemi || Tok.isAtStartOfLine();
+    if (!IsAtStartOfLineOrPreviousHadSemi) {
       SourceLoc EndOfPreviousLoc = getEndOfPreviousLoc();
       diagnose(EndOfPreviousLoc, diag::statement_same_line_without_semi)
         .fixItInsert(EndOfPreviousLoc, ";");
@@ -287,76 +363,83 @@ ParserStatus Parser::parseBraceItems(SmallVectorImpl<ASTNode> &Entries,
     }
 
     ParserPosition BeginParserPosition;
-    if (isCodeCompletionFirstPass())
+    if (isIDEInspectionFirstPass())
       BeginParserPosition = getParserPosition();
 
     // Parse the decl, stmt, or expression.
     PreviousHadSemi = false;
-    if (isStartOfDecl()
-        && Tok.isNot(
-            tok::pound_if, tok::pound_sourceLocation, tok::pound_line)) {
-      ParserResult<Decl> DeclResult = 
-          parseDecl(IsTopLevel ? PD_AllowTopLevel : PD_Default,
-                    [&](Decl *D) {TmpDecls.push_back(D);});
-      if (DeclResult.isParseError()) {
-        NeedParseErrorRecovery = true;
-        if (DeclResult.hasCodeCompletion() && IsTopLevel &&
-            isCodeCompletionFirstPass()) {
-          consumeDecl(BeginParserPosition, None, IsTopLevel);
-          return DeclResult;
-        }
-      }
-      Result = DeclResult.getPtrOrNull();
-
-      for (Decl *D : TmpDecls)
-        Entries.push_back(D);
-      TmpDecls.clear();
-    } else if (Tok.is(tok::pound_if)) {
+    if (Tok.is(tok::pound_if) && !isStartOfSwiftDecl()) {
+      SmallVector<ASTNode, 16> activeElements;
       auto IfConfigResult = parseIfConfig(
-        [&](SmallVectorImpl<ASTNode> &Elements, bool IsActive) {
-          parseBraceItems(Elements, Kind, IsActive
-                            ? BraceItemListKind::ActiveConditionalBlock
-                            : BraceItemListKind::InactiveConditionalBlock);
-        });
-      
-      if (IfConfigResult.isParseError()) {
-        NeedParseErrorRecovery = true;
-        continue;
+          IfConfigContext::BraceItems,
+          [&](bool IsActive) {
+            SmallVector<ASTNode, 16> elements;
+            parseBraceItems(elements, Kind,
+                            IsActive
+                                ? BraceItemListKind::ActiveConditionalBlock
+                                : BraceItemListKind::InactiveConditionalBlock,
+                            IsFollowingGuard);
+
+            if (IsActive)
+              activeElements = std::move(elements);
+          });
+      if (IfConfigResult.hasCodeCompletion() && isIDEInspectionFirstPass()) {
+        consumeDecl(BeginParserPosition, IsTopLevel);
+        return IfConfigResult;
       }
-      
-      Result = IfConfigResult.get();
-      
-      if (!Result) {
+      BraceItemsStatus |= IfConfigResult;
+      if (IfConfigResult.isError()) {
         NeedParseErrorRecovery = true;
         continue;
       }
 
-      // Add the #if block itself
-      Entries.push_back(Result);
-
-      IfConfigDecl *ICD = cast<IfConfigDecl>(Result.get<Decl*>());
-      for (auto &Entry : ICD->getActiveClauseElements()) {
-        if (Entry.is<Decl*>() && isa<IfConfigDecl>(Entry.get<Decl*>()))
-          // Don't hoist nested '#if'.
-          continue;
-        Entries.push_back(Entry);
-        if (Entry.is<Decl*>()) {
-          Entry.get<Decl*>()->setEscapedFromIfConfig(true);
-        }
-      }
+      Entries.append(activeElements);
     } else if (Tok.is(tok::pound_line)) {
       ParserStatus Status = parseLineDirective(true);
       BraceItemsStatus |= Status;
-      NeedParseErrorRecovery = Status.isError();
+      NeedParseErrorRecovery = Status.isErrorOrHasCompletion();
     } else if (Tok.is(tok::pound_sourceLocation)) {
       ParserStatus Status = parseLineDirective(false);
       BraceItemsStatus |= Status;
-      NeedParseErrorRecovery = Status.isError();
+      NeedParseErrorRecovery = Status.isErrorOrHasCompletion();
+    } else if (isStartOfSwiftDecl()) {
+      SmallVector<Decl*, 8> TmpDecls;
+      ParserStatus DeclResult =
+          parseDecl(IsAtStartOfLineOrPreviousHadSemi,
+                    /*IfConfigsAreDeclAttrs=*/true, [&](Decl *D) {
+                      TmpDecls.push_back(D);
+
+                      // Any function after a 'guard' statement is marked as
+                      // possibly having local captures. This allows SILGen
+                      // to correctly determine its capture list, since
+                      // otherwise it would be skipped because it is not
+                      // defined inside a local context.
+                      if (IsFollowingGuard)
+                        if (auto *FD = dyn_cast<FuncDecl>(D))
+                          FD->setHasTopLevelLocalContextCaptures();
+                    });
+      BraceItemsStatus |= DeclResult;
+      if (DeclResult.isErrorOrHasCompletion()) {
+        NeedParseErrorRecovery = true;
+        if (DeclResult.hasCodeCompletion() && IsTopLevel &&
+            isIDEInspectionFirstPass()) {
+          consumeDecl(BeginParserPosition, IsTopLevel);
+          return DeclResult;
+        }
+      }
+      Entries.append(TmpDecls.begin(), TmpDecls.end());
+
+      // HACK: If any declarations were parsed, make the last one the "result".
+      // We should know whether this was in an #if or not.
+      if (!TmpDecls.empty()) {
+        Result = TmpDecls.back();
+      }
+
     } else if (IsTopLevel) {
       // If this is a statement or expression at the top level of the module,
       // Parse it as a child of a TopLevelCodeDecl.
       auto *TLCD = new (Context) TopLevelCodeDecl(CurDeclContext);
-      ContextChange CC(*this, TLCD, &State->getTopLevelContext());
+      ContextChange CC(*this, TLCD);
       SourceLoc StartLoc = Tok.getLoc();
 
       // Expressions can't begin with a closure literal at statement position.
@@ -366,14 +449,15 @@ ParserStatus Parser::parseBraceItems(SmallVectorImpl<ASTNode> &Entries,
       }
 
       ParserStatus Status = parseExprOrStmt(Result);
-      if (Status.hasCodeCompletion() && isCodeCompletionFirstPass()) {
+      BraceItemsStatus |= Status;
+      if (Status.hasCodeCompletion() && isIDEInspectionFirstPass()) {
         consumeTopLevelDecl(BeginParserPosition, TLCD);
-        auto Brace = BraceStmt::create(Context, StartLoc, {}, Tok.getLoc());
+        auto Brace = BraceStmt::create(Context, StartLoc, {}, PreviousLoc);
         TLCD->setBody(Brace);
         Entries.push_back(TLCD);
         return Status;
       }
-      if (Status.isError())
+      if (Status.isErrorOrHasCompletion())
         NeedParseErrorRecovery = true;
       else if (!allowTopLevelCode()) {
         diagnose(StartLoc,
@@ -384,20 +468,21 @@ ParserStatus Parser::parseBraceItems(SmallVectorImpl<ASTNode> &Entries,
       if (!Result.isNull()) {
         // NOTE: this is a 'virtual' brace statement which does not have
         //       explicit '{' or '}', so the start and end locations should be
-        //       the same as those of the result node
+        //       the same as those of the result node, plus any junk consumed
+        //       afterwards
         auto Brace = BraceStmt::create(Context, Result.getStartLoc(),
-                                       Result, Result.getEndLoc());
+                                       Result, PreviousLoc, /*Implicit=*/true);
         TLCD->setBody(Brace);
         Entries.push_back(TLCD);
+
+        // A top-level 'guard' statement can introduce local bindings, so we
+        // must mark all functions following one. This makes them behave
+        // as if they were in local context for the purposes of capture
+        // emission in SILGen.
+        if (auto *stmt = Result.dyn_cast<Stmt *>())
+          if (isa<GuardStmt>(stmt))
+            IsFollowingGuard = true;
       }
-    } else if (Tok.is(tok::kw_init) && isa<ConstructorDecl>(CurDeclContext)) {
-      SourceLoc StartLoc = Tok.getLoc();
-      auto CD = cast<ConstructorDecl>(CurDeclContext);
-      // Hint at missing 'self.' or 'super.' then skip this statement.
-      bool isSelf = !CD->isDesignatedInit() || !isa<ClassDecl>(CD->getParent());
-      diagnose(StartLoc, diag::invalid_nested_init, isSelf)
-        .fixItInsert(StartLoc, isSelf ? "self." : "super.");
-      NeedParseErrorRecovery = true;
     } else {
       ParserStatus ExprOrStmtStatus = parseExprOrStmt(Result);
       BraceItemsStatus |= ExprOrStmtStatus;
@@ -420,13 +505,12 @@ ParserStatus Parser::parseBraceItems(SmallVectorImpl<ASTNode> &Entries,
     }
 
     if (NeedParseErrorRecovery) {
-      // If we had a parse error, skip to the start of the next stmt, decl or
-      // '{'.
+      // If we had a parse error, skip to the start of the next stmt or decl.
       //
       // It would be ideal to stop at the start of the next expression (e.g.
       // "X = 4"), but distinguishing the start of an expression from the middle
       // of one is "hard".
-      skipUntilDeclStmtRBrace(tok::l_brace);
+      skipUntilDeclStmtRBrace();
 
       // If we have to recover, pretend that we had a semicolon; it's less
       // noisy that way.
@@ -437,97 +521,77 @@ ParserStatus Parser::parseBraceItems(SmallVectorImpl<ASTNode> &Entries,
   return BraceItemsStatus;
 }
 
-void Parser::parseTopLevelCodeDeclDelayed() {
-  auto DelayedState = State->takeDelayedDeclState();
-  assert(DelayedState.get() && "should have delayed state");
-
-  auto BeginParserPosition = getParserPosition(DelayedState->BodyPos);
-  auto EndLexerState = L->getStateForEndOfTokenLoc(DelayedState->BodyEnd);
-
-  // ParserPositionRAII needs a primed parser to restore to.
-  if (Tok.is(tok::NUM_TOKENS))
-    consumeTokenWithoutFeedingReceiver();
-
-  // Ensure that we restore the parser state at exit.
-  ParserPositionRAII PPR(*this);
-
-  // Create a lexer that cannot go past the end state.
-  Lexer LocalLex(*L, BeginParserPosition.LS, EndLexerState);
-
-  // Temporarily swap out the parser's current lexer with our new one.
-  llvm::SaveAndRestore<Lexer *> T(L, &LocalLex);
-
-  // Rewind to the beginning of the top-level code.
-  restoreParserPosition(BeginParserPosition);
-
-  // Re-enter the lexical scope.
-  Scope S(this, DelayedState->takeScope());
-
-  // Re-enter the top-level decl context.
-  // FIXME: this can issue discriminators out-of-order?
-  auto *TLCD = cast<TopLevelCodeDecl>(DelayedState->ParentContext);
-  ContextChange CC(*this, TLCD, &State->getTopLevelContext());
-
-  SourceLoc StartLoc = Tok.getLoc();
-  ASTNode Result;
-
-  // Expressions can't begin with a closure literal at statement position. This
-  // prevents potential ambiguities with trailing closure syntax.
-  if (Tok.is(tok::l_brace)) {
-    diagnose(Tok, diag::statement_begins_with_closure);
-  }
-
-  parseExprOrStmt(Result);
-  if (!Result.isNull()) {
-    auto Brace = BraceStmt::create(Context, StartLoc, Result, Tok.getLoc());
-    TLCD->setBody(Brace);
-  }
-}
-
 /// Recover from a 'case' or 'default' outside of a 'switch' by consuming up to
-/// the next ':'.
+/// the next ':' or '}'.
 static ParserResult<Stmt> recoverFromInvalidCase(Parser &P) {
   assert(P.Tok.is(tok::kw_case) || P.Tok.is(tok::kw_default)
          && "not case or default?!");
   P.diagnose(P.Tok, diag::case_outside_of_switch, P.Tok.getText());
-  P.skipUntil(tok::colon);
+  P.skipUntil(tok::colon, tok::r_brace);
   // FIXME: Return an ErrorStmt?
   return nullptr;
 }
 
+/// parseStmt
 ParserResult<Stmt> Parser::parseStmt() {
-  SyntaxParsingContext LocalContext(SyntaxContext, SyntaxContextKind::Stmt);
+  AssertParserMadeProgressBeforeLeavingScopeRAII apmp(*this);
+
+  // If this is a label on a loop/switch statement, consume it and pass it into
+  // parsing logic below.
+  LabeledStmtInfo LabelInfo;
+  if (Tok.is(tok::identifier) && peekToken().is(tok::colon)) {
+    LabelInfo.Loc = consumeIdentifier(LabelInfo.Name,
+                                      /*diagnoseDollarPrefix=*/true);
+    consumeToken(tok::colon);
+  }
 
   // Note that we're parsing a statement.
   StructureMarkerRAII ParsingStmt(*this, Tok.getLoc(),
                                   StructureMarkerKind::Statement);
-  
-  LabeledStmtInfo LabelInfo;
-  
-  // If this is a label on a loop/switch statement, consume it and pass it into
-  // parsing logic below.
-  if (Tok.is(tok::identifier) && peekToken().is(tok::colon)) {
-    LabelInfo.Loc = consumeIdentifier(&LabelInfo.Name);
-    consumeToken(tok::colon);
-  }
 
   SourceLoc tryLoc;
   (void)consumeIf(tok::kw_try, tryLoc);
-  
+
+  // Claim contextual statement keywords now that we've committed
+  // to parsing a statement.
+  if (isContextualYieldKeyword()) {
+    Tok.setKind(tok::kw_yield);
+  } else if (isContextualDiscardKeyword()) {
+    Tok.setKind(tok::kw_discard);
+  }
+
+  if (isContextualThenKeyword(/*preferExpr*/ false))
+    Tok.setKind(tok::kw_then);
+
+  // This needs to handle everything that `Parser::isStartOfStmt()` accepts as
+  // start of statement.
   switch (Tok.getKind()) {
   case tok::pound_line:
   case tok::pound_sourceLocation:
   case tok::pound_if:
+  case tok::pound_error:
+  case tok::pound_warning:
     assert((LabelInfo || tryLoc.isValid()) &&
            "unlabeled directives should be handled earlier");
     // Bailout, and let parseBraceItems() parse them.
     LLVM_FALLTHROUGH;
   default:
     diagnose(Tok, tryLoc.isValid() ? diag::expected_expr : diag::expected_stmt);
+    if (Tok.is(tok::at_sign)) {
+      // Recover from erroneously placed attribute.
+      consumeToken(tok::at_sign);
+      consumeIf(tok::identifier);
+    }
     return nullptr;
   case tok::kw_return:
     if (LabelInfo) diagnose(LabelInfo.Loc, diag::invalid_label_on_stmt);
     return parseStmtReturn(tryLoc);
+  case tok::kw_yield:
+    if (LabelInfo) diagnose(LabelInfo.Loc, diag::invalid_label_on_stmt);
+    return parseStmtYield(tryLoc);
+  case tok::kw_then:
+    if (LabelInfo) diagnose(LabelInfo.Loc, diag::invalid_label_on_stmt);
+    return parseStmtThen(tryLoc);
   case tok::kw_throw:
     if (LabelInfo) diagnose(LabelInfo.Loc, diag::invalid_label_on_stmt);
     return parseStmtThrow(tryLoc);
@@ -554,6 +618,10 @@ ParserResult<Stmt> Parser::parseStmt() {
   case tok::kw_for:
     if (tryLoc.isValid()) diagnose(tryLoc, diag::try_on_stmt, Tok.getText());
     return parseStmtForEach(LabelInfo);
+  case tok::kw_discard:
+    if (LabelInfo) diagnose(LabelInfo.Loc, diag::invalid_label_on_stmt);
+    if (tryLoc.isValid()) diagnose(tryLoc, diag::try_on_stmt, Tok.getText());
+    return parseStmtDiscard();
   case tok::kw_switch:
     if (tryLoc.isValid()) diagnose(tryLoc, diag::try_on_stmt, Tok.getText());
     return parseStmtSwitch(LabelInfo);
@@ -569,11 +637,23 @@ ParserResult<Stmt> Parser::parseStmt() {
     if (LabelInfo) diagnose(LabelInfo.Loc, diag::invalid_label_on_stmt);
     if (tryLoc.isValid()) diagnose(tryLoc, diag::try_on_stmt, Tok.getText());
     return parseStmtContinue();
-  case tok::kw_fallthrough:
+  case tok::kw_fallthrough: {
     if (LabelInfo) diagnose(LabelInfo.Loc, diag::invalid_label_on_stmt);
     if (tryLoc.isValid()) diagnose(tryLoc, diag::try_on_stmt, Tok.getText());
-    return makeParserResult(
-        new (Context) FallthroughStmt(consumeToken(tok::kw_fallthrough)));
+
+    auto loc = consumeToken(tok::kw_fallthrough);
+    return makeParserResult(FallthroughStmt::createParsed(loc, CurDeclContext));
+  }
+  case tok::pound_assert:
+    if (LabelInfo) diagnose(LabelInfo.Loc, diag::invalid_label_on_stmt);
+    if (tryLoc.isValid()) diagnose(tryLoc, diag::try_on_stmt, Tok.getText());
+    return parseStmtPoundAssert();
+  case tok::l_brace:
+    if (tryLoc.isValid()) diagnose(tryLoc, diag::try_on_stmt, Tok.getText());
+    SourceLoc colonLoc = Tok.getLoc();
+    diagnose(colonLoc, diag::labeled_block_needs_do)
+      .fixItInsert(colonLoc, "do ");
+    return parseStmtDo(LabelInfo, /*shouldSkipDoTokenConsume*/ true);
   }
 }
 
@@ -589,12 +669,10 @@ ParserResult<BraceStmt> Parser::parseBraceItemList(Diag<> ID) {
     diagnose(Tok, ID);
 
     // Attempt to recover by looking for a left brace on the same line
-    while (Tok.isNot(tok::eof, tok::l_brace) && !Tok.isAtStartOfLine())
-      skipSingle();
-    if (Tok.isNot(tok::l_brace))
+    if (!skipUntilTokenOrEndOfLine(tok::l_brace, tok::r_brace) ||
+        !Tok.is(tok::l_brace))
       return nullptr;
   }
-  SyntaxParsingContext LocalContext(SyntaxContext, SyntaxKind::CodeBlock);
   SourceLoc LBLoc = consumeToken(tok::l_brace);
 
   SmallVector<ASTNode, 16> Entries;
@@ -602,11 +680,39 @@ ParserResult<BraceStmt> Parser::parseBraceItemList(Diag<> ID) {
 
   ParserStatus Status = parseBraceItems(Entries, BraceItemListKind::Brace,
                                         BraceItemListKind::Brace);
-  parseMatchingToken(tok::r_brace, RBLoc,
-                     diag::expected_rbrace_in_brace_stmt, LBLoc);
+  if (!parseMatchingToken(tok::r_brace, RBLoc,
+                          diag::expected_rbrace_in_brace_stmt, LBLoc)) {
+    // We recovered do don't propagate any error status (but still preserve
+    // HasCodeCompletion).
+    Status.clearIsError();
+  }
 
   return makeParserResult(Status,
                           BraceStmt::create(Context, LBLoc, Entries, RBLoc));
+}
+
+static ParserStatus parseOptionalControlTransferTarget(Parser &P,
+                                                       Identifier &Target,
+                                                       SourceLoc &TargetLoc,
+                                                       StmtKind Kind) {
+  // If we have an identifier after 'break' or 'continue', which is not the
+  // start of another stmt or decl, we assume it is the label to break to,
+  // unless there is a line break.  There is ambiguity with expressions (e.g.
+  // "break x+y") but since the expression after the them is dead, we don't feel
+  // bad eagerly parsing this.
+  if (!P.Tok.isAtStartOfLine()) {
+    if (P.Tok.is(tok::identifier) && !P.isStartOfStmt(/*preferExpr*/ true) &&
+        !P.isStartOfSwiftDecl()) {
+      TargetLoc = P.consumeIdentifier(Target, /*diagnoseDollarPrefix=*/false);
+      return makeParserSuccess();
+    } else if (P.Tok.is(tok::code_complete)) {
+      if (P.CodeCompletionCallbacks)
+        P.CodeCompletionCallbacks->completeStmtLabel(Kind);
+      TargetLoc = P.consumeToken(tok::code_complete);
+      return makeParserCodeCompletionStatus();
+    }
+  }
+  return makeParserSuccess();
 }
 
 /// parseStmtBreak
@@ -618,17 +724,12 @@ ParserResult<Stmt> Parser::parseStmtBreak() {
   SourceLoc Loc = consumeToken(tok::kw_break);
   SourceLoc TargetLoc;
   Identifier Target;
+  ParserStatus Status;
+  Status |= parseOptionalControlTransferTarget(*this, Target, TargetLoc,
+                                               StmtKind::Break);
 
-  // If we have an identifier after this, which is not the start of another
-  // stmt or decl, we assume it is the label to break to, unless there is a
-  // line break.  There is ambiguity with expressions (e.g. "break x+y") but
-  // since the expression after the break is dead, we don't feel bad eagerly
-  // parsing this.
-  if (Tok.is(tok::identifier) && !Tok.isAtStartOfLine() &&
-      !isStartOfStmt() && !isStartOfDecl())
-    TargetLoc = consumeIdentifier(&Target);
-
-  return makeParserResult(new (Context) BreakStmt(Loc, Target, TargetLoc));
+  auto *BS = new (Context) BreakStmt(Loc, Target, TargetLoc, CurDeclContext);
+  return makeParserResult(Status, BS);
 }
 
 /// parseStmtContinue
@@ -640,17 +741,12 @@ ParserResult<Stmt> Parser::parseStmtContinue() {
   SourceLoc Loc = consumeToken(tok::kw_continue);
   SourceLoc TargetLoc;
   Identifier Target;
+  ParserStatus Status;
+  Status |= parseOptionalControlTransferTarget(*this, Target, TargetLoc,
+                                               StmtKind::Continue);
 
-  // If we have an identifier after this, which is not the start of another
-  // stmt or decl, we assume it is the label to continue to, unless there is a
-  // line break.  There is ambiguity with expressions (e.g. "continue x+y") but
-  // since the expression after the continue is dead, we don't feel bad eagerly
-  // parsing this.
-  if (Tok.is(tok::identifier) && !Tok.isAtStartOfLine() &&
-      !isStartOfStmt() && !isStartOfDecl())
-    TargetLoc = consumeIdentifier(&Target);
-
-  return makeParserResult(new (Context) ContinueStmt(Loc, Target, TargetLoc));
+  auto *CS = new (Context) ContinueStmt(Loc, Target, TargetLoc, CurDeclContext);
+  return makeParserResult(Status, CS);
 }
 
 
@@ -660,32 +756,48 @@ ParserResult<Stmt> Parser::parseStmtContinue() {
 ///     'return' expr?
 ///   
 ParserResult<Stmt> Parser::parseStmtReturn(SourceLoc tryLoc) {
-  SyntaxParsingContext LocalContext(SyntaxContext, SyntaxKind::ReturnStmt);
   SourceLoc ReturnLoc = consumeToken(tok::kw_return);
 
   if (Tok.is(tok::code_complete)) {
-    auto CCE = new (Context) CodeCompletionExpr(SourceRange(Tok.getLoc()));
-    auto Result = makeParserResult(new (Context) ReturnStmt(ReturnLoc, CCE));
-    if (CodeCompletion) {
-      CodeCompletion->completeReturnStmt(CCE);
+    auto CCE = new (Context) CodeCompletionExpr(Tok.getLoc());
+    auto Result =
+        makeParserResult(ReturnStmt::createParsed(Context, ReturnLoc, CCE));
+    if (CodeCompletionCallbacks) {
+      CodeCompletionCallbacks->completeReturnStmt(CCE);
     }
-    Result.setHasCodeCompletion();
+    Result.setHasCodeCompletionAndIsError();
     consumeToken();
     return Result;
   }
 
+  auto isStartOfReturnExpr = [&]() {
+    if (Tok.isAny(tok::r_brace, tok::semi, tok::eof, tok::pound_if,
+                  tok::pound_error, tok::pound_warning, tok::pound_endif,
+                  tok::pound_else, tok::pound_elseif)) {
+      return false;
+    }
+    // Allowed for if/switch/do expressions.
+    if (Tok.isAny(tok::kw_if, tok::kw_switch) ||
+        (Tok.is(tok::kw_do) &&
+         Context.LangOpts.hasFeature(Feature::DoExpressions))) {
+      return true;
+    }
+    if (isStartOfStmt(/*preferExpr*/ true) || isStartOfSwiftDecl())
+      return false;
+
+    return true;
+  };
+
   // Handle the ambiguity between consuming the expression and allowing the
   // enclosing stmt-brace to get it by eagerly eating it unless the return is
   // followed by a '}', ';', statement or decl start keyword sequence.
-  if (Tok.isNot(tok::r_brace, tok::semi, tok::eof, tok::pound_if,
-                tok::pound_endif, tok::pound_else, tok::pound_elseif) &&
-      !isStartOfStmt() && !isStartOfDecl()) {
+  if (isStartOfReturnExpr()) {
     SourceLoc ExprLoc = Tok.getLoc();
 
     // Issue a warning when the returned expression is on a different line than
     // the return keyword, but both have the same indentation.
-    if (SourceMgr.getLineAndColumn(ReturnLoc).second ==
-        SourceMgr.getLineAndColumn(ExprLoc).second) {
+    if (SourceMgr.getLineAndColumnInBuffer(ReturnLoc).second ==
+        SourceMgr.getLineAndColumnInBuffer(ExprLoc).second) {
       diagnose(ExprLoc, diag::unindented_code_after_return);
       diagnose(ExprLoc, diag::indent_expression_to_silence);
     }
@@ -699,7 +811,7 @@ ParserResult<Stmt> Parser::parseStmtReturn(SourceLoc tryLoc) {
     }
 
     if (tryLoc.isValid()) {
-      diagnose(tryLoc, diag::try_on_return_throw, /*isThrow=*/false)
+      diagnose(tryLoc, diag::try_must_come_after_stmt, /*return=*/0)
         .fixItInsert(ExprLoc, "try ")
         .fixItRemoveChars(tryLoc, ReturnLoc);
 
@@ -710,13 +822,176 @@ ParserResult<Stmt> Parser::parseStmtReturn(SourceLoc tryLoc) {
     }
 
     return makeParserResult(
-        Result, new (Context) ReturnStmt(ReturnLoc, Result.getPtrOrNull()));
+        Result,
+        ReturnStmt::createParsed(Context, ReturnLoc, Result.getPtrOrNull()));
   }
 
   if (tryLoc.isValid())
     diagnose(tryLoc, diag::try_on_stmt, "return");
 
-  return makeParserResult(new (Context) ReturnStmt(ReturnLoc, nullptr));
+  return makeParserResult(
+      ReturnStmt::createParsed(Context, ReturnLoc, nullptr));
+}
+
+/// parseStmtYield
+///
+///   stmt-yield:
+///     'yield' expr
+///     'yield' '(' expr-list ')'
+///
+/// Note that a parenthesis always starts the second (list) grammar.
+ParserResult<Stmt> Parser::parseStmtYield(SourceLoc tryLoc) {
+  SourceLoc yieldLoc = consumeToken(tok::kw_yield);
+
+  if (Tok.is(tok::code_complete)) {
+    auto cce = new (Context) CodeCompletionExpr(Tok.getLoc());
+    auto result = makeParserResult(
+      YieldStmt::create(Context, yieldLoc, SourceLoc(), cce, SourceLoc()));
+    if (CodeCompletionCallbacks) {
+      CodeCompletionCallbacks->completeYieldStmt(cce, /*index=*/std::nullopt);
+    }
+    result.setHasCodeCompletionAndIsError();
+    consumeToken();
+    return result;
+  }
+
+  ParserStatus status;
+  SourceLoc lpLoc, rpLoc;
+  SmallVector<Expr*, 4> yields;
+  if (Tok.is(tok::l_paren)) {
+    // If there was a 'try' on the yield, and there are multiple
+    // yielded values, suggest just removing the try instead of
+    // suggesting adding it to every yielded value.
+    if (tryLoc.isValid()) {
+      diagnose(tryLoc, diag::try_must_come_after_stmt, /*yield=*/2)
+        .fixItRemoveChars(tryLoc, yieldLoc);
+    }
+
+    SmallVector<ExprListElt, 4> yieldElts;
+    status = parseExprList(tok::l_paren, tok::r_paren, /*isArgumentList*/ false,
+                           lpLoc, yieldElts, rpLoc);
+    for (auto &elt : yieldElts) {
+      // We don't accept labels in a list of yields.
+      if (elt.LabelLoc.isValid()) {
+        diagnose(elt.LabelLoc, diag::unexpected_label_yield)
+          .fixItRemoveChars(elt.LabelLoc, elt.E->getStartLoc());
+      }
+      yields.push_back(elt.E);
+    }
+  } else {
+    SourceLoc beginLoc = Tok.getLoc();
+
+    // There's a single yielded value, so suggest moving 'try' before it.
+    if (tryLoc.isValid()) {
+      diagnose(tryLoc, diag::try_must_come_after_stmt, /*yield=*/2)
+        .fixItInsert(beginLoc, "try ")
+        .fixItRemoveChars(tryLoc, yieldLoc);
+    }
+
+    auto expr = parseExpr(diag::expected_expr_yield);
+    if (expr.hasCodeCompletion() && expr.isNonNull()) {
+      status |= expr;
+      yields.push_back(expr.get());
+    } else if (expr.isParseErrorOrHasCompletion()) {
+      auto endLoc = (Tok.getLoc() == beginLoc ? beginLoc : PreviousLoc);
+      yields.push_back(
+        new (Context) ErrorExpr(SourceRange(beginLoc, endLoc)));
+    } else {
+      yields.push_back(expr.get());
+    }
+  }
+
+  return makeParserResult(
+           status, YieldStmt::create(Context, yieldLoc, lpLoc, yields, rpLoc));
+}
+
+bool Parser::isContextualThenKeyword(bool preferExpr) {
+  if (!Context.LangOpts.hasFeature(Feature::ThenStatements))
+    return false;
+
+  if (!Tok.isContextualKeyword("then"))
+    return false;
+
+  // If we want to prefer an expr, and aren't at the start of a newline, then
+  // don't parse a ThenStmt.
+  if (preferExpr && !Tok.isAtStartOfLine())
+    return false;
+
+  // 'then' immediately followed by '('/'[' is a function/subscript call. If
+  // immediately followed by '.', it's a member access.
+  if (peekToken().isAny(tok::l_paren, tok::l_square, tok::period)) {
+    auto tokEndLoc = Lexer::getLocForEndOfToken(SourceMgr, Tok.getLoc());
+    return peekToken().getLoc() != tokEndLoc;
+  }
+
+  // 'then' followed by '{' is a trailing closure on a function call.
+  if (peekToken().is(tok::l_brace))
+    return false;
+
+  // If we have 'then' followed by an infix or postfix operator, we know this
+  // must be an expression.
+  if (peekToken().isBinaryOperatorLike() || peekToken().isPostfixOperatorLike())
+    return false;
+
+  // These act like binary operators.
+  if (peekToken().isAny(tok::kw_is, tok::kw_as))
+    return false;
+
+  return true;
+}
+
+/// parseStmtThen
+///
+/// stmt-then:
+///   'then' expr
+///
+ParserResult<Stmt> Parser::parseStmtThen(SourceLoc tryLoc) {
+  SourceLoc thenLoc = consumeToken(tok::kw_then);
+
+  if (Tok.is(tok::code_complete)) {
+    auto ccLoc = consumeToken();
+    auto *CCE = new (Context) CodeCompletionExpr(ccLoc);
+    if (CodeCompletionCallbacks)
+      CodeCompletionCallbacks->completeThenStmt(CCE);
+
+    return makeParserCodeCompletionResult(
+        ThenStmt::createParsed(Context, thenLoc, CCE));
+  }
+
+  auto exprLoc = Tok.getLoc();
+
+  // Issue a warning when the expression is on a different line than
+  // the 'then' keyword, but both have the same indentation.
+  if (SourceMgr.getLineAndColumnInBuffer(thenLoc).second ==
+      SourceMgr.getLineAndColumnInBuffer(exprLoc).second) {
+    diagnose(exprLoc, diag::unindented_code_after_then);
+    diagnose(exprLoc, diag::indent_expression_to_silence);
+  }
+
+  ParserResult<Expr> result = parseExpr(diag::expected_expr_after_then);
+  bool hasCodeCompletion = result.hasCodeCompletion();
+
+  // If we couldn't parse an expr, fill it the gap with an ErrorExpr, as
+  // ThenStmt expects an expression node.
+  if (result.isNull())
+    result = makeParserErrorResult(new (Context) ErrorExpr(exprLoc));
+
+  if (tryLoc.isValid()) {
+    diagnose(tryLoc, diag::try_must_come_after_stmt, /*then=*/3)
+        .fixItInsert(exprLoc, "try ")
+        .fixItRemoveChars(tryLoc, thenLoc);
+
+    // Note: We can't use tryLoc here because that's outside the ThenStmt's
+    // source range.
+    if (!isa<ErrorExpr>(result.get()))
+      result = makeParserResult(new (Context) TryExpr(exprLoc, result.get()));
+  }
+
+  if (hasCodeCompletion)
+    result.setHasCodeCompletionAndIsError();
+
+  return makeParserResult(
+      result, ThenStmt::createParsed(Context, thenLoc, result.get()));
 }
 
 /// parseStmtThrow
@@ -731,15 +1006,13 @@ ParserResult<Stmt> Parser::parseStmtThrow(SourceLoc tryLoc) {
     exprLoc = Tok.getLoc();
 
   ParserResult<Expr> Result = parseExpr(diag::expected_expr_throw);
-
-  if (Result.hasCodeCompletion())
-    return makeParserCodeCompletionResult<Stmt>();
+  bool hasCodeCompletion = Result.hasCodeCompletion();
 
   if (Result.isNull())
     Result = makeParserErrorResult(new (Context) ErrorExpr(throwLoc));
 
   if (tryLoc.isValid() && exprLoc.isValid()) {
-    diagnose(tryLoc, diag::try_on_return_throw, /*isThrow=*/true)
+    diagnose(tryLoc, diag::try_must_come_after_stmt, /*throw=*/1)
       .fixItInsert(exprLoc, "try ")
       .fixItRemoveChars(tryLoc, throwLoc);
 
@@ -749,8 +1022,39 @@ ParserResult<Stmt> Parser::parseStmtThrow(SourceLoc tryLoc) {
       Result = makeParserResult(new (Context) TryExpr(exprLoc, Result.get()));
   }
 
+  if (hasCodeCompletion)
+    Result.setHasCodeCompletionAndIsError();
+
   return makeParserResult(Result,
               new (Context) ThrowStmt(throwLoc, Result.get()));
+}
+
+/// parseStmtDiscard
+///
+/// stmt-discard
+///   'discard' 'self'
+///
+ParserResult<Stmt> Parser::parseStmtDiscard() {
+  SourceLoc discardLoc = consumeToken(tok::kw_discard);
+
+  SourceLoc exprLoc;
+  if (Tok.isNot(tok::eof))
+    exprLoc = Tok.getLoc();
+
+  // We parse the whole expression, because we might have something like:
+  //                         discard self.x.y
+  // and we want to emit good diagnostics for this later on.
+  ParserResult<Expr> Result = parseExpr(diag::expected_expr_discard);
+  bool hasCodeCompletion = Result.hasCodeCompletion();
+
+  if (Result.isNull())
+    Result = makeParserErrorResult(new (Context) ErrorExpr(discardLoc));
+
+  if (hasCodeCompletion)
+    Result.setHasCodeCompletionAndIsError();
+
+  return makeParserResult(Result,
+                          new (Context) DiscardStmt(discardLoc, Result.get()));
 }
 
 /// parseStmtDefer
@@ -760,8 +1064,8 @@ ParserResult<Stmt> Parser::parseStmtThrow(SourceLoc tryLoc) {
 ///
 ParserResult<Stmt> Parser::parseStmtDefer() {
   SourceLoc DeferLoc = consumeToken(tok::kw_defer);
-  
-  // Macro expand out the defer into a closure and call, which we can typecheck
+
+  // Expand out the defer into a closure and call, which we can typecheck
   // and emit where needed.
   //
   // The AST representation for a defer statement is a bit weird.  We retain the
@@ -773,47 +1077,28 @@ ParserResult<Stmt> Parser::parseStmtDefer() {
   //
   // As such, the body of the 'defer' is actually type checked within the
   // closure's DeclContext.
-  auto params = ParameterList::createEmpty(Context);
-  DeclName name(Context, Context.getIdentifier("$defer"), params);
-  auto tempDecl
-    = FuncDecl::create(Context,
-                       /*StaticLoc=*/ SourceLoc(),
-                       StaticSpellingKind::None,
-                       /*FuncLoc=*/ SourceLoc(),
-                       name,
-                       /*NameLoc=*/ SourceLoc(),
-                       /*Throws=*/ false, /*ThrowsLoc=*/ SourceLoc(),
-                       /*AccessorKeywordLoc=*/SourceLoc(),
-                       /*generic params*/ nullptr,
-                       params,
-                       TypeLoc(),
-                       CurDeclContext);
-  tempDecl->setImplicit();
-  setLocalDiscriminator(tempDecl);
+  auto *DS = DeferStmt::create(CurDeclContext, DeferLoc);
   ParserStatus Status;
   {
+    auto *tempDecl = DS->getTempDecl();
     // Change the DeclContext for any variables declared in the defer to be within
     // the defer closure.
     ParseFunctionBody cc(*this, tempDecl);
-    
+    llvm::SaveAndRestore<std::optional<StableHasher>> T(
+        CurrentTokenHash, StableHasher::defaultHasher());
+
     ParserResult<BraceStmt> Body =
       parseBraceItemList(diag::expected_lbrace_after_defer);
     if (Body.isNull())
       return nullptr;
     Status |= Body;
-    tempDecl->setBody(Body.get());
-  }
-  
-  SourceLoc loc = tempDecl->getBody()->getStartLoc();
 
-  // Form the call, which will be emitted on any path that needs to run the
-  // code.
-  auto DRE = new (Context) DeclRefExpr(tempDecl, DeclNameLoc(loc),
-                                       /*Implicit*/true,
-                                       AccessSemantics::DirectToStorage);
-  auto call = CallExpr::createImplicit(Context, DRE, { }, { });
-  
-  auto DS = new (Context) DeferStmt(DeferLoc, tempDecl, call);
+    // Clone the current hasher and extract a Fingerprint.
+    StableHasher currentHash{*CurrentTokenHash};
+    Fingerprint fp(std::move(currentHash));
+    tempDecl->setBodyParsed(Body.get(), fp);
+  }
+
   return makeParserResult(Status, DS);
 }
 
@@ -831,6 +1116,45 @@ namespace {
   };
 } // unnamed namespace
 
+static void parseWhereGuard(Parser &P, GuardedPattern &result,
+                            ParserStatus &status,
+                            GuardedPatternContext parsingContext,
+                            bool isExprBasic) {
+  if (P.Tok.is(tok::kw_where)) {
+    result.WhereLoc = P.consumeToken(tok::kw_where);
+    SourceLoc startOfGuard = P.Tok.getLoc();
+
+    auto diagKind = [=]() -> Diag<> {
+      switch (parsingContext) {
+      case GuardedPatternContext::Case:
+        return diag::expected_case_where_expr;
+      case GuardedPatternContext::Catch:
+        return diag::expected_catch_where_expr;
+      }
+      llvm_unreachable("bad context");
+    }();
+    ParserResult<Expr> guardResult = P.parseExprImpl(diagKind, isExprBasic);
+    status |= guardResult;
+
+    // Use the parsed guard expression if possible.
+    if (guardResult.isNonNull()) {
+      result.Guard = guardResult.get();
+
+      // Otherwise, fake up an ErrorExpr.
+    } else {
+      // If we didn't consume any tokens failing to parse the
+      // expression, don't put in the source range of the ErrorExpr.
+      SourceRange errorRange;
+      if (startOfGuard == P.Tok.getLoc()) {
+        errorRange = result.WhereLoc;
+      } else {
+        errorRange = SourceRange(startOfGuard, P.PreviousLoc);
+      }
+      result.Guard = new (P.Context) ErrorExpr(errorRange);
+    }
+  }
+}
+
 /// Parse a pattern-matching clause for a case or catch statement,
 /// including the guard expression:
 ///
@@ -841,10 +1165,7 @@ static void parseGuardedPattern(Parser &P, GuardedPattern &result,
                                 GuardedPatternContext parsingContext,
                                 bool isFirstPattern) {
   ParserResult<Pattern> patternResult;
-  auto setErrorResult = [&] () {
-    patternResult = makeParserErrorResult(new (P.Context)
-      AnyPattern(SourceLoc()));
-  };
+
   bool isExprBasic = [&]() -> bool {
     switch (parsingContext) {
     // 'case' is terminated with a colon and so allows a trailing closure.
@@ -859,69 +1180,48 @@ static void parseGuardedPattern(Parser &P, GuardedPattern &result,
 
   // Do some special-case code completion for the start of the pattern.
   if (P.Tok.is(tok::code_complete)) {
-    setErrorResult();
-    if (P.CodeCompletion) {
+    auto CCE = new (P.Context) CodeCompletionExpr(P.Tok.getLoc());
+    result.ThePattern =
+        ExprPattern::createParsed(P.Context, CCE, P.CurDeclContext);
+    if (P.CodeCompletionCallbacks) {
       switch (parsingContext) {
       case GuardedPatternContext::Case:
-        P.CodeCompletion->completeCaseStmtBeginning();
+        P.CodeCompletionCallbacks->completeCaseStmtBeginning(CCE);
         break;
       case GuardedPatternContext::Catch:
-        P.CodeCompletion->completePostfixExprBeginning(nullptr);
+        P.CodeCompletionCallbacks->completePostfixExprBeginning(CCE);
         break;
       }
-      P.consumeToken();
-    } else {
-      result.ThePattern = patternResult.get();
-      status.setHasCodeCompletion();
-      return;
     }
-  }
-  if (parsingContext == GuardedPatternContext::Case &&
-      P.Tok.isAny(tok::period_prefix, tok::period) &&
-      P.peekToken().is(tok::code_complete)) {
-    setErrorResult();
-    if (P.CodeCompletion) {
-      P.consumeToken();
-      P.CodeCompletion->completeCaseStmtDotPrefix();
-      P.consumeToken();
-    } else {
-      result.ThePattern = patternResult.get();
-      status.setHasCodeCompletion();
-      return;
-    }
+    P.consumeToken(tok::code_complete);
+    status.setHasCodeCompletionAndIsError();
+    return;
   }
 
   // If this is a 'catch' clause and we have "catch {" or "catch where...",
   // then we get an implicit "let error" pattern.
   if (parsingContext == GuardedPatternContext::Catch &&
       P.Tok.isAny(tok::l_brace, tok::kw_where)) {
-    auto loc = P.Tok.getLoc();
-    auto errorName = P.Context.Id_error;
-    auto var = new (P.Context) VarDecl(/*IsStatic*/false,
-                                       VarDecl::Specifier::Let,
-                                       /*IsCaptureList*/false, loc, errorName,
-                                       Type(), P.CurDeclContext);
-    var->setImplicit();
-    auto namePattern = new (P.Context) NamedPattern(var);
-    auto varPattern = new (P.Context) VarPattern(loc, /*isLet*/true,
-                                                 namePattern, /*implicit*/true);
-    patternResult = makeParserResult(varPattern);
+    patternResult = makeParserResult(
+        BindingPattern::createImplicitCatch(P.CurDeclContext, P.Tok.getLoc()));
   }
-
 
   // Okay, if the special code-completion didn't kick in, parse a
   // matching pattern.
   if (patternResult.isNull()) {
-    llvm::SaveAndRestore<decltype(P.InVarOrLetPattern)>
-      T(P.InVarOrLetPattern, Parser::IVOLP_InMatchingPattern);
+    llvm::SaveAndRestore<decltype(P.InBindingPattern)> T(
+        P.InBindingPattern, PatternBindingState::InMatchingPattern);
     patternResult = P.parseMatchingPattern(isExprBasic);
   }
 
   // If that didn't work, use a bogus pattern so that we can fill out
   // the AST.
-  if (patternResult.isNull())
-    patternResult =
-      makeParserErrorResult(new (P.Context) AnyPattern(P.PreviousLoc));
+  if (patternResult.isNull()) {
+    auto *AP = new (P.Context) AnyPattern(P.PreviousLoc);
+    if (P.PreviousLoc.isInvalid())
+      AP->setImplicit();
+    patternResult = makeParserErrorResult(AP);
+  }
 
   // Fill in the pattern.
   status |= patternResult;
@@ -933,9 +1233,11 @@ static void parseGuardedPattern(Parser &P, GuardedPattern &result,
     // represents tuples and var patterns as tupleexprs and
     // unresolved_pattern_expr nodes, instead of as proper pattern nodes.
     patternResult.get()->forEachVariable([&](VarDecl *VD) {
-      if (VD->hasName()) P.addToScope(VD);
       boundDecls.push_back(VD);
     });
+
+    // Parse the optional 'where' guard.
+    parseWhereGuard(P, result, status, parsingContext, isExprBasic);
   } else {
     // If boundDecls already contains variables, then we must match the
     // same number and same names in this pattern as were declared in a
@@ -946,10 +1248,6 @@ static void parseGuardedPattern(Parser &P, GuardedPattern &result,
       if (!VD->hasName())
         return;
       
-      for (auto repeat : repeatedDecls)
-        if (repeat->getName() == VD->getName())
-          P.addToScope(VD); // will diagnose a duplicate declaration
-
       bool found = false;
       for (auto previous : boundDecls) {
         if (previous->hasName() && previous->getName() == VD->getName()) {
@@ -979,79 +1277,56 @@ static void parseGuardedPattern(Parser &P, GuardedPattern &result,
         status.setIsParseError();
       }
     }
-    
-    for (auto VD : repeatedDecls) {
-      VD->setHasNonPatternBindingInit();
-      VD->setImplicit();
-    }
-  }
-  
-  // Now that we have them, mark them as being initialized without a PBD.
-  for (auto VD : boundDecls)
-    VD->setHasNonPatternBindingInit();
 
-  // Parse the optional 'where' guard.
-  if (P.consumeIf(tok::kw_where, result.WhereLoc)) {
-    SourceLoc startOfGuard = P.Tok.getLoc();
-
-    auto diagKind = [=]() -> Diag<> {
-      switch (parsingContext) {
-      case GuardedPatternContext::Case:
-        return diag::expected_case_where_expr;
-      case GuardedPatternContext::Catch:
-        return diag::expected_catch_where_expr;
-      }
-      llvm_unreachable("bad context");
-    }();
-    ParserResult<Expr> guardResult = P.parseExprImpl(diagKind, isExprBasic);
-    status |= guardResult;
-
-    // Use the parsed guard expression if possible.
-    if (guardResult.isNonNull()) {
-      result.Guard = guardResult.get();
-
-    // Otherwise, fake up an ErrorExpr.
-    } else {
-      // If we didn't consume any tokens failing to parse the
-      // expression, don't put in the source range of the ErrorExpr.
-      SourceRange errorRange;
-      if (startOfGuard == P.Tok.getLoc()) {
-        errorRange = result.WhereLoc;
-      } else {
-        errorRange = SourceRange(startOfGuard, P.PreviousLoc);
-      }
-      result.Guard = new (P.Context) ErrorExpr(errorRange);
-    }
+    // Parse the optional 'where' guard, with this particular pattern's bound
+    // vars in scope.
+    parseWhereGuard(P, result, status, parsingContext, isExprBasic);
   }
 }
 
-/// Validate availability spec list, emitting diagnostics if necessary.
-static void validateAvailabilitySpecList(Parser &P,
-                                         ArrayRef<AvailabilitySpec *> Specs) {
+/// Validate availability spec list, emitting diagnostics if necessary and
+/// removing specs for unrecognized platforms.
+static void
+validateAvailabilitySpecList(Parser &P,
+                             SmallVectorImpl<AvailabilitySpec *> &Specs,
+                             Parser::AvailabilitySpecSource Source) {
   llvm::SmallSet<PlatformKind, 4> Platforms;
-  bool HasOtherPlatformSpec = false;
+  std::optional<SourceLoc> OtherPlatformSpecLoc = std::nullopt;
 
   if (Specs.size() == 1 &&
-      isa<LanguageVersionConstraintAvailabilitySpec>(Specs[0])) {
-    // @available(swift N) is allowed only in isolation; it cannot
-    // be combined with other availability specs in a single list.
+      isa<PlatformAgnosticVersionConstraintAvailabilitySpec>(Specs[0])) {
+    // @available(swift N) and @available(_PackageDescription N) are allowed
+    // only in isolation; they cannot be combined with other availability specs
+    // in a single list.
     return;
   }
 
+  SmallVector<AvailabilitySpec *, 5> RecognizedSpecs;
   for (auto *Spec : Specs) {
-    if (isa<OtherPlatformAvailabilitySpec>(Spec)) {
-      HasOtherPlatformSpec = true;
+    RecognizedSpecs.push_back(Spec);
+    if (auto *OtherPlatSpec = dyn_cast<OtherPlatformAvailabilitySpec>(Spec)) {
+      OtherPlatformSpecLoc = OtherPlatSpec->getStarLoc();
       continue;
     }
 
-    if (auto *LangSpec =
-        dyn_cast<LanguageVersionConstraintAvailabilitySpec>(Spec)) {
-      P.diagnose(LangSpec->getSwiftLoc(),
-                 diag::availability_swift_must_occur_alone);
+    if (auto *PlatformAgnosticSpec =
+         dyn_cast<PlatformAgnosticVersionConstraintAvailabilitySpec>(Spec)) {
+      P.diagnose(PlatformAgnosticSpec->getPlatformAgnosticNameLoc(),
+                 diag::availability_must_occur_alone,
+                 PlatformAgnosticSpec->isLanguageVersionSpecific() 
+                   ? "swift" 
+                   : "_PackageDescription");
       continue;
     }
 
     auto *VersionSpec = cast<PlatformVersionConstraintAvailabilitySpec>(Spec);
+    // We keep specs for unrecognized platforms around for error recovery
+    // during parsing but remove them once parsing is completed.
+    if (VersionSpec->isUnrecognizedPlatform()) {
+      RecognizedSpecs.pop_back();
+      continue;
+    }
+
     bool Inserted = Platforms.insert(VersionSpec->getPlatform()).second;
     if (!Inserted) {
       // Rule out multiple version specs referring to the same platform.
@@ -1064,16 +1339,54 @@ static void validateAvailabilitySpecList(Parser &P,
     }
   }
 
-  if (!HasOtherPlatformSpec) {
-    SourceLoc InsertWildcardLoc = Specs.back()->getSourceRange().End;
-    P.diagnose(InsertWildcardLoc, diag::availability_query_wildcard_required)
+  switch (Source) {
+  case Parser::AvailabilitySpecSource::Available: {
+    if (OtherPlatformSpecLoc == std::nullopt) {
+      SourceLoc InsertWildcardLoc = P.PreviousLoc;
+      P.diagnose(InsertWildcardLoc, diag::availability_query_wildcard_required)
         .fixItInsertAfter(InsertWildcardLoc, ", *");
+    }
+    break;
   }
+  case Parser::AvailabilitySpecSource::Unavailable: {
+    if (OtherPlatformSpecLoc != std::nullopt) {
+      SourceLoc Loc = OtherPlatformSpecLoc.value();
+      P.diagnose(Loc, diag::unavailability_query_wildcard_not_required)
+        .fixItRemove(Loc);
+    }
+    break;
+  }
+  case Parser::AvailabilitySpecSource::Macro: {
+    if (OtherPlatformSpecLoc != std::nullopt) {
+      SourceLoc Loc = OtherPlatformSpecLoc.value();
+      P.diagnose(Loc, diag::attr_availability_wildcard_in_macro);
+    }
+    break;
+  }
+  }
+
+  Specs = RecognizedSpecs;
 }
 
 // #available(...)
+// #unavailable(...)
 ParserResult<PoundAvailableInfo> Parser::parseStmtConditionPoundAvailable() {
-  SourceLoc PoundLoc = consumeToken(tok::pound_available);
+  tok MainToken;
+  AvailabilitySpecSource Source;
+  bool isUnavailability;
+  if (Tok.is(tok::pound_available)) {
+    MainToken = tok::pound_available;
+    Source = AvailabilitySpecSource::Available;
+    isUnavailability = false;
+  } else {
+    MainToken = tok::pound_unavailable;
+    Source = AvailabilitySpecSource::Unavailable;
+    isUnavailability = true;
+  }
+
+  SourceLoc PoundLoc;
+
+  PoundLoc = consumeToken(MainToken);
 
   if (!Tok.isFollowingLParen()) {
     diagnose(Tok, diag::avail_query_expected_condition);
@@ -1081,16 +1394,20 @@ ParserResult<PoundAvailableInfo> Parser::parseStmtConditionPoundAvailable() {
   }
 
   StructureMarkerRAII ParsingAvailabilitySpecList(*this, Tok);
+
   SourceLoc LParenLoc = consumeToken(tok::l_paren);
 
   SmallVector<AvailabilitySpec *, 5> Specs;
-  ParserStatus Status = parseAvailabilitySpecList(Specs);
+  ParserStatus Status = parseAvailabilitySpecList(Specs, Source);
 
   for (auto *Spec : Specs) {
-    if (auto *Lang =
-        dyn_cast<LanguageVersionConstraintAvailabilitySpec>(Spec)) {
-      diagnose(Lang->getSwiftLoc(),
-               diag::pound_available_swift_not_allowed);
+    if (auto *PlatformAgnostic =
+          dyn_cast<PlatformAgnosticVersionConstraintAvailabilitySpec>(Spec)) {
+      diagnose(PlatformAgnostic->getPlatformAgnosticNameLoc(),
+               PlatformAgnostic->isLanguageVersionSpecific()
+                   ? diag::pound_available_swift_not_allowed
+                   : diag::pound_available_package_description_not_allowed,
+               getTokenText(MainToken));
       Status.setIsParseError();
     }
   }
@@ -1100,25 +1417,96 @@ ParserResult<PoundAvailableInfo> Parser::parseStmtConditionPoundAvailable() {
                          diag::avail_query_expected_rparen, LParenLoc))
     Status.setIsParseError();
 
-  auto *result = PoundAvailableInfo::create(Context, PoundLoc, Specs,RParenLoc);
+  // Diagnose #available == false as being a wrong spelling of #unavailable.
+  if (!isUnavailability && Tok.isAnyOperator() && Tok.getText() == "==" &&
+      peekToken().is(tok::kw_false)) {
+    diagnose(Tok, diag::false_available_is_called_unavailable)
+      .highlight(SourceRange(PoundLoc, peekToken().getLoc()))
+      .fixItReplace(PoundLoc, getTokenText(tok::pound_unavailable))
+      .fixItRemove(SourceRange(Tok.getLoc(), peekToken().getLoc()));
+    consumeToken();
+    consumeToken();
+    Status.setIsParseError();
+  }
+
+  auto *result = PoundAvailableInfo::create(Context, PoundLoc, LParenLoc, Specs,
+                                            RParenLoc, isUnavailability);
   return makeParserResult(Status, result);
 }
 
 ParserStatus
-Parser::parseAvailabilitySpecList(SmallVectorImpl<AvailabilitySpec *> &Specs) {
+Parser::parseAvailabilityMacroDefinition(AvailabilityMacroDefinition &Result) {
+
+  // Prime the lexer.
+  if (Tok.is(tok::NUM_TOKENS))
+    consumeTokenWithoutFeedingReceiver();
+
+  if (!Tok.isIdentifierOrUnderscore()) {
+    diagnose(Tok, diag::attr_availability_missing_macro_name);
+    return makeParserError();
+  }
+
+  Result.Name = Tok.getText();
+  consumeToken();
+
+  if (Tok.isAny(tok::integer_literal, tok::floating_literal)) {
+    SourceRange VersionRange;
+    if (parseVersionTuple(Result.Version, VersionRange,
+                          diag::avail_query_expected_version_number)) {
+      return makeParserError();
+    }
+  }
+
+  if (!consumeIf(tok::colon)) {
+    diagnose(Tok, diag::attr_availability_expected_colon_macro, Result.Name);
+    return makeParserError();
+  }
+
+  return parseAvailabilitySpecList(Result.Specs, AvailabilitySpecSource::Macro);
+}
+
+ParserStatus
+Parser::parseAvailabilitySpecList(SmallVectorImpl<AvailabilitySpec *> &Specs,
+                                  AvailabilitySpecSource Source) {
   ParserStatus Status = makeParserSuccess();
 
   // We don't use parseList() because we want to provide more specific
   // diagnostics disallowing operators in version specs.
   while (1) {
-    auto SpecResult = parseAvailabilitySpec();
-    if (auto *Spec = SpecResult.getPtrOrNull()) {
-      Specs.push_back(Spec);
-    } else {
-      if (SpecResult.hasCodeCompletion()) {
-        return makeParserCodeCompletionStatus();
+    // First look for a macro as we need Specs for the expansion.
+    bool MatchedAMacro = false;
+    switch (Source) {
+    case AvailabilitySpecSource::Available:
+    case AvailabilitySpecSource::Unavailable:
+      if (Tok.is(tok::identifier)) {
+        SmallVector<AvailabilitySpec *, 4> MacroSpecs;
+        ParserStatus MacroStatus = parseAvailabilityMacro(MacroSpecs);
+
+        if (MacroStatus.isError()) {
+          // There's a parsing error if the platform name matches a macro
+          // but something goes wrong after.
+          Status.setIsParseError();
+          MatchedAMacro = true;
+        } else {
+          MatchedAMacro = !MacroSpecs.empty();
+          Specs.append(MacroSpecs.begin(), MacroSpecs.end());
+        }
       }
-      Status.setIsParseError();
+      break;
+    case AvailabilitySpecSource::Macro: 
+      break;
+    }
+
+    if (!MatchedAMacro) {
+      auto SpecResult = parseAvailabilitySpec();
+      if (auto *Spec = SpecResult.getPtrOrNull()) {
+        Specs.push_back(Spec);
+      } else {
+        if (SpecResult.hasCodeCompletion()) {
+          return makeParserCodeCompletionStatus();
+        }
+        Status.setIsParseError();
+      }
     }
 
     // We don't allow binary operators to combine specs.
@@ -1127,6 +1515,10 @@ Parser::parseAvailabilitySpecList(SmallVectorImpl<AvailabilitySpec *> &Specs) {
       consumeToken();
       Status.setIsParseError();
     } else if (consumeIf(tok::comma)) {
+      // End of unavailable spec list with a trailing comma.
+      if (Source == AvailabilitySpecSource::Unavailable && Tok.is(tok::r_paren)) {
+        break;
+      }
       // There is more to parse in this list.
 
       // Before continuing to parse the next specification, we check that it's
@@ -1157,10 +1549,9 @@ Parser::parseAvailabilitySpecList(SmallVectorImpl<AvailabilitySpec *> &Specs) {
             auto *PlatformSpec =
                 cast<PlatformVersionConstraintAvailabilitySpec>(Previous);
 
-            auto PlatformName = platformString(PlatformSpec->getPlatform());
             auto PlatformNameEndLoc =
-                PlatformSpec->getPlatformLoc().getAdvancedLoc(
-                    PlatformName.size());
+              Lexer::getLocForEndOfToken(SourceManager,
+                                         PlatformSpec->getPlatformLoc());
 
             diagnose(PlatformSpec->getPlatformLoc(),
                      diag::avail_query_meant_introduced)
@@ -1178,10 +1569,340 @@ Parser::parseAvailabilitySpecList(SmallVectorImpl<AvailabilitySpec *> &Specs) {
     }
   }
 
-  if (Status.isSuccess())
-    validateAvailabilitySpecList(*this, Specs);
+  if (Status.isSuccess() && !Status.hasCodeCompletion())
+    validateAvailabilitySpecList(*this, Specs, Source);
 
   return Status;
+}
+
+// #_hasSymbol(...)
+ParserResult<PoundHasSymbolInfo> Parser::parseStmtConditionPoundHasSymbol() {
+  SourceLoc PoundLoc = consumeToken(tok::pound__hasSymbol);
+
+  if (!Tok.isFollowingLParen()) {
+    diagnose(Tok, diag::has_symbol_expected_lparen);
+    return makeParserError();
+  }
+
+  SourceLoc LParenLoc = consumeToken(tok::l_paren);
+  ParserStatus status = makeParserSuccess();
+
+  auto ExprResult = parseExprBasic(diag::has_symbol_expected_expr);
+  status |= ExprResult;
+
+  SourceLoc RParenLoc;
+  if (parseMatchingToken(tok::r_paren, RParenLoc,
+                         diag::has_symbol_expected_rparen, LParenLoc))
+    status.setIsParseError();
+
+  auto *result = PoundHasSymbolInfo::create(
+      Context, PoundLoc, LParenLoc, ExprResult.getPtrOrNull(), RParenLoc);
+  return makeParserResult(status, result);
+}
+
+ParserStatus
+Parser::parseStmtConditionElement(SmallVectorImpl<StmtConditionElement> &result,
+                                  Diag<> DefaultID, StmtKind ParentKind,
+                                  StringRef &BindingKindStr) {
+  ParserStatus Status;
+
+  // Diagnose !#available as being a wrong spelling of #unavailable.
+  if (Tok.getText() == "!" && peekToken().is(tok::pound_available)) {
+    SourceRange Range = SourceRange(Tok.getLoc(), peekToken().getLoc());
+    diagnose(Tok, diag::false_available_is_called_unavailable)
+      .fixItReplace(Range, getTokenText(tok::pound_unavailable));
+    // For better error recovery, reject but allow parsing to continue.
+    consumeToken();
+  }
+
+  // Parse a leading #available/#unavailable condition if present.
+  if (Tok.isAny(tok::pound_available, tok::pound_unavailable)) {
+    auto res = parseStmtConditionPoundAvailable();
+    if (res.isNull() || res.hasCodeCompletion()) {
+      Status |= res;
+      return Status;
+    }
+    BindingKindStr = StringRef();
+    result.push_back({res.get()});
+    return Status;
+  }
+
+  // Parse a leading #_hasSymbol condition if present.
+  if (Tok.is(tok::pound__hasSymbol)) {
+    auto res = parseStmtConditionPoundHasSymbol();
+    if (res.isNull() || res.hasCodeCompletion()) {
+      Status |= res;
+      return Status;
+    }
+    BindingKindStr = StringRef();
+    result.push_back({res.get()});
+    return Status;
+  }
+
+  // Handle code completion after the #.
+  if (Tok.is(tok::pound) && peekToken().is(tok::code_complete) &&
+      Tok.getLoc().getAdvancedLoc(1) == peekToken().getLoc()) {
+    auto Expr = parseExprPoundCodeCompletion(ParentKind);
+    Status |= Expr;
+    result.push_back(Expr.get());
+  }
+
+  // Parse the basic expression case.  If we have a leading let/var/case
+  // keyword or an assignment, then we know this is a binding.
+  if (Tok.isNot(tok::kw_let, tok::kw_var, tok::kw_case) &&
+      (!Context.LangOpts.hasFeature(Feature::ReferenceBindings) ||
+       Tok.isNot(tok::kw_inout))) {
+    // If we lack it, then this is theoretically a boolean condition.
+    // However, we also need to handle migrating from Swift 2 syntax, in
+    // which a comma followed by an expression could actually be a pattern
+    // clause followed by a binding.  Determine what we have by checking for a
+    // syntactically valid pattern followed by an '=', which can never be a
+    // boolean condition.
+    //
+    // However, if this is the first clause, and we see "x = y", then this is
+    // almost certainly a typo for '==' and definitely not a continuation of
+    // another clause, so parse it as an expression.  This also avoids
+    // lookahead + backtracking on simple if conditions that are obviously
+    // boolean conditions.
+    auto isBooleanExpr = [&]() -> bool {
+      Parser::BacktrackingScope Backtrack(*this);
+      return !canParseTypedPattern() || Tok.isNot(tok::equal);
+    };
+
+    if (BindingKindStr.empty() || isBooleanExpr()) {
+      auto diagID = result.empty() ? DefaultID :
+        diag::expected_expr_conditional;
+      auto BoolExpr = parseExprBasic(diagID);
+      Status |= BoolExpr;
+      if (BoolExpr.isNull())
+        return Status;
+      result.push_back(BoolExpr.get());
+      BindingKindStr = StringRef();
+      return Status;
+    }
+  }
+
+  SourceLoc IntroducerLoc;
+  if (Tok.isAny(tok::kw_let, tok::kw_var, tok::kw_case) ||
+      (Context.LangOpts.hasFeature(Feature::ReferenceBindings) &&
+       Tok.isAny(tok::kw_inout))) {
+    BindingKindStr = Tok.getText();
+    IntroducerLoc = consumeToken();
+  } else {
+    // If we lack the leading let/var/case keyword, then we're here because
+    // the user wrote something like "if let x = foo(), y = bar() {".  Fix
+    // this by inserting a new 'let' keyword before y.
+    IntroducerLoc = Tok.getLoc();
+    assert(!BindingKindStr.empty() &&
+            "Shouldn't get here without a leading binding");
+    diagnose(Tok.getLoc(), diag::expected_binding_keyword, BindingKindStr)
+      .fixItInsert(Tok.getLoc(), BindingKindStr.str()+" ");
+  }
+
+  // We're parsing a conditional binding.
+  assert(CurDeclContext->isLocalContext() &&
+          "conditional binding in non-local context?!");
+    
+  ParserResult<Pattern> ThePattern;
+    
+  if (BindingKindStr == "case") {
+    // In our recursive parse, remember that we're in a matching pattern.
+    llvm::SaveAndRestore<decltype(InBindingPattern)> T(
+        InBindingPattern, PatternBindingState::InMatchingPattern);
+
+    // Reset async attribute in parser context.
+    llvm::SaveAndRestore<bool> AsyncAttr(InPatternWithAsyncAttribute, false);
+
+    ThePattern = parseMatchingPattern(/*isExprBasic*/ true);
+  } else if (Tok.is(tok::kw_case)) {
+    // If will probably be a common typo to write "if let case" instead of
+    // "if case let" so detect this and produce a nice fixit.
+    diagnose(IntroducerLoc, diag::wrong_condition_case_location,
+              BindingKindStr)
+    .fixItRemove(IntroducerLoc)
+    .fixItInsertAfter(Tok.getLoc(), " " + BindingKindStr.str());
+
+    consumeToken(tok::kw_case);
+
+    auto newPatternBindingState = PatternBindingState::get(BindingKindStr)
+      .value_or(PatternBindingState(PatternBindingState::InVar));
+    BindingKindStr = "case";
+    
+    // In our recursive parse, remember that we're in a var/let pattern.
+    llvm::SaveAndRestore<decltype(InBindingPattern)> T(InBindingPattern,
+                                                       newPatternBindingState);
+
+    // Reset async attribute in parser context.
+    llvm::SaveAndRestore<bool> AsyncAttr(InPatternWithAsyncAttribute, false);
+
+    ThePattern = parseMatchingPattern(/*isExprBasic*/ true);
+    
+    if (ThePattern.isNonNull()) {
+      auto *P = new (Context)
+          BindingPattern(IntroducerLoc, *newPatternBindingState.getIntroducer(),
+                         ThePattern.get());
+      ThePattern = makeParserResult(Status, P);
+    }
+
+  } else if (Tok.is(tok::code_complete)) {
+    if (CodeCompletionCallbacks) {
+      CodeCompletionCallbacks->completeOptionalBinding();
+    }
+    ThePattern = makeParserResult(new (Context) AnyPattern(Tok.getLoc()));
+    ThePattern.setHasCodeCompletionAndIsError();
+    consumeToken(tok::code_complete);
+  } else {
+    // Otherwise, this is an implicit optional binding "if let".
+    ThePattern = parseMatchingPatternAsBinding(
+        PatternBindingState::get(BindingKindStr)
+            .value_or(PatternBindingState(PatternBindingState::InVar)),
+        IntroducerLoc,
+        /*isExprBasic*/ true);
+    // The let/var pattern is part of the statement.
+    if (Pattern *P = ThePattern.getPtrOrNull())
+      P->setImplicit();
+  }
+
+  ThePattern = parseOptionalPatternTypeAnnotation(ThePattern);
+  if (ThePattern.hasCodeCompletion()) {
+    Status.setHasCodeCompletionAndIsError();
+
+    // Skip to '=' so that the completion can see the expected type of the
+    // pattern which is determined by the initializer. 
+    skipUntilDeclStmtRBrace(tok::equal, tok::l_brace);
+  }
+    
+  if (ThePattern.isNull()) {
+    // Recover by creating AnyPattern.
+    auto *AP = new (Context) AnyPattern(PreviousLoc);
+    if (PreviousLoc.isInvalid())
+      AP->setImplicit();
+    ThePattern = makeParserResult(AP);
+  }
+
+  // Conditional bindings can have the format:
+  //  `let newBinding = <expr>`, or
+  //  `let newBinding`, which is shorthand for `let newBinding = newBinding`
+  ParserResult<Expr> Init;
+  if (Tok.is(tok::equal)) {
+    consumeToken();
+    Init = parseExprBasic(diag::expected_expr_conditional_var);
+  } else if (!ThePattern.getPtrOrNull()->getBoundName().empty()) {
+    auto bindingName = DeclNameRef(ThePattern.getPtrOrNull()->getBoundName());
+    auto loc = DeclNameLoc(ThePattern.getPtrOrNull()->getEndLoc());
+    auto declRefExpr = new (Context) UnresolvedDeclRefExpr(bindingName,
+                                                           DeclRefKind::Ordinary,
+                                                           loc);
+    // We do NOT mark this declRefExpr as implicit because that'd avoid
+    // reporting errors if it were used in a synchronous context in
+    // 'diagnoseUnhandledAsyncSite'. There may be other ways to resolve the
+    // reporting issue that we could explore in the future.
+    //
+    // Even though implicit, the ast node has correct source location.
+    Init = makeParserResult(declRefExpr);
+  } else if (BindingKindStr != "case") {
+    // If the pattern is present but isn't an identifier, the user wrote
+    // something invalid like `let foo.bar`. Emit a special diagnostic for this,
+    // with a fix-it prepending "<#identifier#> = "
+    //  - We don't emit this fix-it if the user wrote `case let` (etc),
+    //    since the shorthand syntax isn't available for pattern matching
+    auto diagLoc = ThePattern.get()->getSemanticsProvidingPattern()->getStartLoc();
+    diagnose(diagLoc, diag::conditional_var_valid_identifiers_only)
+      .fixItInsert(diagLoc, "<#identifier#> = ");
+
+    // For better recovery, assume the expression pattern as the initializer,
+    // and synthesize an optional AnyPattern.
+    auto *semanticPattern = ThePattern.get()->getSemanticsProvidingPattern();
+    if (auto *EP = dyn_cast<ExprPattern>(semanticPattern)) {
+      Init = makeParserResult(EP->getSubExpr());
+      auto *AP = AnyPattern::createImplicit(Context);
+      ThePattern =
+          makeParserResult(OptionalSomePattern::createImplicit(Context, AP));
+    }
+  } else {
+    diagnose(Tok, diag::conditional_var_initializer_required);
+  }
+
+  if (Init.hasCodeCompletion())
+    Status.setHasCodeCompletionAndIsError();
+
+  if (Init.isNull()) {
+    // Recover by creating ErrorExpr.
+    Init = makeParserResult(new (Context)
+                                ErrorExpr(ThePattern.get()->getEndLoc()));
+  }
+
+  result.push_back(ConditionalPatternBindingInfo::create(
+      Context, IntroducerLoc, ThePattern.get(), Init.get()));
+  return Status;
+}
+
+/// Returns `true` if the current token represents the start of a conditional
+/// statement body.
+bool Parser::isStartOfConditionalStmtBody() {
+  if (!Tok.is(tok::l_brace)) {
+    // Statement bodies always start with a '{'. If there is no '{', we can't be
+    // at the statement body.
+    return false;
+  }
+
+  Parser::BacktrackingScope Backtrack(*this);
+
+  skipSingle();
+
+  if (Tok.is(tok::eof)) {
+    // There's nothing else in the source file that could be the statement body,
+    // so this must be it.
+    return true;
+  }
+
+  if (Tok.is(tok::semi)) {
+    // We can't have a semicolon between the condition and the statement body,
+    // so this must be the statement body.
+    return true;
+  }
+
+  if (Tok.is(tok::kw_else)) {
+    // If the current token is an `else` keyword, this must be the statement
+    // body of an `if` statement since conditions can't be followed by `else`.
+    return true;
+  }
+
+  if (Tok.is(tok::r_brace) || Tok.is(tok::r_paren)) {
+    // A right brace or parenthesis cannot start a statement body, nor can the
+    // condition list continue afterwards. So, this must be the statement body.
+    // This covers cases like `if true, { if true, { } }` or `( if true, {
+    // print(0) } )`. While the latter is not valid code, it improves
+    // diagnostics.
+    return true;
+  }
+
+  if (Tok.isAtStartOfLine()) {
+    // If the current token is at the start of a line, it is most likely a
+    // statement body. The only exceptions are:
+    if (Tok.is(tok::comma)) {
+      // If newline begins with ',' it must be a condition trailing comma, so
+      // this can't be the statement body, e.g. if true, { true } , true {
+      // print("body") }
+      return false;
+    }
+    if (Tok.is(tok::oper_binary_spaced) || Tok.is(tok::oper_binary_unspaced)) {
+      // If current token is a binary operator this can't be the statement body
+      // since an `if` expression can't be the left-hand side of an operator,
+      // e.g. if true, { true }
+      // != nil
+      // {
+      //   print("body")
+      // }
+      return false;
+    }
+    // Excluded the above exceptions, this must be the statement body.
+    return true;
+  } else {
+    // If the current token isn't at the start of a line and isn't `EOF`, `;`,
+    // `else`, `)` or `}` this can't be the statement body.
+    return false;
+  }
 }
 
 /// Parse the condition of an 'if' or 'while'.
@@ -1192,6 +1913,7 @@ Parser::parseAvailabilitySpecList(SmallVectorImpl<AvailabilitySpec *> &Specs) {
 ///     expr-basic
 ///     ('var' | 'let' | 'case') pattern '=' expr-basic
 ///     '#available' '(' availability-spec (',' availability-spec)* ')'
+///     '#_hasSymbol' '(' expr ')'
 ///
 /// The use of expr-basic here disallows trailing closures, which are
 /// problematic given the curly braces around the if/while body.
@@ -1203,11 +1925,37 @@ ParserStatus Parser::parseStmtCondition(StmtCondition &Condition,
 
   SmallVector<StmtConditionElement, 4> result;
 
-  // This little helper function is used to consume a separator comma if
-  // present, it returns false if it isn't there.  It also gracefully handles
-  // the case when the user used && instead of comma, since that is a common
-  // error.
-  auto consumeSeparatorComma = [&]() -> bool {
+  // For error recovery purposes, keep track of the disposition of the last
+  // pattern binding we saw ('let', 'var', or 'case').
+  StringRef BindingKindStr;
+  
+  // We have a simple comma separated list of clauses, but also need to handle
+  // a variety of common errors situations (including migrating from Swift 2
+  // syntax).
+  while (true) {
+
+    if (Context.LangOpts.hasFeature(Feature::TrailingComma)) {
+      // Condition terminator is `else` for `guard` statements.
+      if (ParentKind == StmtKind::Guard && Tok.is(tok::kw_else)) {
+        break;
+      }
+      // Condition terminator is start of statement body for `if` or `while`
+      // statements. Missing `else` is a common mistake for `guard` statements
+      // so we fall back to lookahead for a body.
+      if (isStartOfConditionalStmtBody()) {
+        break;
+      }
+    }
+
+    Status |= parseStmtConditionElement(result, DefaultID, ParentKind,
+                                        BindingKindStr);
+    if (Status.isErrorOrHasCompletion())
+      break;
+
+    // If a comma exists consume it and succeed.
+    if (consumeIf(tok::comma))
+      continue;
+    
     // If we have an "&&" token followed by a continuation of the statement
     // condition, then fixit the "&&" to "," and keep going.
     if (Tok.isAny(tok::oper_binary_spaced, tok::oper_binary_unspaced) &&
@@ -1215,7 +1963,7 @@ ParserStatus Parser::parseStmtCondition(StmtCondition &Condition,
       diagnose(Tok, diag::expected_comma_stmtcondition)
         .fixItReplaceChars(getEndOfPreviousLoc(), Tok.getRange().getEnd(), ",");
       consumeToken();
-      return true;
+      continue;
     }
 
     // Boolean conditions are separated by commas, not the 'where' keyword, as
@@ -1224,182 +1972,11 @@ ParserStatus Parser::parseStmtCondition(StmtCondition &Condition,
       diagnose(Tok, diag::expected_comma_stmtcondition)
         .fixItReplaceChars(getEndOfPreviousLoc(), Tok.getRange().getEnd(), ",");
       consumeToken();
-      return true;
-    }
-    
-    // Otherwise, if a comma exists consume it and succeed.
-    return consumeIf(tok::comma);
-  };
-  
- 
-  // For error recovery purposes, keep track of the disposition of the last
-  // pattern binding we saw ('let', 'var', or 'case').
-  StringRef BindingKindStr;
-  
-  // We have a simple comma separated list of clauses, but also need to handle
-  // a variety of common errors situations (including migrating from Swift 2
-  // syntax).
-  bool isFirstIteration = true;
-  while (isFirstIteration || consumeSeparatorComma()) {
-    isFirstIteration = false;
-    
-    // Parse a leading #available condition if present.
-    if (Tok.is(tok::pound_available)) {
-      auto res = parseStmtConditionPoundAvailable();
-      if (res.isNull() || res.hasCodeCompletion()) {
-        Status |= res;
-        return Status;
-      }
-      
-      result.push_back({res.get()});
-      BindingKindStr = StringRef();
       continue;
     }
     
-    // Handle code completion after the #.
-    if (Tok.is(tok::pound) && peekToken().is(tok::code_complete)) {
-      consumeToken(); // '#' token.
-      auto CodeCompletionPos = consumeToken();
-      auto Expr = new (Context) CodeCompletionExpr(CodeCompletionPos);
-      if (CodeCompletion)
-        CodeCompletion->completeAfterPound(Expr, ParentKind);
-      result.push_back(Expr);
-      Status.setHasCodeCompletion();
-      return Status;
-    }
-    
-    // Parse the basic expression case.  If we have a leading let/var/case
-    // keyword or an assignment, then we know this is a binding.
-    if (Tok.isNot(tok::kw_let, tok::kw_var, tok::kw_case)) {
-      // If we lack it, then this is theoretically a boolean condition.
-      // However, we also need to handle migrating from Swift 2 syntax, in
-      // which a comma followed by an expression could actually be a pattern
-      // clause followed by a binding.  Determine what we have by checking for a
-      // syntactically valid pattern followed by an '=', which can never be a
-      // boolean condition.
-      //
-      // However, if this is the first clause, and we see "x = y", then this is
-      // almost certainly a typo for '==' and definitely not a continuation of
-      // another clause, so parse it as an expression.  This also avoids
-      // lookahead + backtracking on simple if conditions that are obviously
-      // boolean conditions.
-      auto isBooleanExpr = [&]() -> bool {
-        Parser::BacktrackingScope Backtrack(*this);
-        return !canParseTypedPattern() || Tok.isNot(tok::equal);
-      };
-
-      if (BindingKindStr.empty() || isBooleanExpr()) {
-        auto diagID = result.empty() ? DefaultID :
-              diag::expected_expr_conditional;
-        auto BoolExpr = parseExprBasic(diagID);
-        Status |= BoolExpr;
-        if (BoolExpr.isNull())
-          return Status;
-        result.push_back(BoolExpr.get());
-        BindingKindStr = StringRef();
-        continue;
-      }
-    }
-    
-    SourceLoc IntroducerLoc;
-    if (Tok.isAny(tok::kw_let, tok::kw_var, tok::kw_case)) {
-      BindingKindStr = Tok.getText();
-      IntroducerLoc = consumeToken();
-    } else {
-      // If we lack the leading let/var/case keyword, then we're here because
-      // the user wrote something like "if let x = foo(), y = bar() {".  Fix
-      // this by inserting a new 'let' keyword before y.
-      IntroducerLoc = Tok.getLoc();
-      assert(!BindingKindStr.empty() &&
-             "Shouldn't get here without a leading binding");
-      diagnose(Tok.getLoc(), diag::expected_binding_keyword, BindingKindStr)
-        .fixItInsert(Tok.getLoc(), BindingKindStr.str()+" ");
-    }
-
-    
-    // We're parsing a conditional binding.
-    assert(CurDeclContext->isLocalContext() &&
-           "conditional binding in non-local context?!");
-    
-    ParserResult<Pattern> ThePattern;
-    
-    if (BindingKindStr == "case") {
-      // In our recursive parse, remember that we're in a matching pattern.
-      llvm::SaveAndRestore<decltype(InVarOrLetPattern)>
-        T(InVarOrLetPattern, IVOLP_InMatchingPattern);
-      ThePattern = parseMatchingPattern(/*isExprBasic*/ true);
-    } else if ((BindingKindStr == "let" || BindingKindStr == "var") &&
-               Tok.is(tok::kw_case)) {
-      // If will probably be a common typo to write "if let case" instead of
-      // "if case let" so detect this and produce a nice fixit.
-      diagnose(IntroducerLoc, diag::wrong_condition_case_location,
-               BindingKindStr)
-      .fixItRemove(IntroducerLoc)
-      .fixItInsertAfter(Tok.getLoc(), " " + BindingKindStr.str());
-
-      consumeToken(tok::kw_case);
-      
-      bool wasLet = BindingKindStr == "let";
-      
-      // In our recursive parse, remember that we're in a var/let pattern.
-      llvm::SaveAndRestore<decltype(InVarOrLetPattern)>
-        T(InVarOrLetPattern, wasLet ? IVOLP_InLet : IVOLP_InVar);
-      
-      BindingKindStr = "case";
-      ThePattern = parseMatchingPattern(/*isExprBasic*/ true);
-      
-      if (ThePattern.isNonNull()) {
-        auto *P = new (Context) VarPattern(IntroducerLoc, wasLet,
-                                           ThePattern.get(), /*impl*/false);
-        ThePattern = makeParserResult(P);
-      }
-
-    } else {
-      // Otherwise, this is an implicit optional binding "if let".
-      ThePattern = parseMatchingPatternAsLetOrVar(BindingKindStr == "let",
-                                                  IntroducerLoc,
-                                                  /*isExprBasic*/ true);
-      // The let/var pattern is part of the statement.
-      if (Pattern *P = ThePattern.getPtrOrNull())
-        P->setImplicit();
-    }
-
-    ThePattern = parseOptionalPatternTypeAnnotation(ThePattern,
-                                                    BindingKindStr != "case");
-    Status |= ThePattern;
-    
-    if (ThePattern.isNull() || ThePattern.hasCodeCompletion())
-      return Status;
-
-    // Conditional bindings must have an initializer.
-    Expr *Init;
-    if (consumeIf(tok::equal)) {
-      ParserResult<Expr> InitExpr
-        = parseExprBasic(diag::expected_expr_conditional_var);
-      Status |= InitExpr;
-      if (InitExpr.isNull())
-        return Status;
-      Init = InitExpr.get();
-      
-    } else {
-      // Although we require an initializer, recover by parsing as if it were
-      // merely omitted.
-      diagnose(Tok, diag::conditional_var_initializer_required);
-      Init = new (Context) ErrorExpr(ThePattern.get()->getEndLoc());
-    }
-    
-    result.push_back({IntroducerLoc, ThePattern.get(), Init});
-    IntroducerLoc = SourceLoc();
-    
-    // Add variable bindings from the pattern to our current scope and mark
-    // them as being having a non-pattern-binding initializer.
-    ThePattern.get()->forEachVariable([&](VarDecl *VD) {
-      if (VD->hasName())
-        addToScope(VD);
-      VD->setHasNonPatternBindingInit();
-    });
-    
-  } while (consumeSeparatorComma());
+    break;
+  }; 
   
   Condition = Context.AllocateCopy(result);
   return Status;
@@ -1411,8 +1988,16 @@ ParserStatus Parser::parseStmtCondition(StmtCondition &Condition,
 ///   stmt-if-else:
 ///    'else' stmt-brace
 ///    'else' stmt-if
-ParserResult<Stmt> Parser::parseStmtIf(LabeledStmtInfo LabelInfo) {
-  SourceLoc IfLoc = consumeToken(tok::kw_if);
+ParserResult<Stmt> Parser::parseStmtIf(LabeledStmtInfo LabelInfo,
+                                       bool IfWasImplicitlyInserted) {
+  SourceLoc IfLoc;
+  if (IfWasImplicitlyInserted) {
+    // The code was invalid due to a missing 'if' (e.g. 'else x < y {') and a
+    // fixit implicitly inserted it.
+    IfLoc = Tok.getLoc();
+  } else {
+    IfLoc = consumeToken(tok::kw_if);
+  }
 
   ParserStatus Status;
   StmtCondition Condition;
@@ -1421,8 +2006,6 @@ ParserResult<Stmt> Parser::parseStmtIf(LabeledStmtInfo LabelInfo) {
   // A scope encloses the condition and true branch for any variables bound
   // by a conditional binding. The else branch does *not* see these variables.
   {
-    Scope S(this, ScopeKind::IfVars);
-
     auto recoverWithCond = [&](ParserStatus Status,
                                StmtCondition Condition) -> ParserResult<Stmt> {
       if (Condition.empty()) {
@@ -1449,7 +2032,7 @@ ParserResult<Stmt> Parser::parseStmtIf(LabeledStmtInfo LabelInfo) {
     } else {
       Status |= parseStmtCondition(Condition, diag::expected_condition_if,
                                    StmtKind::If);
-      if (Status.isError() || Status.hasCodeCompletion())
+      if (Status.isErrorOrHasCompletion())
         return recoverWithCond(Status, Condition);
     }
 
@@ -1472,10 +2055,32 @@ ParserResult<Stmt> Parser::parseStmtIf(LabeledStmtInfo LabelInfo) {
   ParserResult<Stmt> ElseBody;
   if (Tok.is(tok::kw_else)) {
     ElseLoc = consumeToken(tok::kw_else);
-    if (Tok.is(tok::kw_if))
-      ElseBody = parseStmtIf(LabeledStmtInfo());
-    else
-      ElseBody = parseBraceItemList(diag::expected_lbrace_after_else);
+
+    bool implicitlyInsertIf = false;
+    if (Tok.isNot(tok::kw_if, tok::l_brace, tok::code_complete)) {
+      // The code looks like 'if ... { ... } else not_if_or_lbrace', so we've
+      // got a problem. If the last bit is 'else ... {' on one line, let's
+      // assume they've forgotten the 'if'.
+      BacktrackingScope backtrack(*this);
+      if (skipUntilTokenOrEndOfLine(tok::l_brace, tok::r_brace))
+        implicitlyInsertIf = Tok.is(tok::l_brace);
+    }
+
+    if (Tok.is(tok::kw_if) || implicitlyInsertIf) {
+      if (implicitlyInsertIf) {
+        diagnose(ElseLoc, diag::expected_lbrace_or_if_after_else_fixit)
+            .fixItInsertAfter(ElseLoc, " if");
+      }
+      ElseBody = parseStmtIf(LabeledStmtInfo(), implicitlyInsertIf);
+    } else if (Tok.is(tok::code_complete)) {
+      if (CodeCompletionCallbacks) {
+        CodeCompletionCallbacks->completeAfterIfStmtElse();
+      }
+      Status.setHasCodeCompletionAndIsError();
+      consumeToken(tok::code_complete);
+    } else {
+      ElseBody = parseBraceItemList(diag::expected_lbrace_or_if_after_else);
+    }
     Status |= ElseBody;
   }
 
@@ -1510,7 +2115,7 @@ ParserResult<Stmt> Parser::parseStmtGuard() {
             BraceStmt::create(Context, EndLoc, {}, EndLoc, /*implicit=*/true)));
   };
 
-  if (Tok.is(tok::l_brace)) {
+  if (Tok.isAny(tok::l_brace, tok::kw_else)) {
     SourceLoc LBraceLoc = Tok.getLoc();
     diagnose(GuardLoc, diag::missing_condition_after_guard)
       .highlight(SourceRange(GuardLoc, LBraceLoc));
@@ -1520,7 +2125,7 @@ ParserResult<Stmt> Parser::parseStmtGuard() {
   } else {
     Status |= parseStmtCondition(Condition, diag::expected_condition_guard,
                                  StmtKind::Guard);
-    if (Status.isError() || Status.hasCodeCompletion()) {
+    if (Status.isErrorOrHasCompletion()) {
       // FIXME: better recovery
       return recoverWithCond(Status, Condition);
     }
@@ -1536,19 +2141,6 @@ ParserResult<Stmt> Parser::parseStmtGuard() {
     else
       return recoverWithCond(Status, Condition);
   }
-
-  // Before parsing the body, disable all of the bound variables so that they
-  // cannot be used unbound.
-  SmallVector<VarDecl *, 4> Vars;
-  for (auto &elt : Condition)
-    if (auto pattern = elt.getPatternOrNull())
-      pattern->collectVariables(Vars);
-
-  llvm::SaveAndRestore<decltype(DisabledVars)>
-  RestoreCurVars(DisabledVars, Vars);
-
-  llvm::SaveAndRestore<decltype(DisabledVarReason)>
-  RestoreReason(DisabledVarReason, diag::bound_var_guard_body);
 
   Body = parseBraceItemList(diag::expected_lbrace_after_guard);
   if (Body.isNull())
@@ -1566,8 +2158,6 @@ ParserResult<Stmt> Parser::parseStmtGuard() {
 ParserResult<Stmt> Parser::parseStmtWhile(LabeledStmtInfo LabelInfo) {
   SourceLoc WhileLoc = consumeToken(tok::kw_while);
 
-  Scope S(this, ScopeKind::WhileVars);
-  
   ParserStatus Status;
   StmtCondition Condition;
 
@@ -1596,7 +2186,7 @@ ParserResult<Stmt> Parser::parseStmtWhile(LabeledStmtInfo LabelInfo) {
   } else {
     Status |= parseStmtCondition(Condition, diag::expected_condition_while,
                                  StmtKind::While);
-    if (Status.isError() || Status.hasCodeCompletion())
+    if (Status.isErrorOrHasCompletion())
       return recoverWithCond(Status, Condition);
   }
 
@@ -1636,9 +2226,8 @@ ParserResult<Stmt> Parser::parseStmtRepeat(LabeledStmtInfo labelInfo) {
 
   ParserResult<Expr> condition;
   if (Tok.is(tok::l_brace)) {
-    SourceLoc lbraceLoc = Tok.getLoc();
     diagnose(whileLoc, diag::missing_condition_after_while);
-    condition = makeParserErrorResult(new (Context) ErrorExpr(lbraceLoc));
+    condition = makeParserErrorResult(new (Context) ErrorExpr(whileLoc));
   } else {
     condition = parseExpr(diag::expected_expr_repeat_while);
     status |= condition;
@@ -1655,12 +2244,38 @@ ParserResult<Stmt> Parser::parseStmtRepeat(LabeledStmtInfo labelInfo) {
 
 /// 
 ///   stmt-do:
-///     (identifier ':')? 'do' stmt-brace
-///     (identifier ':')? 'do' stmt-brace stmt-catch+
-ParserResult<Stmt> Parser::parseStmtDo(LabeledStmtInfo labelInfo) {
-  SourceLoc doLoc = consumeToken(tok::kw_do);
+///     (identifier ':')? 'do' throws-clause? stmt-brace
+///     (identifier ':')? 'do' throws-clause? stmt-brace stmt-catch+
+ParserResult<Stmt> Parser::parseStmtDo(LabeledStmtInfo labelInfo,
+                                       bool shouldSkipDoTokenConsume) {
+  SourceLoc doLoc;
+
+  if (shouldSkipDoTokenConsume) {
+    doLoc = Tok.getLoc();
+  } else {
+    doLoc = consumeToken(tok::kw_do);
+  }
 
   ParserStatus status;
+
+  // Parse the optional 'throws' clause.
+  SourceLoc throwsLoc;
+  TypeRepr *thrownType = nullptr;
+  if (consumeIf(tok::kw_throws, throwsLoc)) {
+    // Parse the thrown error type.
+    SourceLoc lParenLoc;
+    if (consumeIf(tok::l_paren, lParenLoc)) {
+      ParserResult<TypeRepr> parsedThrownTy =
+          parseType(diag::expected_thrown_error_type);
+      thrownType = parsedThrownTy.getPtrOrNull();
+      status |= parsedThrownTy;
+
+      SourceLoc rParenLoc;
+      parseMatchingToken(
+          tok::r_paren, rParenLoc,
+          diag::expected_rparen_after_thrown_error_type, lParenLoc);
+    }
+  }
 
   ParserResult<BraceStmt> body =
       parseBraceItemList(diag::expected_lbrace_after_do);
@@ -1671,43 +2286,55 @@ ParserResult<Stmt> Parser::parseStmtDo(LabeledStmtInfo labelInfo) {
 
   // If the next token is 'catch', this is a 'do'/'catch' statement.
   if (Tok.is(tok::kw_catch)) {
-    // Parse 'catch' clauses 
-    SmallVector<CatchStmt*, 4> allClauses;
+    // Parse 'catch' clauses
+    SmallVector<CaseStmt *, 4> allClauses;
+    ParserStatus catchClausesStatus;
     do {
-      ParserResult<CatchStmt> clause = parseStmtCatch();
-      status |= clause;
-      if (status.hasCodeCompletion() && clause.isNull())
+      ParserResult<CaseStmt> clause = parseStmtCatch();
+      catchClausesStatus |= clause;
+      if (catchClausesStatus.hasCodeCompletion() && clause.isNull()) {
+        status |= catchClausesStatus;
         return makeParserResult<Stmt>(status, nullptr);
+      }
 
       // parseStmtCatch promises to return non-null unless we are
       // completing inside the catch's pattern.
       allClauses.push_back(clause.get());
-    } while (Tok.is(tok::kw_catch) && !status.hasCodeCompletion());
+    } while (Tok.is(tok::kw_catch) && !catchClausesStatus.hasCodeCompletion());
+    status |= catchClausesStatus;
 
     // Recover from all of the clauses failing to parse by returning a
     // normal do-statement.
     if (allClauses.empty()) {
-      assert(status.isError());
+      assert(status.isErrorOrHasCompletion());
       return makeParserResult(status,
                         new (Context) DoStmt(labelInfo, doLoc, body.get()));
     }
 
     return makeParserResult(status,
-      DoCatchStmt::create(Context, labelInfo, doLoc, body.get(), allClauses));
+      DoCatchStmt::create(CurDeclContext, labelInfo, doLoc, throwsLoc,
+                          thrownType, body.get(), allClauses));
   }
 
-  SourceLoc whileLoc;
+  if (throwsLoc.isValid()) {
+    diagnose(throwsLoc, diag::do_throws_without_catch);
+  }
 
-  // If we don't see a 'while', this is just the bare 'do' scoping
-  // statement.
-  if (!consumeIf(tok::kw_while, whileLoc)) {
+  // If we dont see a 'while' or see a 'while' that starts
+  // from new line. This is just the bare `do` scoping statement.
+  if (Tok.getKind() != tok::kw_while || Tok.isAtStartOfLine()) {
     return makeParserResult(status,
-                         new (Context) DoStmt(labelInfo, doLoc, body.get()));
+                            new (Context) DoStmt(labelInfo, doLoc, body.get()));
   }
-
+  SourceLoc whileLoc = Tok.getLoc();
   // But if we do, advise the programmer that it's 'repeat' now.
-  diagnose(doLoc, diag::do_while_now_repeat_while)
+  diagnose(doLoc, diag::do_while_now_repeat_while);
+  diagnose(doLoc, diag::do_while_expected_repeat_while)
     .fixItReplace(doLoc, "repeat");
+  diagnose(doLoc, diag::do_while_expected_separate_stmt)
+    .fixItInsert(whileLoc, "\n");
+
+  consumeToken(tok::kw_while);
   status.setIsParseError();
   ParserResult<Expr> condition;
   if (Tok.is(tok::l_brace)) {
@@ -1735,20 +2362,26 @@ ParserResult<Stmt> Parser::parseStmtDo(LabeledStmtInfo labelInfo) {
 ///
 /// This routine promises to return a non-null result unless there was
 /// a code-completion token in the pattern.
-ParserResult<CatchStmt> Parser::parseStmtCatch() {
+ParserResult<CaseStmt> Parser::parseStmtCatch() {
   // A catch block has its own scope for variables bound out of the pattern.
-  Scope S(this, ScopeKind::CatchVars);
-
   SourceLoc catchLoc = consumeToken(tok::kw_catch);
 
   SmallVector<VarDecl*, 4> boundDecls;
-
   ParserStatus status;
-  GuardedPattern pattern;
-  parseGuardedPattern(*this, pattern, status, boundDecls,
-                      GuardedPatternContext::Catch, /* isFirst */ true);
-  if (status.hasCodeCompletion()) {
-    return makeParserCodeCompletionResult<CatchStmt>();
+  SmallVector<CaseLabelItem, 1> caseLabelItems;
+
+  {
+    bool isFirst = true;
+    while (true) {
+      GuardedPattern PatternResult;
+      parseGuardedPattern(*this, PatternResult, status, boundDecls,
+                          GuardedPatternContext::Catch, isFirst);
+      caseLabelItems.emplace_back(PatternResult.ThePattern,
+                                  PatternResult.WhereLoc, PatternResult.Guard);
+      isFirst = false;
+      if (!consumeIf(tok::comma))
+        break;
+    }
   }
 
   auto bodyResult = parseBraceItemList(diag::expected_lbrace_after_catch);
@@ -1759,10 +2392,9 @@ ParserResult<CatchStmt> Parser::parseStmtCatch() {
                                                          /*implicit=*/ true));
   }
 
-  auto result =
-    new (Context) CatchStmt(catchLoc, pattern.ThePattern, pattern.WhereLoc,
-                            pattern.Guard, bodyResult.get());
-  return makeParserResult(status, result);
+  return makeParserResult(
+      status, CaseStmt::createParsedDoCatch(Context, catchLoc, caseLabelItems,
+                                            bodyResult.get()));
 }
 
 static bool isStmtForCStyle(Parser &P) {
@@ -1783,7 +2415,8 @@ static bool isStmtForCStyle(Parser &P) {
   // Skip until we see ';', or something that ends control part.
   while (true) {
     if (P.Tok.isAny(tok::eof, tok::kw_in, tok::l_brace, tok::r_brace,
-                    tok::r_paren) || P.isStartOfStmt())
+                    tok::r_paren) ||
+        P.isStartOfStmt(/*preferExpr*/ false))
       return false;
     // If we saw newline before ';', consider it is a foreach statement.
     if (!HasLParen && P.Tok.isAtStartOfLine())
@@ -1809,37 +2442,60 @@ ParserResult<Stmt> Parser::parseStmtForEach(LabeledStmtInfo LabelInfo) {
   // lookahead to resolve what is going on.
   bool IsCStyleFor = isStmtForCStyle(*this);
   auto StartOfControl = Tok.getLoc();
+  SourceLoc AwaitLoc;
+  SourceLoc TryLoc;
+
+  if (Tok.isContextualKeyword("await")) {
+    AwaitLoc = consumeToken();
+  } else if (Tok.is(tok::kw_try)) {
+    TryLoc = consumeToken();
+    if (Tok.isContextualKeyword("await")) {
+      AwaitLoc = consumeToken();
+    }
+  }
+
+  if (Tok.is(tok::code_complete)) {
+    if (CodeCompletionCallbacks) {
+      CodeCompletionCallbacks->completeForEachPatternBeginning(
+          TryLoc.isValid(), AwaitLoc.isValid());
+    }
+    consumeToken(tok::code_complete);
+    // Since 'completeForeachPatternBeginning' is a keyword only completion,
+    // we don't need to parse the rest of 'for' statement.
+    return makeParserCodeCompletionStatus();
+  }
 
   // Parse the pattern.  This is either 'case <refutable pattern>' or just a
   // normal pattern.
   if (consumeIf(tok::kw_case)) {
-    llvm::SaveAndRestore<decltype(InVarOrLetPattern)>
-      T(InVarOrLetPattern, Parser::IVOLP_InMatchingPattern);
+    llvm::SaveAndRestore<decltype(InBindingPattern)> T(
+        InBindingPattern, PatternBindingState::InMatchingPattern);
+
+    // Reset async attribute in parser context.
+    llvm::SaveAndRestore<bool> AsyncAttr(InPatternWithAsyncAttribute, false);
+
     pattern = parseMatchingPattern(/*isExprBasic*/true);
-    pattern = parseOptionalPatternTypeAnnotation(pattern, /*isOptional*/false);
+    pattern = parseOptionalPatternTypeAnnotation(pattern);
   } else if (!IsCStyleFor || Tok.is(tok::kw_var)) {
     // Change the parser state to know that the pattern we're about to parse is
     // implicitly mutable.  Bound variables can be changed to mutable explicitly
     // if desired by using a 'var' pattern.
-    assert(InVarOrLetPattern == IVOLP_NotInVarOrLet &&
+    assert(InBindingPattern == PatternBindingState::NotInBinding &&
            "for-each loops cannot exist inside other patterns");
-    InVarOrLetPattern = IVOLP_ImplicitlyImmutable;
+    InBindingPattern = PatternBindingState::ImplicitlyImmutable;
     pattern = parseTypedPattern();
-    assert(InVarOrLetPattern == IVOLP_ImplicitlyImmutable);
-    InVarOrLetPattern = IVOLP_NotInVarOrLet;
+    assert(InBindingPattern == PatternBindingState::ImplicitlyImmutable);
+    InBindingPattern = PatternBindingState::NotInBinding;
   }
   
   SourceLoc InLoc;
   if (pattern.isNull()) {
     // Recover by creating a "_" pattern.
-    pattern = makeParserErrorResult(new (Context) AnyPattern(SourceLoc()));
+    pattern = makeParserErrorResult(AnyPattern::createImplicit(Context));
     consumeIf(tok::kw_in, InLoc);
   } else if (!IsCStyleFor) {
     parseToken(tok::kw_in, InLoc, diag::expected_foreach_in);
   }
-
-  // Bound variables all get their initial values from the generator.
-  pattern.get()->markHasNonPatternBindingInit();
 
   if (IsCStyleFor) {
     // Skip until start of body part.
@@ -1865,36 +2521,40 @@ ParserResult<Stmt> Parser::parseStmtForEach(LabeledStmtInfo LabelInfo) {
     diagnose(LBraceLoc, diag::expected_foreach_container);
     Container = makeParserErrorResult(new (Context) ErrorExpr(LBraceLoc));
   } else if (Tok.is(tok::code_complete)) {
-    Container =
-        makeParserResult(new (Context) CodeCompletionExpr(Tok.getLoc()));
-    Container.setHasCodeCompletion();
-    Status |= Container;
-    if (CodeCompletion)
-      CodeCompletion->completeForEachSequenceBeginning(
-          cast<CodeCompletionExpr>(Container.get()));
-    consumeToken(tok::code_complete);
+    // If there is no "in" keyword, suggest it. Otherwise, complete the
+    // sequence.
+    if (InLoc.isInvalid()) {
+      if (CodeCompletionCallbacks) {
+        CodeCompletionCallbacks->completeForEachInKeyword();
+      }
+      consumeToken(tok::code_complete);
+      return makeParserCodeCompletionStatus();
+    } else {
+      Container =
+          makeParserResult(new (Context) CodeCompletionExpr(Tok.getLoc()));
+      Container.setHasCodeCompletionAndIsError();
+      Status |= Container;
+      if (CodeCompletionCallbacks) {
+        CodeCompletionCallbacks->completeForEachSequenceBeginning(
+            cast<CodeCompletionExpr>(Container.get()));
+      }
+      consumeToken(tok::code_complete);
+    }
   } else {
     Container = parseExprBasic(diag::expected_foreach_container);
     Status |= Container;
     if (Container.isNull())
       Container = makeParserErrorResult(new (Context) ErrorExpr(Tok.getLoc()));
-    if (Container.isParseError())
+    if (Container.isParseErrorOrHasCompletion())
       // Recover.
       skipUntilDeclStmtRBrace(tok::l_brace, tok::kw_where);
   }
-
-  // Introduce a new scope and place the variables in the pattern into that
-  // scope.
-  // FIXME: We may want to merge this scope with the scope introduced by
-  // the stmt-brace, as in C++.
-  Scope S(this, ScopeKind::ForeachVars);
   
-  // Introduce variables to the current scope.
-  addPatternVariablesToScope(pattern.get());
-
   // Parse the 'where' expression if present.
   ParserResult<Expr> Where;
-  if (consumeIf(tok::kw_where)) {
+  SourceLoc WhereLoc;
+  if (Tok.is(tok::kw_where)) {
+    WhereLoc = consumeToken();
     Where = parseExprBasic(diag::expected_foreach_where_expr);
     if (Where.isNull())
       Where = makeParserErrorResult(new (Context) ErrorExpr(Tok.getLoc()));
@@ -1911,8 +2571,8 @@ ParserResult<Stmt> Parser::parseStmtForEach(LabeledStmtInfo LabelInfo) {
 
   return makeParserResult(
       Status,
-      new (Context) ForEachStmt(LabelInfo, ForLoc, pattern.get(), InLoc,
-                                Container.get(), Where.getPtrOrNull(),
+      new (Context) ForEachStmt(LabelInfo, ForLoc, TryLoc, AwaitLoc, pattern.get(), InLoc,
+                                Container.get(), WhereLoc, Where.getPtrOrNull(),
                                 Body.get()));
 }
 
@@ -1930,23 +2590,31 @@ ParserResult<Stmt> Parser::parseStmtSwitch(LabeledStmtInfo LabelInfo) {
     SubjectExpr = makeParserErrorResult(new (Context) ErrorExpr(SubjectLoc));
   } else {
     SubjectExpr = parseExprBasic(diag::expected_switch_expr);
-    if (SubjectExpr.hasCodeCompletion()) {
-      return makeParserCodeCompletionResult<Stmt>();
-    }
     if (SubjectExpr.isNull()) {
       SubjectExpr = makeParserErrorResult(new (Context) ErrorExpr(SubjectLoc));
     }
     Status |= SubjectExpr;
   }
 
-  if (!Tok.is(tok::l_brace)) {
-    diagnose(Tok, diag::expected_lbrace_after_switch);
-    return nullptr;
-  }
-  SourceLoc lBraceLoc = consumeToken(tok::l_brace);
+  SourceLoc lBraceLoc;
   SourceLoc rBraceLoc;
-  
   SmallVector<ASTNode, 8> cases;
+
+  if (Status.isErrorOrHasCompletion()) {
+    return makeParserResult(
+        Status, SwitchStmt::create(LabelInfo, SwitchLoc, SubjectExpr.get(),
+                                   lBraceLoc, cases, rBraceLoc,
+                                   /*EndLoc=*/PreviousLoc, Context));
+  }
+
+  if (!consumeIf(tok::l_brace, lBraceLoc)) {
+    diagnose(Tok, diag::expected_lbrace_after_switch);
+    return makeParserResult(
+        Status, SwitchStmt::create(LabelInfo, SwitchLoc, SubjectExpr.get(),
+                                   lBraceLoc, cases, rBraceLoc,
+                                   /*EndLoc=*/PreviousLoc, Context));
+  }
+
   Status |= parseStmtCases(cases, /*IsActive=*/true);
 
   // We cannot have additional cases after a default clause. Complain on
@@ -1969,7 +2637,8 @@ ParserResult<Stmt> Parser::parseStmtSwitch(LabeledStmtInfo LabelInfo) {
 
   return makeParserResult(
       Status, SwitchStmt::create(LabelInfo, SwitchLoc, SubjectExpr.get(),
-                                 lBraceLoc, cases, rBraceLoc, Context));
+                                 lBraceLoc, cases, rBraceLoc,
+                                 /*EndLoc=*/rBraceLoc, Context));
 }
 
 ParserStatus
@@ -1977,7 +2646,7 @@ Parser::parseStmtCases(SmallVectorImpl<ASTNode> &cases, bool IsActive) {
   ParserStatus Status;
   while (Tok.isNot(tok::r_brace, tok::eof,
                    tok::pound_endif, tok::pound_elseif, tok::pound_else)) {
-    if (Tok.isAny(tok::kw_case, tok::kw_default)) {
+    if (isAtStartOfSwitchCase(*this)) {
       ParserResult<CaseStmt> Case = parseStmtCase(IsActive);
       Status |= Case;
       if (Case.isNonNull())
@@ -1985,23 +2654,29 @@ Parser::parseStmtCases(SmallVectorImpl<ASTNode> &cases, bool IsActive) {
     } else if (Tok.is(tok::pound_if)) {
       // '#if' in 'case' position can enclose one or more 'case' or 'default'
       // clauses.
-      auto IfConfigResult = parseIfConfig(
-        [&](SmallVectorImpl<ASTNode> &Elements, bool IsActive) {
-          parseStmtCases(Elements, IsActive);
-        });
+      auto IfConfigResult =
+          parseIfConfig(IfConfigContext::SwitchStmt,
+                        [&](bool IsActive) {
+                          SmallVector<ASTNode, 16> elements;
+                          parseStmtCases(elements, IsActive);
+
+                          if (IsActive) {
+                            cases.append(elements);
+                          }
+                        });
       Status |= IfConfigResult;
-      if (auto ICD = IfConfigResult.getPtrOrNull()) {
-        cases.emplace_back(ICD);
-
-        for (auto &Entry : ICD->getActiveClauseElements()) {
-          if (Entry.is<Decl*>() && isa<IfConfigDecl>(Entry.get<Decl*>()))
-            // Don't hoist nested '#if'.
-            continue;
-
-          assert(Entry.is<Stmt*>() && isa<CaseStmt>(Entry.get<Stmt*>()));
-          cases.push_back(Entry);
-        }
+    } else if (Tok.is(tok::pound_warning) || Tok.is(tok::pound_error)) {
+      auto PoundDiagnosticResult = parseDeclPoundDiagnostic();
+      Status |= PoundDiagnosticResult;
+      if (auto PDD = PoundDiagnosticResult.getPtrOrNull()) {
+        cases.emplace_back(PDD);
       }
+    } else if (Tok.is(tok::code_complete)) {
+      if (CodeCompletionCallbacks) {
+        CodeCompletionCallbacks->completeCaseStmtKeyword();
+      }
+      consumeToken(tok::code_complete);
+      return makeParserCodeCompletionStatus();
     } else {
       // If there are non-case-label statements at the start of the switch body,
       // raise an error and recover by discarding them.
@@ -2022,20 +2697,32 @@ static ParserStatus parseStmtCase(Parser &P, SourceLoc &CaseLoc,
                                   SmallVectorImpl<VarDecl *> &BoundDecls,
                                   SourceLoc &ColonLoc) {
   ParserStatus Status;
-  bool isFirst = true;
-  
   CaseLoc = P.consumeToken(tok::kw_case);
 
-  do {
-    GuardedPattern PatternResult;
-    parseGuardedPattern(P, PatternResult, Status, BoundDecls,
-                        GuardedPatternContext::Case, isFirst);
-    LabelItems.push_back(CaseLabelItem(/*IsDefault=*/false,
-                                       PatternResult.ThePattern,
-                                       PatternResult.WhereLoc,
-                                       PatternResult.Guard));
-    isFirst = false;
-  } while (P.consumeIf(tok::comma));
+  {
+    bool isFirst = true;
+    while (true) {
+      GuardedPattern PatternResult;
+      parseGuardedPattern(P, PatternResult, Status, BoundDecls,
+                          GuardedPatternContext::Case, isFirst);
+      LabelItems.emplace_back(PatternResult.ThePattern, PatternResult.WhereLoc,
+                              PatternResult.Guard);
+      isFirst = false;
+      if (!P.consumeIf(tok::comma))
+        break;
+
+      if (P.Context.LangOpts.hasFeature(Feature::TrailingComma) &&
+          P.Tok.is(tok::colon)) {
+        break;
+      }
+
+      if (P.Tok.is(tok::kw_case)) {
+        P.diagnose(P.Tok, diag::extra_case_keyword)
+          .fixItRemove(SourceRange(P.Tok.getLoc()));
+        P.consumeToken(tok::kw_case);
+      }
+    }
+  }
 
   ColonLoc = P.Tok.getLoc();
   if (!P.Tok.is(tok::colon)) {
@@ -2075,28 +2762,57 @@ parseStmtCaseDefault(Parser &P, SourceLoc &CaseLoc,
 
   // Create an implicit AnyPattern to represent the default match.
   auto Any = new (P.Context) AnyPattern(CaseLoc);
+  if (CaseLoc.isInvalid())
+    Any->setImplicit();
   LabelItems.push_back(
-      CaseLabelItem(/*IsDefault=*/true, Any, WhereLoc, Guard.getPtrOrNull()));
+      CaseLabelItem::getDefault(Any, WhereLoc, Guard.getPtrOrNull()));
 
   return Status;
 }
 
 ParserResult<CaseStmt> Parser::parseStmtCase(bool IsActive) {
-  // A case block has its own scope for variables bound out of the pattern.
-  Scope S(this, ScopeKind::CaseVars, !IsActive);
-
   ParserStatus Status;
 
   SmallVector<CaseLabelItem, 2> CaseLabelItems;
   SmallVector<VarDecl *, 4> BoundDecls;
+
+  SourceLoc UnknownAttrLoc;
+  while (Tok.is(tok::at_sign)) {
+    if (peekToken().isContextualKeyword("unknown")) {
+      if (!UnknownAttrLoc.isValid()) {
+        UnknownAttrLoc = consumeToken(tok::at_sign);
+      } else {
+        diagnose(Tok, diag::duplicate_attribute, false);
+        diagnose(UnknownAttrLoc, diag::previous_attribute, false);
+        consumeToken(tok::at_sign);
+      }
+      consumeToken(tok::identifier);
+
+      if (Tok.is(tok::l_paren)) {
+        diagnose(Tok, diag::unexpected_lparen_in_attribute, "unknown");
+        skipSingle();
+      }
+    } else {
+      assert(peekToken().is(tok::identifier) && "isAtStartOfSwitchCase() lied");
+
+      consumeToken(tok::at_sign);
+      diagnose(Tok, diag::unknown_attribute, Tok.getText());
+      consumeToken(tok::identifier);
+
+      if (Tok.is(tok::l_paren))
+        skipSingle();
+    }
+  }
 
   SourceLoc CaseLoc;
   SourceLoc ColonLoc;
   if (Tok.is(tok::kw_case)) {
     Status |=
         ::parseStmtCase(*this, CaseLoc, CaseLabelItems, BoundDecls, ColonLoc);
-  } else {
+  } else if (Tok.is(tok::kw_default)) {
     Status |= parseStmtCaseDefault(*this, CaseLoc, CaseLabelItems, ColonLoc);
+  } else {
+    llvm_unreachable("isAtStartOfSwitchCase() lied.");
   }
 
   assert(!CaseLabelItems.empty() && "did not parse any labels?!");
@@ -2104,10 +2820,9 @@ ParserResult<CaseStmt> Parser::parseStmtCase(bool IsActive) {
   SmallVector<ASTNode, 8> BodyItems;
 
   SourceLoc StartOfBody = Tok.getLoc();
-  if (Tok.isNot(tok::kw_case) && Tok.isNot(tok::kw_default) &&
-      Tok.isNot(tok::r_brace)) {
+  if (Tok.isNot(tok::r_brace) && !isAtStartOfSwitchCase(*this)) {
     Status |= parseBraceItems(BodyItems, BraceItemListKind::Case);
-  } else if (Status.isSuccess()) {
+  } else if (Status.isSuccess() && !Status.hasCodeCompletion()) {
     diagnose(CaseLoc, diag::case_stmt_without_body,
              CaseLabelItems.back().isDefault())
         .highlight(SourceRange(CaseLoc, ColonLoc))
@@ -2123,6 +2838,52 @@ ParserResult<CaseStmt> Parser::parseStmtCase(bool IsActive) {
   }
 
   return makeParserResult(
-      Status, CaseStmt::create(Context, CaseLoc, CaseLabelItems,
-                               !BoundDecls.empty(), ColonLoc, Body));
+      Status, CaseStmt::createParsedSwitchCase(Context, CaseLoc, CaseLabelItems,
+                                               UnknownAttrLoc, ColonLoc, Body));
+}
+
+/// stmt-pound-assert:
+///   '#assert' '(' expr (',' string_literal)? ')'
+ParserResult<Stmt> Parser::parseStmtPoundAssert() {
+  SourceLoc startLoc = consumeToken(tok::pound_assert);
+  SourceLoc endLoc;
+
+  if (Tok.isNot(tok::l_paren)) {
+    diagnose(Tok, diag::pound_assert_expected_lparen);
+    return makeParserError();
+  }
+  SourceLoc LBLoc = consumeToken(tok::l_paren);
+
+  auto conditionExprResult = parseExpr(diag::pound_assert_expected_expression);
+  if (conditionExprResult.isParseErrorOrHasCompletion())
+    return ParserStatus(conditionExprResult);
+
+  StringRef message;
+  if (consumeIf(tok::comma)) {
+    if (Tok.isNot(tok::string_literal)) {
+      diagnose(Tok.getLoc(), diag::pound_assert_expected_string_literal);
+      return makeParserError();
+    }
+
+    auto messageOpt = getStringLiteralIfNotInterpolated(Tok.getLoc(),
+                                                        "'#assert' message");
+    consumeToken();
+    if (!messageOpt)
+      return makeParserError();
+
+    message = *messageOpt;
+  }
+
+  if (parseMatchingToken(tok::r_paren, endLoc,
+                         diag::pound_assert_expected_rparen, LBLoc)) {
+    return makeParserError();
+  }
+
+  if (!Context.LangOpts.hasFeature(Feature::StaticAssert)) {
+    diagnose(startLoc, diag::pound_assert_disabled);
+    return makeParserError();
+  }
+
+  return makeParserResult<Stmt>(new (Context) PoundAssertStmt(
+      SourceRange(startLoc, endLoc), conditionExprResult.get(), message));
 }

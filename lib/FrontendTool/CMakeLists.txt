@@ -1,21 +1,30 @@
-add_swift_library(swiftFrontendTool STATIC
+
+add_swift_host_library(swiftFrontendTool STATIC
   FrontendTool.cpp
   ImportedModules.cpp
-  ReferenceDependencies.cpp
-  TBD.cpp
-  DEPENDS
-    swift-syntax-generated-headers SwiftOptions
-  LINK_LIBRARIES
-    swiftIndex
-    swiftIDE
-    swiftTBDGen swiftIRGen swiftSIL swiftSILGen swiftSILOptimizer
-    swiftDemangling
-    swiftImmediate
-    swiftSerialization
-    swiftPrintAsObjC
-    swiftFrontend
+  LoadedModuleTrace.cpp
+  TBD.cpp)
+add_dependencies(swiftFrontendTool
+  SwiftOptions)
+target_link_libraries(swiftFrontendTool INTERFACE
+  clangAPINotes
+  clangBasic)
+target_link_libraries(swiftFrontendTool PRIVATE
     swiftClangImporter
+    swiftConstExtract
+    swiftDemangling
+    swiftDependencyScan
+    swiftFrontend
+    swiftImmediate
+    swiftIndex
+    swiftIRGen
+    swiftMigrator
     swiftOption
-    clangAPINotes
-    clangBasic
-)
+    swiftPrintAsClang
+    swiftSerialization
+    swiftSIL
+    swiftSILGen
+    swiftSILOptimizer
+    swiftThreading)
+
+set_swift_llvm_is_available(swiftFrontendTool)

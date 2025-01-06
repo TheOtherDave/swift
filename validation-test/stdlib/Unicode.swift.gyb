@@ -1,6 +1,9 @@
 // RUN: %target-run-simple-swiftgyb
 // REQUIRES: executable_test
 
+// With a non-optimized stdlib the test takes very long.
+// REQUIRES: optimized_stdlib
+
 import SwiftPrivate
 import StdlibUnittest
 import StdlibUnicodeUnittest
@@ -207,6 +210,11 @@ UnicodeScalarTests.test("init") {
   expectEqual("h", UnicodeScalar(UInt16(104)))
   expectEqual("i", UnicodeScalar(UInt8(105)))
   expectEqual(nil, UnicodeScalar(UInt32(0xD800)))
+  expectEqual("j", Unicode.Scalar(Int(0x6A)))
+
+  if #available(SwiftStdlib 5.6, *) {
+    expectEqual(nil, Unicode.Scalar(-0x6A))
+  }
 }
 
 var UTF8Decoder = TestSuite("UTF8Decoder")
@@ -1686,7 +1694,7 @@ StringCookedViews.test("UTF8ForContiguousUTF16/StringsWithUnpairedSurrogates") {
 }
 
 func verifyThatStringIsOpaqueForCoreFoundation(_ nss: NSString) {
-  // Sanity checks to make sure we are testing the code path that does UTF-8
+  // Soundness checks to make sure we are testing the code path that does UTF-8
   // encoding itself, instead of dispatching to CF.  Both the original string
   // itself and its copies should be resilient to CF's fast path functions,
   // because Swift bridging may copy the string to ensure that it is not
@@ -1767,7 +1775,7 @@ StringCookedViews.test("UTF8ForNonContiguousUTF16Extra") {
       kCFAllocatorDefault, bytes, bytes.count,
       CFStringBuiltInEncodings.macRoman.rawValue, false, kCFAllocatorNull)
 
-    // Sanity checks to make sure we are testing the code path that does UTF-8
+    // Soundness checks to make sure we are testing the code path that does UTF-8
     // encoding itself, instead of dispatching to CF.
     // GetCStringPtr fails because our un-copied bytes aren't zero-terminated.
     // GetCharactersPtr fails because our un-copied bytes aren't UTF-16.
@@ -1790,7 +1798,7 @@ StringCookedViews.test("UTF8ForNonContiguousUTF16Extra") {
     var cfstring: CFString = CFStringCreateWithBytes(kCFAllocatorDefault,
         bytes, bytes.count, CFStringBuiltInEncodings.macRoman.rawValue, false)
 
-    // Sanity checks to make sure we are testing the code path that does UTF-8
+    // Soundness checks to make sure we are testing the code path that does UTF-8
     // encoding itself, instead of dispatching to CF.
     // CFStringCreateWithBytes() usually allocates zero-terminated ASCII
     // or UTF-16, in which case one of the fast paths will succeed.

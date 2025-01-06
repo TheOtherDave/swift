@@ -32,83 +32,113 @@ class SILGlobalVariable;
 
 namespace irgen {
 class TypeInfo;
+class IRGenModule;
 
 /// This data structure holds everything needed to emit debug info
 /// for a type.
 class DebugTypeInfo {
-public:
-  /// The DeclContext of the function. This might not be the DeclContext of
-  /// the variable if inlining took place.
-  DeclContext *DeclCtx = nullptr;
-
-  /// The generic environment of the type. Ideally we should need only this and
-  /// retire the DeclCtxt.
-  GenericEnvironment *GenericEnv = nullptr;
-
+protected:
   /// The type we need to emit may be different from the type
   /// mentioned in the Decl, for example, stripped of qualifiers.
   TypeBase *Type = nullptr;
   /// Needed to determine the size of basic types and to determine
   /// the storage type for undefined variables.
-  llvm::Type *StorageType = nullptr;
-  Size size = Size(0);
-  Alignment align = Alignment(0);
+  llvm::Type *FragmentStorageType = nullptr;
+  std::optional<uint32_t> NumExtraInhabitants;
+  Alignment Align;
   bool DefaultAlignment = true;
+  bool IsMetadataType = false;
+  bool IsFixedBuffer = false;
 
-  DebugTypeInfo() {}
-  DebugTypeInfo(DeclContext *DC, GenericEnvironment *GE, swift::Type Ty,
-                llvm::Type *StorageTy, Size SizeInBytes, Alignment AlignInBytes,
-                bool HasDefaultAlignment);
+public:
+  DebugTypeInfo() = default;
+  DebugTypeInfo(swift::Type Ty, llvm::Type *StorageTy = nullptr,
+                Alignment AlignInBytes = Alignment(1),
+                bool HasDefaultAlignment = true, bool IsMetadataType = false,
+                bool IsFixedBuffer = false,
+                std::optional<uint32_t> NumExtraInhabitants = {});
+
   /// Create type for a local variable.
-  static DebugTypeInfo getLocalVariable(DeclContext *DeclCtx,
-                                        GenericEnvironment *GE, VarDecl *Decl,
-                                        swift::Type Ty, const TypeInfo &Info,
-                                        bool Unwrap);
+  static DebugTypeInfo getLocalVariable(VarDecl *Decl, swift::Type Ty,
+                                        const TypeInfo &Info, IRGenModule &IGM);
+  /// Create type for global type metadata.
+  static DebugTypeInfo getGlobalMetadata(swift::Type Ty, llvm::Type *StorageTy,
+                                         Size size, Alignment align);
   /// Create type for an artificial metadata variable.
-  static DebugTypeInfo getMetadata(swift::Type Ty, llvm::Type *StorageTy,
-                                   Size size, Alignment align);
+  static DebugTypeInfo getTypeMetadata(swift::Type Ty, llvm::Type *StorageTy,
+                                       Size size, Alignment align);
+
+  /// Create a forward declaration for a type whose size is unknown.
+  static DebugTypeInfo getForwardDecl(swift::Type Ty);
+
   /// Create a standalone type from a TypeInfo object.
-  static DebugTypeInfo getFromTypeInfo(DeclContext *DC, GenericEnvironment *GE,
-                                       swift::Type Ty, const TypeInfo &Info);
+  static DebugTypeInfo getFromTypeInfo(swift::Type Ty, const TypeInfo &Info,
+                                       IRGenModule &IGM);
   /// Global variables.
-  static DebugTypeInfo getGlobal(SILGlobalVariable *GV, llvm::Type *StorageType,
-                                 Size size, Alignment align);
+  static DebugTypeInfo getGlobal(SILGlobalVariable *GV,
+                                 llvm::Type *StorageType, IRGenModule &IGM);
+  static DebugTypeInfo getGlobalFixedBuffer(SILGlobalVariable *GV,
+                                            llvm::Type *StorageType,
+                                            Size SizeInBytes, Alignment align);
   /// ObjC classes.
   static DebugTypeInfo getObjCClass(ClassDecl *theClass,
                                     llvm::Type *StorageType, Size size,
                                     Alignment align);
+  /// Error type.
+  static DebugTypeInfo getErrorResult(swift::Type Ty, IRGenModule &IGM);
 
   TypeBase *getType() const { return Type; }
 
   TypeDecl *getDecl() const;
-  DeclContext *getDeclContext() const { return DeclCtx; }
-  GenericEnvironment *getGenericEnvironment() const { return GenericEnv; }
 
-  void unwrapLValueOrInOutType() {
-    Type = Type->getWithoutSpecifierType().getPointer();
+  // Determine whether this type is an Archetype dependent on a generic context.
+  bool isContextArchetype() const {
+    if (auto archetype =
+            Type->getWithoutSpecifierType()->getAs<ArchetypeType>()) {
+      return !isa<OpaqueTypeArchetypeType>(archetype);
+    }
+    return false;
   }
 
-  // Determine whether this type is an Archetype itself.
-  bool isArchetype() const {
-    return Type->getWithoutSpecifierType()->is<ArchetypeType>();
-  }
-
-  /// LValues, inout args, and Archetypes are implicitly indirect by
-  /// virtue of their DWARF type.
-  //
-  // FIXME: Should this check if the lowered SILType is address only
-  // instead? Otherwise optionals of archetypes etc will still have
-  // 'isImplicitlyIndirect()' return false.
-  bool isImplicitlyIndirect() const {
-    return Type->hasLValueType() || isArchetype() || Type->is<InOutType>();
-  }
-
+  llvm::Type *getFragmentStorageType() const { return FragmentStorageType; }
+  Alignment getAlignment() const { return Align; }
   bool isNull() const { return Type == nullptr; }
+  bool isForwardDecl() const { return FragmentStorageType == nullptr; }
+  bool isMetadataType() const { return IsMetadataType; }
+  bool hasDefaultAlignment() const { return DefaultAlignment; }
+  bool isFixedBuffer() const { return IsFixedBuffer; }
+  std::optional<uint32_t> getNumExtraInhabitants() const {
+    return NumExtraInhabitants;
+  }
+
   bool operator==(DebugTypeInfo T) const;
   bool operator!=(DebugTypeInfo T) const;
-
-  void dump() const;
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  LLVM_DUMP_METHOD void dump() const;
+#endif
 };
+
+/// A DebugTypeInfo with a defined size (that may be 0).
+class CompletedDebugTypeInfo : public DebugTypeInfo {
+  Size::int_type SizeInBits;
+
+  CompletedDebugTypeInfo(DebugTypeInfo DbgTy, Size::int_type SizeInBits)
+    : DebugTypeInfo(DbgTy), SizeInBits(SizeInBits) {}
+
+public:
+  static std::optional<CompletedDebugTypeInfo>
+  get(DebugTypeInfo DbgTy, std::optional<Size::int_type> SizeInBits) {
+    if (!SizeInBits)
+      return {};
+    return CompletedDebugTypeInfo(DbgTy, *SizeInBits);
+  }
+
+  static std::optional<CompletedDebugTypeInfo>
+  getFromTypeInfo(swift::Type Ty, const TypeInfo &Info, IRGenModule &IGM);
+
+  Size::int_type getSizeInBits() const { return SizeInBits; }
+};
+
 }
 }
 
@@ -121,9 +151,8 @@ template <> struct DenseMapInfo<swift::irgen::DebugTypeInfo> {
   }
   static swift::irgen::DebugTypeInfo getTombstoneKey() {
     return swift::irgen::DebugTypeInfo(
-        nullptr, nullptr,
         llvm::DenseMapInfo<swift::TypeBase *>::getTombstoneKey(), nullptr,
-        swift::irgen::Size(0), swift::irgen::Alignment(0), false);
+        swift::irgen::Alignment(), /* HasDefaultAlignment = */ false);
   }
   static unsigned getHashValue(swift::irgen::DebugTypeInfo Val) {
     return DenseMapInfo<swift::CanType>::getHashValue(Val.getType());

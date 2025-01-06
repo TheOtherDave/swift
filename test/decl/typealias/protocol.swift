@@ -143,14 +143,15 @@ protocol P3 {
 }
 
 // Test for not crashing on recursive aliases
+// FIXME: Nonsense redundant requirement warnings
 protocol Circular {
-  typealias Y = Self.Y // expected-error {{type alias 'Y' is not a member type of 'Self'}}
+  typealias Y = Self.Y // expected-error {{type alias 'Y' references itself}} expected-note {{while resolving type 'Self.Y'}}
 
-  typealias Y2 = Y2 // expected-error {{type alias 'Y2' references itself}}
-  // expected-note@-1 {{type declared here}}
+  typealias Y2 = Y2 // expected-error {{type alias 'Y2' references itself}} expected-note {{while resolving type 'Y2'}}
 
-  typealias Y3 = Y4 // expected-note {{type declared here}}
-  typealias Y4 = Y3 // expected-error {{type alias 'Y3' references itself}}
+  typealias Y3 = Y4 // expected-error {{type alias 'Y3' references itself}} expected-note {{while resolving type 'Y4'}}
+
+  typealias Y4 = Y3 // expected-note {{through reference here}} expected-note {{while resolving type 'Y3'}}
 }
 
 // Qualified and unqualified references to protocol typealiases from concrete type
@@ -172,8 +173,8 @@ struct T5 : P5 {
   var a: P5.T1 // OK
 
   // Invalid -- cannot represent associated type of existential
-  var v2: P5.T2 // expected-error {{type alias 'T2' can only be used with a concrete type or generic parameter base}}
-  var v3: P5.X // expected-error {{type alias 'X' can only be used with a concrete type or generic parameter base}}
+  var v2: P5.T2 // expected-error {{cannot access type alias 'T2' from 'P5'; use a concrete type or generic parameter base instead}}
+  var v3: P5.X // expected-error {{cannot access type alias 'X' from 'P5'; use a concrete type or generic parameter base instead}}
 
   // Unqualified reference to typealias from a protocol conformance
   var v4: T1 // OK
@@ -184,7 +185,20 @@ struct T5 : P5 {
   var v7: T5.T2 // OK
 
   var v8 = P6.A.self
-  var v9 = P6.B.self // expected-error {{type alias 'B' can only be used with a concrete type or generic parameter base}}
+  var v9 = P6.B.self // expected-error {{cannot access type alias 'B' from 'P6'; use a concrete type or generic parameter base instead}}
+
+  var v10 = (any P6).A.self
+  var v11 = (any P6).B.self // expected-error {{cannot access type alias 'B' from 'any P6'; use a concrete type or generic parameter base instead}}
+
+  struct Generic<T> {
+    func okay(value: T.A) where T == any P6 {}
+
+    func invalid1(value: T.B) where T == any P6 {}
+    // expected-error@-1 {{cannot access type alias 'B' from 'any P6'; use a concrete type or generic parameter base instead}}
+
+    func invalid2(value: T.A) where T == any P5 {}
+    // expected-error@-1 {{cannot access associated type 'A' from 'any P5'; use a concrete type or generic parameter base instead}}
+  }
 }
 
 // Unqualified lookup finds typealiases in protocol extensions
@@ -245,3 +259,72 @@ struct CandyEdible : Edible {
 // Edible.Snack is witnessed by 'typealias Snack' inside the
 // constrained extension of CandyWrapper above
 extension CandyBar : Edible {}
+
+protocol P9 {
+  typealias A = Int
+}
+
+func testT9a<T: P9, U>(_: T, _: U) where T.A == U { } // expected-warning {{same-type requirement makes generic parameter 'U' non-generic}}
+func testT9b<T: P9>(_: T) where T.A == Float { } // expected-error{{no type for 'T.A' can satisfy both 'T.A == Int' and 'T.A == Float'}}
+
+
+struct X<T> { }
+
+protocol P10 {
+  associatedtype A
+  typealias T = Int
+
+  @available(*, deprecated, message: "just use Int, silly")
+  typealias V = Int
+
+  // FIXME: This used to be in a protocol extension, but the Requirement Machine does
+  // not permit `where` clauses to reference typealiases in protocol extensions.
+  typealias U = Float
+}
+
+extension P10 where T == Int { }
+
+extension P10 where A == X<T> { }
+
+extension P10 where A == X<U> { }
+
+extension P10 where A == X<Self.U> { }
+
+extension P10 where V == Int { } // expected-warning {{'V' is deprecated: just use Int, silly}}
+
+// rdar://problem/36003312
+protocol P11 {
+  typealias A = Y11
+}
+
+struct X11<T: P11> { }
+struct Y11: P11 { }
+
+extension P11 {
+  func foo(_: X11<Self.A>) { }
+}
+
+// Ordering issue
+struct SomeConformingType : UnboundGenericAliasProto {
+  func f(_: G<Int>) {}
+}
+
+protocol UnboundGenericAliasProto {
+  typealias G = X
+}
+
+// If pre-checking cannot resolve a member type due to ambiguity,
+// we go down the usual member access path. Make sure its correct
+// for protocol typealiases.
+protocol Amb1 {
+  typealias T = Int
+}
+
+protocol Amb2 {
+  typealias T = String
+}
+
+typealias Amb = Amb1 & Amb2
+
+let _: Int.Type = Amb.T.self
+let _: String.Type = Amb.T.self

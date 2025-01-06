@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -11,27 +11,43 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "silgen"
+
+#include "ManagedValue.h"
+#include "RValue.h"
 #include "SILGenFunction.h"
+#include "SILGenFunctionBuilder.h"
+#include "SILGenTopLevel.h"
 #include "Scope.h"
-#include "swift/Strings.h"
+#include "swift/AST/ConformanceLookup.h"
+#include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticsSIL.h"
+#include "swift/AST/Evaluator.h"
+#include "swift/AST/GenericEnvironment.h"
+#include "swift/AST/Initializer.h"
 #include "swift/AST/NameLookup.h"
+#include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/PrettyStackTrace.h"
+#include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/ResilienceExpansion.h"
-#include "swift/Basic/Timer.h"
+#include "swift/AST/SILGenRequests.h"
+#include "swift/AST/SourceFile.h"
+#include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
+#include "swift/Basic/Statistic.h"
 #include "swift/ClangImporter/ClangModule.h"
-#include "swift/Serialization/SerializedModuleLoader.h"
-#include "swift/Serialization/SerializedSILLoader.h"
+#include "swift/Frontend/Frontend.h"
 #include "swift/SIL/PrettyStackTrace.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILDebugScope.h"
+#include "swift/SIL/SILProfiler.h"
+#include "swift/Serialization/SerializedModuleLoader.h"
+#include "swift/Serialization/SerializedSILLoader.h"
+#include "swift/Strings.h"
 #include "swift/Subsystems.h"
 #include "llvm/ProfileData/InstrProfReader.h"
 #include "llvm/Support/Debug.h"
-#include "ManagedValue.h"
-#include "RValue.h"
 using namespace swift;
 using namespace Lowering;
 
@@ -40,50 +56,58 @@ using namespace Lowering;
 //===----------------------------------------------------------------------===//
 
 SILGenModule::SILGenModule(SILModule &M, ModuleDecl *SM)
-  : M(M), Types(M.Types), SwiftModule(SM), TopLevelSGF(nullptr),
-    Profiler(nullptr) {
-  SILOptions &Opts = M.getOptions();
+    : M(M), Types(M.Types), SwiftModule(SM),
+      FileIDsByFilePath(SM->computeFileIDMap(/*shouldDiagnose=*/true)) {
+  const SILOptions &Opts = M.getOptions();
   if (!Opts.UseProfile.empty()) {
-    auto ReaderOrErr = llvm::IndexedInstrProfReader::create(Opts.UseProfile);
+    // FIXME: Create file system to read the profile. In the future, the vfs
+    // needs to come from CompilerInstance.
+    auto FS = llvm::vfs::getRealFileSystem();
+    auto ReaderOrErr =
+        llvm::IndexedInstrProfReader::create(Opts.UseProfile, *FS);
     if (auto E = ReaderOrErr.takeError()) {
       diagnose(SourceLoc(), diag::profile_read_error, Opts.UseProfile,
                llvm::toString(std::move(E)));
-      Opts.UseProfile.erase();
+    } else {
+      M.setPGOReader(std::move(ReaderOrErr.get()));
     }
-    PGOReader = std::move(ReaderOrErr.get());
   }
 }
 
 SILGenModule::~SILGenModule() {
-  assert(!TopLevelSGF && "active source file lowering!?");
-  M.verify();
-}
 
-EnumElementDecl *SILGenModule::getLoweredEnumElementDecl(EnumElementDecl *elt) {
-  auto &ctx = getASTContext();
-  if (elt->getParentEnum()->classifyAsOptionalType()
-        != OTK_ImplicitlyUnwrappedOptional)
-    return elt;
-
-  if (elt == ctx.getImplicitlyUnwrappedOptionalSomeDecl()) {
-    return ctx.getOptionalSomeDecl();
-  } else {
-    assert(elt == ctx.getImplicitlyUnwrappedOptionalNoneDecl());
-    return ctx.getOptionalNoneDecl();
+  // Update the linkage of external private functions to public_external,
+  // because there is no private_external linkage. External private functions
+  // can occur in the following cases:
+  //
+  // * private class methods which are referenced from the vtable of a derived
+  //   class  in a different file/module. Such private methods are always
+  //   generated with public linkage in the other file/module.
+  //
+  // * in lldb: lldb can access private declarations in other files/modules
+  //
+  // * private functions with a @_silgen_name attribute but without a body
+  //
+  // * when compiling with -disable-access-control
+  //
+  for (SILFunction &f : M.getFunctionList()) {
+    if (f.getLinkage() == SILLinkage::Private && f.isExternalDeclaration())
+      f.setLinkage(SILLinkage::PublicExternal);
   }
+
+  // Skip verification if a lazy typechecking error occurred.
+  auto &ctx = getASTContext();
+  if (ctx.TypeCheckerOpts.EnableLazyTypecheck && ctx.hadError())
+    return;
+
+  M.verifyIncompleteOSSA();
 }
 
-static SILDeclRef
-getBridgingFn(Optional<SILDeclRef> &cacheSlot,
-              SILGenModule &SGM,
-              Identifier moduleName,
-              StringRef functionName,
-              Optional<std::initializer_list<Type>> inputTypes,
-              Optional<Type> outputType) {
-  // FIXME: the optionality of outputType and the presence of trustInputTypes
-  // are hacks for cases where coming up with those types is complicated, i.e.,
-  // when dealing with generic bridging functions.
-
+static SILDeclRef getBridgingFn(std::optional<SILDeclRef> &cacheSlot,
+                                SILGenModule &SGM, Identifier moduleName,
+                                StringRef functionName,
+                                std::initializer_list<Type> inputTypes,
+                                Type outputType) {
   if (!cacheSlot) {
     ASTContext &ctx = SGM.M.getASTContext();
     ModuleDecl *mod = ctx.getLoadedModule(moduleName);
@@ -94,7 +118,7 @@ getBridgingFn(Optional<SILDeclRef> &cacheSlot,
     }
 
     SmallVector<ValueDecl *, 2> decls;
-    mod->lookupValue(/*AccessPath=*/{}, ctx.getIdentifier(functionName),
+    mod->lookupValue(ctx.getIdentifier(functionName),
                      NLKind::QualifiedLookup, decls);
     if (decls.empty()) {
       SGM.diagnose(SourceLoc(), diag::bridging_function_missing,
@@ -114,30 +138,31 @@ getBridgingFn(Optional<SILDeclRef> &cacheSlot,
       llvm::report_fatal_error("unable to set up the ObjC bridge!");
     }
 
-    assert(fd->hasInterfaceType() && "bridging functions must be type-checked");
-
     // Check that the function takes the expected arguments and returns the
     // expected result type.
     SILDeclRef c(fd);
-    auto funcInfo = SGM.getConstantType(c).castTo<SILFunctionType>();
-    SILFunctionConventions fnConv(funcInfo, SGM.M);
+    auto funcTy =
+        SGM.Types.getConstantFunctionType(TypeExpansionContext::minimal(), c);
+    SILFunctionConventions fnConv(funcTy, SGM.M);
 
-    if (inputTypes) {
-      auto toSILType = [&SGM](Type ty) { return SGM.getLoweredType(ty); };
-      if (fnConv.hasIndirectSILResults()
-          || funcInfo->getNumParameters() != inputTypes->size()
-          || !std::equal(
-                 fnConv.getParameterSILTypes().begin(),
-                 fnConv.getParameterSILTypes().end(),
-                 makeTransformIterator(inputTypes->begin(), toSILType))) {
-        SGM.diagnose(fd->getLoc(), diag::bridging_function_not_correct_type,
-                     moduleName.str(), functionName);
-        llvm::report_fatal_error("unable to set up the ObjC bridge!");
-      }
+    auto toSILType = [&SGM](Type ty) {
+      return SGM.Types.getLoweredType(ty, TypeExpansionContext::minimal());
+    };
+
+    if (fnConv.hasIndirectSILResults() ||
+        funcTy->getNumParameters() != inputTypes.size() ||
+        !std::equal(
+            fnConv.getParameterSILTypes(TypeExpansionContext::minimal())
+                .begin(),
+            fnConv.getParameterSILTypes(TypeExpansionContext::minimal()).end(),
+            makeTransformIterator(inputTypes.begin(), toSILType))) {
+      SGM.diagnose(fd->getLoc(), diag::bridging_function_not_correct_type,
+                   moduleName.str(), functionName);
+      llvm::report_fatal_error("unable to set up the ObjC bridge!");
     }
 
-    if (outputType
-        && fnConv.getSingleSILResultType() != SGM.getLoweredType(*outputType)) {
+    if (fnConv.getSingleSILResultType(TypeExpansionContext::minimal()) !=
+        toSILType(outputType)) {
       SGM.diagnose(fd->getLoc(), diag::bridging_function_not_correct_type,
                    moduleName.str(), functionName);
       llvm::report_fatal_error("unable to set up the ObjC bridge!");
@@ -146,24 +171,24 @@ getBridgingFn(Optional<SILDeclRef> &cacheSlot,
     cacheSlot = c;
   }
 
-  DEBUG(llvm::dbgs() << "bridging function "
-          << moduleName << '.' << functionName
-          << " mapped to ";
-        cacheSlot->print(llvm::dbgs()));
+  LLVM_DEBUG(llvm::dbgs() << "bridging function "
+                          << moduleName << '.' << functionName
+                          << " mapped to ";
+             cacheSlot->print(llvm::dbgs()));
 
   return *cacheSlot;
 }
 
-#define REQUIRED(X) { Types.get##X##Type() }
-#define OPTIONAL(X) { OptionalType::get(Types.get##X##Type()) }
-#define GENERIC(X) None
+#define REQUIRED(X) Types.get##X##Type()
+#define OPTIONAL(X) OptionalType::get(Types.get##X##Type())
+#define EXISTENTIAL(X) getASTContext().get##X##ExistentialType()
 
 #define GET_BRIDGING_FN(Module, FromKind, FromTy, ToKind, ToTy) \
   SILDeclRef SILGenModule::get##FromTy##To##ToTy##Fn() { \
     return getBridgingFn(FromTy##To##ToTy##Fn, *this, \
                          getASTContext().Id_##Module, \
                          "_convert" #FromTy "To" #ToTy, \
-                         FromKind(FromTy), \
+                         { FromKind(FromTy) }, \
                          ToKind(ToTy)); \
   }
 
@@ -171,13 +196,14 @@ GET_BRIDGING_FN(Darwin, REQUIRED, Bool, REQUIRED, DarwinBoolean)
 GET_BRIDGING_FN(Darwin, REQUIRED, DarwinBoolean, REQUIRED, Bool)
 GET_BRIDGING_FN(ObjectiveC, REQUIRED, Bool, REQUIRED, ObjCBool)
 GET_BRIDGING_FN(ObjectiveC, REQUIRED, ObjCBool, REQUIRED, Bool)
-GET_BRIDGING_FN(Foundation, OPTIONAL, NSError, REQUIRED, Error)
-GET_BRIDGING_FN(Foundation, REQUIRED, Error, REQUIRED, NSError)
+GET_BRIDGING_FN(Foundation, OPTIONAL, NSError, EXISTENTIAL, Error)
+GET_BRIDGING_FN(Foundation, EXISTENTIAL, Error, REQUIRED, NSError)
+GET_BRIDGING_FN(WinSDK, REQUIRED, Bool, REQUIRED, WindowsBool)
+GET_BRIDGING_FN(WinSDK, REQUIRED, WindowsBool, REQUIRED, Bool)
 
 #undef GET_BRIDGING_FN
 #undef REQUIRED
 #undef OPTIONAL
-#undef GENERIC
 
 static FuncDecl *diagnoseMissingIntrinsic(SILGenModule &sgm,
                                           SILLocation loc,
@@ -189,11 +215,22 @@ static FuncDecl *diagnoseMissingIntrinsic(SILGenModule &sgm,
 
 #define FUNC_DECL(NAME, ID)                             \
   FuncDecl *SILGenModule::get##NAME(SILLocation loc) {  \
-    if (auto fn = getASTContext().get##NAME(nullptr))   \
+    if (auto fn = getASTContext().get##NAME())          \
       return fn;                                        \
     return diagnoseMissingIntrinsic(*this, loc, ID);    \
   }
 #include "swift/AST/KnownDecls.def"
+
+#define KNOWN_SDK_FUNC_DECL(MODULE, NAME, ID)                                  \
+  FuncDecl *SILGenModule::get##NAME(SILLocation loc) {                         \
+    if (ModuleDecl *M = getASTContext().getLoadedModule(                       \
+            getASTContext().Id_##MODULE)) {                                    \
+      if (auto fn = getASTContext().get##NAME())                               \
+        return fn;                                                             \
+    }                                                                          \
+    return diagnoseMissingIntrinsic(*this, loc, ID);                           \
+  }
+#include "swift/AST/KnownSDKDecls.def"
 
 ProtocolDecl *SILGenModule::getObjectiveCBridgeable(SILLocation loc) {
   if (ObjectiveCBridgeable)
@@ -222,14 +259,9 @@ FuncDecl *SILGenModule::getBridgeToObjectiveCRequirement(SILLocation loc) {
 
   // Look for _bridgeToObjectiveC().
   auto &ctx = getASTContext();
-  FuncDecl *found = nullptr;
   DeclName name(ctx, ctx.Id_bridgeToObjectiveC, llvm::ArrayRef<Identifier>());
-  for (auto member : proto->lookupDirect(name, true)) {
-    if (auto func = dyn_cast<FuncDecl>(member)) {
-      found = func;
-      break;
-    }
-  }
+  auto *found = dyn_cast_or_null<FuncDecl>(
+    proto->getSingleRequirement(name));
 
   if (!found)
     diagnose(loc, diag::bridging_objcbridgeable_broken, name);
@@ -252,15 +284,10 @@ FuncDecl *SILGenModule::getUnconditionallyBridgeFromObjectiveCRequirement(
 
   // Look for _bridgeToObjectiveC().
   auto &ctx = getASTContext();
-  FuncDecl *found = nullptr;
   DeclName name(ctx, ctx.getIdentifier("_unconditionallyBridgeFromObjectiveC"),
-                llvm::makeArrayRef(Identifier()));
-  for (auto member : proto->lookupDirect(name, true)) {
-    if (auto func = dyn_cast<FuncDecl>(member)) {
-      found = func;
-      break;
-    }
-  }
+                llvm::ArrayRef(Identifier()));
+  auto *found = dyn_cast_or_null<FuncDecl>(
+    proto->getSingleRequirement(name));
 
   if (!found)
     diagnose(loc, diag::bridging_objcbridgeable_broken, name);
@@ -283,17 +310,9 @@ SILGenModule::getBridgedObjectiveCTypeRequirement(SILLocation loc) {
 
   // Look for _bridgeToObjectiveC().
   auto &ctx = getASTContext();
-  AssociatedTypeDecl *found = nullptr;
-  DeclName name(ctx.Id_ObjectiveCType);
-  for (auto member : proto->lookupDirect(name, true)) {
-    if (auto assocType = dyn_cast<AssociatedTypeDecl>(member)) {
-      found = assocType;
-      break;
-    }
-  }
-
+  auto *found = proto->getAssociatedType(ctx.Id_ObjectiveCType);
   if (!found)
-    diagnose(loc, diag::bridging_objcbridgeable_broken, name);
+    diagnose(loc, diag::bridging_objcbridgeable_broken, ctx.Id_ObjectiveCType);
 
   BridgedObjectiveCType = found;
   return found;
@@ -305,9 +324,11 @@ SILGenModule::getConformanceToObjectiveCBridgeable(SILLocation loc, Type type) {
   if (!proto) return nullptr;
 
   // Find the conformance to _ObjectiveCBridgeable.
-  auto result = SwiftModule->lookupConformance(type, proto);
-  if (result) return result->getConcrete();
-  return nullptr;
+  auto result = lookupConformance(type, proto);
+  if (result.isInvalid())
+    return nullptr;
+
+  return result.getConcrete();
 }
 
 ProtocolDecl *SILGenModule::getBridgedStoredNSError(SILLocation loc) {
@@ -334,25 +355,157 @@ VarDecl *SILGenModule::getNSErrorRequirement(SILLocation loc) {
 
   // Look for _nsError.
   auto &ctx = getASTContext();
-  VarDecl *found = nullptr;
-  for (auto member : proto->lookupDirect(ctx.Id_nsError, true)) {
-    if (auto var = dyn_cast<VarDecl>(member)) {
-      found = var;
-      break;
-    }
-  }
+  auto *found = dyn_cast_or_null<VarDecl>(
+      proto->getSingleRequirement(ctx.Id_nsError));
 
   NSErrorRequirement = found;
   return found;
 }
 
-Optional<ProtocolConformanceRef>
+ProtocolConformanceRef
 SILGenModule::getConformanceToBridgedStoredNSError(SILLocation loc, Type type) {
   auto proto = getBridgedStoredNSError(loc);
-  if (!proto) return None;
+  if (!proto)
+    return ProtocolConformanceRef::forInvalid();
 
   // Find the conformance to _BridgedStoredNSError.
-  return SwiftModule->lookupConformance(type, proto);
+  return lookupConformance(type, proto);
+}
+
+static FuncDecl *lookupConcurrencyIntrinsic(ASTContext &C, StringRef name) {
+  auto *module = C.getLoadedModule(C.Id_Concurrency);
+  if (!module)
+    return nullptr;
+
+  return evaluateOrDefault(
+      C.evaluator, LookupIntrinsicRequest{module, C.getIdentifier(name)},
+      /*default=*/nullptr);
+}
+
+FuncDecl *SILGenModule::getAsyncLetStart() {
+  return lookupConcurrencyIntrinsic(getASTContext(), "_asyncLetStart");
+}
+
+FuncDecl *SILGenModule::getAsyncLetGet() {
+  return lookupConcurrencyIntrinsic(getASTContext(), "_asyncLet_get");
+}
+
+FuncDecl *SILGenModule::getAsyncLetGetThrowing() {
+  return lookupConcurrencyIntrinsic(getASTContext(), "_asyncLet_get_throwing");
+}
+
+FuncDecl *SILGenModule::getFinishAsyncLet() {
+  return lookupConcurrencyIntrinsic(getASTContext(), "_asyncLet_finish");
+}
+
+FuncDecl *SILGenModule::getTaskFutureGet() {
+  return lookupConcurrencyIntrinsic(getASTContext(), "_taskFutureGet");
+}
+
+FuncDecl *SILGenModule::getTaskFutureGetThrowing() {
+  return lookupConcurrencyIntrinsic(getASTContext(), "_taskFutureGetThrowing");
+}
+
+FuncDecl *SILGenModule::getResumeUnsafeContinuation() {
+  return lookupConcurrencyIntrinsic(getASTContext(),
+                                    "_resumeUnsafeContinuation");
+}
+FuncDecl *SILGenModule::getResumeUnsafeThrowingContinuation() {
+  return lookupConcurrencyIntrinsic(getASTContext(),
+                                    "_resumeUnsafeThrowingContinuation");
+}
+FuncDecl *SILGenModule::getResumeUnsafeThrowingContinuationWithError() {
+  return lookupConcurrencyIntrinsic(
+      getASTContext(), "_resumeUnsafeThrowingContinuationWithError");
+}
+FuncDecl *SILGenModule::getRunTaskForBridgedAsyncMethod() {
+  return lookupConcurrencyIntrinsic(getASTContext(),
+                                    "_runTaskForBridgedAsyncMethod");
+}
+FuncDecl *SILGenModule::getCheckExpectedExecutor() {
+  return lookupConcurrencyIntrinsic(getASTContext(), "_checkExpectedExecutor");
+}
+
+FuncDecl *SILGenModule::getCreateCheckedContinuation() {
+  return lookupConcurrencyIntrinsic(getASTContext(),
+                                    "_createCheckedContinuation");
+}
+FuncDecl *SILGenModule::getCreateCheckedThrowingContinuation() {
+  return lookupConcurrencyIntrinsic(getASTContext(),
+                                    "_createCheckedThrowingContinuation");
+}
+FuncDecl *SILGenModule::getResumeCheckedContinuation() {
+  return lookupConcurrencyIntrinsic(getASTContext(),
+                                    "_resumeCheckedContinuation");
+}
+FuncDecl *SILGenModule::getResumeCheckedThrowingContinuation() {
+  return lookupConcurrencyIntrinsic(getASTContext(),
+                                    "_resumeCheckedThrowingContinuation");
+}
+FuncDecl *SILGenModule::getResumeCheckedThrowingContinuationWithError() {
+  return lookupConcurrencyIntrinsic(
+      getASTContext(), "_resumeCheckedThrowingContinuationWithError");
+}
+
+FuncDecl *SILGenModule::getAsyncMainDrainQueue() {
+  return lookupConcurrencyIntrinsic(getASTContext(), "_asyncMainDrainQueue");
+}
+
+FuncDecl *SILGenModule::getSwiftJobRun() {
+  return lookupConcurrencyIntrinsic(getASTContext(), "_swiftJobRun");
+}
+
+FuncDecl *SILGenModule::getDeinitOnExecutor() {
+  return lookupConcurrencyIntrinsic(getASTContext(), "_deinitOnExecutor");
+}
+
+FuncDecl *SILGenModule::getExit() {
+  ASTContext &C = getASTContext();
+
+  // Try the most likely modules.
+  Identifier mostLikelyIdentifier;
+  const llvm::Triple &triple = C.LangOpts.Target;
+  if (triple.isOSDarwin()) {
+    mostLikelyIdentifier = C.getIdentifier("Darwin");
+  } else if (triple.isOSWASI()) {
+    mostLikelyIdentifier = C.getIdentifier("SwiftWASILibc");
+  } else if (triple.isWindowsMSVCEnvironment()) {
+    mostLikelyIdentifier = C.getIdentifier("ucrt");
+  } else {
+    mostLikelyIdentifier = C.getIdentifier("SwiftGlibc");
+  }
+  ModuleDecl *exitModule = C.getModuleByIdentifier(mostLikelyIdentifier);
+  FuncDecl *exitFunction = nullptr;
+  if (exitModule) {
+    exitFunction = evaluateOrDefault(
+        C.evaluator,
+        LookupIntrinsicRequest{exitModule, C.getIdentifier("exit")},
+        /*default=*/nullptr);
+  }
+
+  if (!exitFunction) {
+    // No go, look for it in any loaded module. Several of the internal
+    // Swift modules or swift-corelibs modules may have absorbed <stdlib.h>
+    // when buliding without fully specified clang modules in the OS/SDK.
+    for (const auto &loadedModuleVector : C.getLoadedModules()) {
+      if (loadedModuleVector.first == mostLikelyIdentifier) {
+        continue;
+      }
+
+      ModuleDecl *loadedModule = loadedModuleVector.second;
+      if (loadedModule) {
+        exitFunction = evaluateOrDefault(
+            C.evaluator,
+            LookupIntrinsicRequest{loadedModule, C.getIdentifier("exit")},
+            /*default=*/nullptr);
+      }
+      if (exitFunction) {
+        break;
+      }
+    }
+  }
+
+  return exitFunction;
 }
 
 ProtocolConformance *SILGenModule::getNSErrorConformanceToError() {
@@ -360,8 +513,8 @@ ProtocolConformance *SILGenModule::getNSErrorConformanceToError() {
     return *NSErrorConformanceToError;
 
   auto &ctx = getASTContext();
-  auto nsError = ctx.getNSErrorDecl();
-  if (!nsError) {
+  auto nsErrorTy = ctx.getNSErrorType();
+  if (!nsErrorTy) {
     NSErrorConformanceToError = nullptr;
     return nullptr;
   }
@@ -372,82 +525,92 @@ ProtocolConformance *SILGenModule::getNSErrorConformanceToError() {
     return nullptr;
   }
 
-  auto conformance =
-    SwiftModule->lookupConformance(nsError->getDeclaredInterfaceType(),
-                                   cast<ProtocolDecl>(error));
+  auto conformance = lookupConformance(nsErrorTy, cast<ProtocolDecl>(error));
 
-  if (conformance && conformance->isConcrete())
-    NSErrorConformanceToError = conformance->getConcrete();
+  if (conformance.isConcrete())
+    NSErrorConformanceToError = conformance.getConcrete();
   else
     NSErrorConformanceToError = nullptr;
   return *NSErrorConformanceToError;
 }
 
-
-SILFunction *SILGenModule::emitTopLevelFunction(SILLocation Loc) {
-  ASTContext &C = M.getASTContext();
-  auto extInfo = SILFunctionType::ExtInfo()
-    .withRepresentation(SILFunctionType::Representation::CFunctionPointer);
-
-  auto findStdlibDecl = [&](StringRef name) -> ValueDecl* {
-    if (!getASTContext().getStdlibModule())
-      return nullptr;
-    SmallVector<ValueDecl*, 1> lookupBuffer;
-    getASTContext().getStdlibModule()->lookupValue({},
-                                       getASTContext().getIdentifier(name),
-                                       NLKind::QualifiedLookup,
-                                       lookupBuffer);
-    if (lookupBuffer.size() == 1)
-      return lookupBuffer[0];
-    return nullptr;
-  };
-
-  // Use standard library types if we have them; otherwise, fall back to
-  // builtins.
-  CanType Int32Ty;
-  if (auto Int32Decl = dyn_cast_or_null<TypeDecl>(findStdlibDecl("Int32"))) {
-    Int32Ty = Int32Decl->getDeclaredInterfaceType()->getCanonicalType();
+SILFunction *
+SILGenModule::getKeyPathProjectionCoroutine(bool isReadAccess,
+                                            KeyPathTypeKind typeKind) {
+  bool isBaseInout;
+  bool isResultInout;
+  StringRef functionName;
+  NominalTypeDecl *keyPathDecl;
+  if (isReadAccess) {
+    assert(typeKind == KPTK_KeyPath ||
+           typeKind == KPTK_WritableKeyPath ||
+           typeKind == KPTK_ReferenceWritableKeyPath);
+    functionName = "swift_readAtKeyPath";
+    isBaseInout = false;
+    isResultInout = false;
+    keyPathDecl = getASTContext().getKeyPathDecl();
+  } else if (typeKind == KPTK_WritableKeyPath) {
+    functionName = "swift_modifyAtWritableKeyPath";
+    isBaseInout = true;
+    isResultInout = true;
+    keyPathDecl = getASTContext().getWritableKeyPathDecl();
+  } else if (typeKind == KPTK_ReferenceWritableKeyPath) {
+    functionName = "swift_modifyAtReferenceWritableKeyPath";
+    isBaseInout = false;
+    isResultInout = true;
+    keyPathDecl = getASTContext().getReferenceWritableKeyPathDecl();
   } else {
-    Int32Ty = CanType(BuiltinIntegerType::get(32, C));
+    llvm_unreachable("bad combination");
   }
 
-  CanType PtrPtrInt8Ty = C.TheRawPointerType;
-  if (auto PointerDecl = C.getUnsafeMutablePointerDecl()) {
-    if (auto Int8Decl = cast<TypeDecl>(findStdlibDecl("Int8"))) {
-      Type Int8Ty = Int8Decl->getDeclaredInterfaceType();
-      Type PointerInt8Ty = BoundGenericType::get(PointerDecl,
-                                                 nullptr,
-                                                 Int8Ty);
-      Type OptPointerInt8Ty = OptionalType::get(PointerInt8Ty);
-      PtrPtrInt8Ty = BoundGenericType::get(PointerDecl,
-                                           nullptr,
-                                           OptPointerInt8Ty)
-        ->getCanonicalType();
-    }
-  }
+  auto fn = M.lookUpFunction(functionName);
+  if (fn) return fn;
 
+  auto sig = keyPathDecl->getGenericSignature().getCanonicalSignature();
+  auto rootType = sig.getGenericParams()[0]->getCanonicalType();
+  auto valueType = sig.getGenericParams()[1]->getCanonicalType();
+
+  auto keyPathTy = BoundGenericType::get(keyPathDecl, Type(),
+                                         { rootType, valueType })
+    ->getCanonicalType();
+
+  // (@in_guaranteed/@inout Root, @guaranteed KeyPath<Root, Value>)
   SILParameterInfo params[] = {
-    SILParameterInfo(Int32Ty, ParameterConvention::Direct_Unowned),
-    SILParameterInfo(PtrPtrInt8Ty, ParameterConvention::Direct_Unowned),
+    { rootType,
+      isBaseInout ? ParameterConvention::Indirect_Inout
+                  : ParameterConvention::Indirect_In_Guaranteed },
+    { keyPathTy, ParameterConvention::Direct_Guaranteed },
   };
 
-  CanSILFunctionType topLevelType = SILFunctionType::get(nullptr, extInfo,
-                                   SILCoroutineKind::None,
-                                   ParameterConvention::Direct_Unowned,
-                                   params, /*yields*/ {},
-                                   SILResultInfo(Int32Ty,
-                                                 ResultConvention::Unowned),
-                                   None,
-                                   C);
+  // -> @yields @in_guaranteed/@inout Value
+  SILYieldInfo yields[] = {
+    { valueType,
+      isResultInout ? ParameterConvention::Indirect_Inout
+                    : ParameterConvention::Indirect_In_Guaranteed },
+  };
 
-  return M.createFunction(SILLinkage::Public, SWIFT_ENTRY_POINT_FUNCTION,
-                          topLevelType, nullptr, Loc, IsBare, IsNotTransparent,
-                          IsNotSerialized, ProfileCounter(), IsNotThunk,
-                          SubclassScope::NotApplicable);
-}
+  auto extInfo = SILFunctionType::ExtInfo::getThin();
 
-SILType SILGenModule::getConstantType(SILDeclRef constant) {
-  return Types.getConstantType(constant);
+  auto functionTy = SILFunctionType::get(sig, extInfo,
+                                         SILCoroutineKind::YieldOnce,
+                                         ParameterConvention::Direct_Unowned,
+                                         params,
+                                         yields,
+                                         /*results*/ {},
+                                         /*error result*/ {},
+                                         SubstitutionMap(),
+                                         SubstitutionMap(),
+                                         getASTContext());
+
+  auto env = sig.getGenericEnvironment();
+
+  SILGenFunctionBuilder builder(*this);
+  fn = builder.createFunction(
+      SILLinkage::PublicExternal, functionName, functionTy, env,
+      /*location*/ std::nullopt, IsNotBare, IsNotTransparent, IsNotSerialized,
+      IsNotDynamic, IsNotDistributed, IsNotRuntimeAccessible);
+
+  return fn;
 }
 
 SILFunction *SILGenModule::getEmittedFunction(SILDeclRef constant,
@@ -482,7 +645,7 @@ static SILFunction *getFunctionToInsertAfter(SILGenModule &SGM,
     // be inserted after.
     auto foundDelayed = SGM.delayedFunctions.find(insertAfter);
     if (foundDelayed != SGM.delayedFunctions.end()) {
-      insertAfter = foundDelayed->second.insertAfter;
+      insertAfter = foundDelayed->second;
     } else {
       break;
     }
@@ -492,51 +655,156 @@ static SILFunction *getFunctionToInsertAfter(SILGenModule &SGM,
   return nullptr;
 }
 
-static bool hasSILBody(FuncDecl *fd) {
-  if (fd->getAccessorKind() == AccessorKind::IsMaterializeForSet)
-    return !isa<ProtocolDecl>(fd->getDeclContext());
+static bool shouldEmitFunctionBody(const AbstractFunctionDecl *AFD) {
+  if (!AFD->hasBody())
+    return false;
 
-  return fd->getBody(/*canSynthesize=*/false);
+  if (AFD->isBodySkipped())
+    return false;
+
+  auto &ctx = AFD->getASTContext();
+  if (ctx.TypeCheckerOpts.EnableLazyTypecheck) {
+    // Force the function body to be type-checked and then skip it if there
+    // have been any errors.
+    (void)AFD->getTypecheckedBody();
+
+    // FIXME: Only skip bodies that contain type checking errors.
+    // It would be ideal to only skip the function body if it is specifically
+    // the source of an error. However, that information isn't available today
+    // so instead we avoid emitting all function bodies as soon as any error is
+    // encountered.
+    if (ctx.hadError())
+      return false;
+  }
+
+  return true;
+}
+
+static bool isEmittedOnDemand(SILModule &M, SILDeclRef constant) {
+  if (!constant.hasDecl())
+    return false;
+
+  if (constant.isForeign)
+    return false;
+
+  auto *d = constant.getDecl();
+  auto *dc = d->getDeclContext();
+
+  switch (constant.kind) {
+  case SILDeclRef::Kind::Func: {
+    auto *fd = cast<FuncDecl>(d);
+    if (!shouldEmitFunctionBody(fd))
+      return false;
+
+    if (isa<ClangModuleUnit>(dc->getModuleScopeContext()))
+      return true;
+
+    if (fd->hasForcedStaticDispatch())
+      return true;
+
+    break;
+  }
+  case SILDeclRef::Kind::Allocator: {
+    auto *cd = cast<ConstructorDecl>(d);
+    // For factories, we don't need to emit a special thunk; the normal
+    // foreign-to-native thunk is sufficient.
+    if (isa<ClangModuleUnit>(dc->getModuleScopeContext()) &&
+        !cd->isFactoryInit() &&
+        (dc->getSelfClassDecl() || shouldEmitFunctionBody(cd)))
+      return true;
+
+    break;
+  }
+  case SILDeclRef::Kind::EnumElement:
+    return true;
+  case SILDeclRef::Kind::DefaultArgGenerator: {
+    // Default arguments of C++ functions are only emitted if used.
+    if (isa<ClangModuleUnit>(dc->getModuleScopeContext()))
+      return true;
+
+    break;
+  }
+  default:
+    break;
+  }
+
+  return false;
+}
+
+static ActorIsolation getActorIsolationForFunction(SILFunction &fn) {
+  if (auto constant = fn.getDeclRef()) {
+    if (constant.kind == SILDeclRef::Kind::Deallocator) {
+      // Deallocating destructor is always nonisolated. Isolation of the deinit
+      // applies only to isolated deallocator and destroyer.
+      return ActorIsolation::forNonisolated(false);
+    }
+
+    // If we have actor isolation for our constant, put the isolation onto the
+    // function. If the isolation is unspecified, we do not return it.
+    if (auto isolation =
+            getActorIsolationOfContext(constant.getInnermostDeclContext()))
+      return isolation;
+  }
+
+  // Otherwise, return for unspecified.
+  return ActorIsolation::forUnspecified();
 }
 
 SILFunction *SILGenModule::getFunction(SILDeclRef constant,
                                        ForDefinition_t forDefinition) {
-  // If we already emitted the function, return it (potentially preparing it
-  // for definition).
+  // If we already emitted the function, return it.
   if (auto emitted = getEmittedFunction(constant, forDefinition))
     return emitted;
 
-  ProfileCounter count = ProfileCounter();
-  if (constant.hasDecl()) {
-    if (auto *fd = constant.getFuncDecl()) {
-      if (hasSILBody(fd)) {
-        count = loadProfilerCount(fd->getBody(/*canSynthesize=*/false));
-      }
-    }
-  }
+  auto getBestLocation = [](SILDeclRef ref) -> SILLocation {
+    if (ref.hasDecl())
+      return ref.getDecl();
+    if (ref.loc.isNull())
+      return {(Decl *)nullptr};
+    if (auto *ace = ref.getAbstractClosureExpr())
+      return {ace};
+    return {(Decl *)nullptr};
+  };
+
   // Note: Do not provide any SILLocation. You can set it afterwards.
-  auto *F = M.getOrCreateFunction(constant.hasDecl() ? constant.getDecl()
-                                                     : (Decl *)nullptr,
-                                  constant, forDefinition, count);
+  SILGenFunctionBuilder builder(*this);
+  auto &IGM = *this;
+  auto *F = builder.getOrCreateFunction(
+      getBestLocation(constant), constant, forDefinition,
+      [&IGM](SILLocation loc, SILDeclRef constant) -> SILFunction * {
+        return IGM.getFunction(constant, NotForDefinition);
+      });
+
+  F->setDeclRef(constant);
+  F->setActorIsolation(getActorIsolationForFunction(*F));
 
   assert(F && "SILFunction should have been defined");
 
   emittedFunctions[constant] = F;
 
-  // If we delayed emitting this function previously, we need it now.
   auto foundDelayed = delayedFunctions.find(constant);
+  if (foundDelayed == delayedFunctions.end()) {
+    if (isEmittedOnDemand(M, constant)) {
+      if (forcedFunctions.insert(constant).second)
+        pendingForcedFunctions.push_back(constant);
+      return F;
+    }
+  }
+
+  // If we delayed emitting this function previously, we need it now.
   if (foundDelayed != delayedFunctions.end()) {
     // Move the function to its proper place within the module.
     M.functions.remove(F);
     SILFunction *insertAfter = getFunctionToInsertAfter(*this,
-                                              foundDelayed->second.insertAfter);
+                                              foundDelayed->second);
     if (!insertAfter) {
       M.functions.push_front(F);
     } else {
       M.functions.insertAfter(insertAfter->getIterator(), F);
     }
 
-    forcedFunctions.push_back(*foundDelayed);
+    if (forcedFunctions.insert(constant).second)
+      pendingForcedFunctions.push_back(constant);
     delayedFunctions.erase(foundDelayed);
   } else {
     // We would have registered a delayed function as "last emitted" when we
@@ -551,136 +819,627 @@ bool SILGenModule::hasFunction(SILDeclRef constant) {
   return emittedFunctions.count(constant);
 }
 
-void SILGenModule::visitFuncDecl(FuncDecl *fd) {
-  ProfilerRAII Profiler(*this, fd);
-  emitFunction(fd);
+bool SILGenModule::shouldSkipDecl(Decl *D) {
+  if (!D->isAvailableDuringLowering())
+    return true;
+
+  if (!getASTContext().SILOpts.SkipNonExportableDecls)
+    return false;
+
+  // Declarations nested in functions should be emitted whenever the function
+  // containing them should also be emitted.
+  if (auto funcContext = D->getDeclContext()->getOutermostFunctionContext())
+    return shouldSkipDecl(funcContext->getAsDecl());
+
+  if (D->isExposedToClients())
+    return false;
+
+  return true;
 }
 
-/// Emit a function now, if it's externally usable or has been referenced in
-/// the current TU, or remember how to emit it later if not.
-template<typename /*void (SILFunction*)*/ Fn>
-void emitOrDelayFunction(SILGenModule &SGM,
-                         SILDeclRef constant,
-                         Fn &&emitter) {
-  auto emitAfter = SGM.lastEmittedFunction;
+void SILGenModule::visit(Decl *D) {
+  if (shouldSkipDecl(D))
+    return;
 
-  SILFunction *f = nullptr;
+  ASTVisitor::visit(D);
+}
 
-  // If the function is explicit or may be externally referenced, we must emit
-  // it.
-  bool mayDelay;
-  // Shared thunks and Clang-imported definitions can always be delayed.
-  if (constant.isThunk() || constant.isClangImported()) {
-    mayDelay = true;
-  // Implicit decls may be delayed if they can't be used externally.
-  } else {
-    auto linkage = constant.getLinkage(ForDefinition);
-    mayDelay = constant.isImplicit()
-      && !isPossiblyUsedExternally(linkage, SGM.M.isWholeModule());
-  }
+void SILGenModule::visitFuncDecl(FuncDecl *fd) { emitFunction(fd); }
 
-  // Avoid emitting a delayable definition if it hasn't already been referenced.
-  if (mayDelay)
-    f = SGM.getEmittedFunction(constant, ForDefinition);
-  else
-    f = SGM.getFunction(constant, ForDefinition);
-
-  // If we don't want to emit now, remember how for later.
-  if (!f) {
-    SGM.delayedFunctions.insert({constant, {emitAfter,
-                                            std::forward<Fn>(emitter)}});
-    // Even though we didn't emit the function now, update the
-    // lastEmittedFunction so that we preserve the original ordering that
-    // the symbols would have been emitted in.
-    SGM.lastEmittedFunction = constant;
+void SILGenModule::emitFunctionDefinition(SILDeclRef constant, SILFunction *f) {
+  if (!f->empty()) {
+    diagnose(constant.getAsRegularLocation(), diag::sil_function_redefinition,
+             f->getName());
+    if (f->hasLocation())
+      diagnose(f->getLocation(), diag::sil_function_redefinition_note);
     return;
   }
 
-  emitter(f);
-}
+  if (constant.isForeignToNativeThunk()) {
+    f->setThunk(IsThunk);
+    if (constant.asForeign().isClangGenerated())
+      f->setSerializedKind(IsSerialized);
 
-void SILGenModule::preEmitFunction(SILDeclRef constant,
-                              llvm::PointerUnion<ValueDecl *,
-                                                 Expr *> astNode,
-                                   SILFunction *F,
-                                   SILLocation Loc) {
-  // By default, use the astNode to create the location.
-  if (Loc.isNull()) {
-    if (auto *decl = astNode.get<ValueDecl *>())
-      Loc = RegularLocation(decl);
-    else
-      Loc = RegularLocation(astNode.get<Expr *>());
+    auto loc = constant.getAsRegularLocation();
+    loc.markAutoGenerated();
+    auto *dc = loc.getAsDeclContext();
+    assert(dc);
+
+    preEmitFunction(constant, f, loc);
+    PrettyStackTraceSILFunction X("silgen emitForeignToNativeThunk", f);
+    SILGenFunction(*this, *f, dc).emitForeignToNativeThunk(constant);
+    postEmitFunction(constant, f);
+    return;
   }
 
+  if (constant.isNativeToForeignThunk()) {
+    auto loc = constant.getAsRegularLocation();
+    loc.markAutoGenerated();
+    auto *dc = loc.getAsDeclContext();
+    assert(dc);
+
+    preEmitFunction(constant, f, loc);
+    PrettyStackTraceSILFunction X("silgen emitNativeToForeignThunk", f);
+    f->setBare(IsBare);
+    f->setThunk(IsThunk);
+    // If the native function is async, then the foreign entry point is not,
+    // so it needs to spawn a detached task in which to run the native
+    // implementation, so the actual thunk logic needs to go into a closure
+    // implementation function.
+    if (constant.hasAsync()) {
+      f = SILGenFunction(*this, *f, dc).emitNativeAsyncToForeignThunk(constant);
+    }
+
+    SILGenFunction(*this, *f, dc).emitNativeToForeignThunk(constant);
+
+    postEmitFunction(constant, f);
+    return;
+  }
+
+  if (constant.isDistributedThunk()) {
+    auto loc = constant.getAsRegularLocation();
+    loc.markAutoGenerated();
+    auto *dc = loc.getAsDeclContext();
+    assert(dc);
+
+    preEmitFunction(constant, f, loc);
+    PrettyStackTraceSILFunction X("silgen emitDistributedThunk", f);
+    f->setBare(IsBare);
+    f->setThunk(IsThunk);
+    f->setIsDistributed();
+
+    assert(constant.isDistributedThunk());
+    SILGenFunction(*this, *f, constant.getFuncDecl())
+        .emitFunction(constant.getFuncDecl());
+
+    postEmitFunction(constant, f);
+    return;
+  }
+
+  if (constant.isBackDeploymentThunk()) {
+    auto loc = constant.getAsRegularLocation();
+    loc.markAutoGenerated();
+    auto *dc = loc.getAsDeclContext();
+    assert(dc);
+
+    preEmitFunction(constant, f, loc);
+    PrettyStackTraceSILFunction X("silgen emitBackDeploymentThunk", f);
+    f->setBare(IsBare);
+    f->setThunk(IsBackDeployedThunk);
+
+    SILGenFunction(*this, *f, dc).emitBackDeploymentThunk(constant);
+
+    postEmitFunction(constant, f);
+    return;
+  }
+
+  switch (constant.kind) {
+  case SILDeclRef::Kind::Func: {
+    if (auto *ce = constant.getAbstractClosureExpr()) {
+      preEmitFunction(constant, f, ce);
+      PrettyStackTraceSILFunction X("silgen closureexpr", f);
+      f->createProfiler(constant);
+      SILGenFunction(*this, *f, ce).emitClosure(ce);
+      postEmitFunction(constant, f);
+      break;
+    }
+
+    if (constant.isInitAccessor()) {
+      auto *accessor = cast<AccessorDecl>(constant.getDecl());
+      preEmitFunction(constant, f, accessor);
+      PrettyStackTraceSILFunction X("silgen init accessor", f);
+      f->createProfiler(constant);
+      SILGenFunction(*this, *f, accessor).emitInitAccessor(accessor);
+      postEmitFunction(constant, f);
+      break;
+    }
+
+    auto *fd = cast<FuncDecl>(constant.getDecl());
+
+    preEmitFunction(constant, f, fd);
+    PrettyStackTraceSILFunction X("silgen emitFunction", f);
+    f->createProfiler(constant);
+    SILGenFunction(*this, *f, fd).emitFunction(fd);
+    postEmitFunction(constant, f);
+    break;
+  }
+
+  case SILDeclRef::Kind::Allocator: {
+    auto *decl = cast<ConstructorDecl>(constant.getDecl());
+
+    if (decl->getDeclContext()->getSelfClassDecl() &&
+        (decl->isDesignatedInit() ||
+         decl->isObjC())) {
+      preEmitFunction(constant, f, decl);
+      PrettyStackTraceSILFunction X("silgen emitClassConstructorAllocator", f);
+      SILGenFunction(*this, *f, decl).emitClassConstructorAllocator(decl);
+      postEmitFunction(constant, f);
+    } else {
+      preEmitFunction(constant, f, decl);
+      PrettyStackTraceSILFunction X("silgen emitValueConstructor", f);
+      f->createProfiler(constant);
+      SILGenFunction(*this, *f, decl).emitValueConstructor(decl);
+      postEmitFunction(constant, f);
+    }
+    break;
+  }
+
+  case SILDeclRef::Kind::Initializer: {
+    auto *decl = cast<ConstructorDecl>(constant.getDecl());
+    assert(decl->getDeclContext()->getSelfClassDecl());
+
+    preEmitFunction(constant, f, decl);
+    PrettyStackTraceSILFunction X("silgen constructor initializer", f);
+    f->createProfiler(constant);
+    SILGenFunction(*this, *f, decl).emitClassConstructorInitializer(decl);
+    postEmitFunction(constant, f);
+    break;
+  }
+
+  case SILDeclRef::Kind::DefaultArgGenerator: {
+    auto *decl = constant.getDecl();
+    auto *param = getParameterAt(decl, constant.defaultArgIndex);
+    assert(param);
+
+    auto *initDC = param->getDefaultArgumentInitContext();
+
+    switch (param->getDefaultArgumentKind()) {
+    case DefaultArgumentKind::Normal: {
+      auto arg = param->getTypeCheckedDefaultExpr();
+      auto loc = RegularLocation::getAutoGeneratedLocation(arg);
+      preEmitFunction(constant, f, loc);
+      PrettyStackTraceSILFunction X("silgen default arg initializer", f);
+      SILGenFunction SGF(*this, *f, initDC);
+      SGF.emitGeneratorFunction(constant, arg);
+      postEmitFunction(constant, f);
+      break;
+    }
+
+    case DefaultArgumentKind::StoredProperty: {
+      auto arg = param->getStoredProperty();
+      auto loc = RegularLocation::getAutoGeneratedLocation(arg);
+      preEmitFunction(constant, f, loc);
+      PrettyStackTraceSILFunction X("silgen stored property initializer", f);
+      SILGenFunction SGF(*this, *f, initDC);
+      SGF.emitGeneratorFunction(constant, arg);
+      postEmitFunction(constant, f);
+      break;
+    }
+
+    default:
+      llvm_unreachable("Bad default argument kind");
+    }
+
+    break;
+  }
+
+  case SILDeclRef::Kind::StoredPropertyInitializer: {
+    auto *var = cast<VarDecl>(constant.getDecl());
+
+    auto *pbd = var->getParentPatternBinding();
+    unsigned idx = pbd->getPatternEntryIndexForVarDecl(var);
+    auto *initDC = pbd->getInitContext(idx);
+    auto *init = constant.getInitializationExpr();
+    assert(init);
+
+    auto *parentMod = f->getParentModule();
+    auto loc = RegularLocation::getAutoGeneratedLocation(init);
+    preEmitFunction(constant, f, loc);
+    PrettyStackTraceSILFunction X("silgen emitStoredPropertyInitialization", f);
+    f->createProfiler(constant);
+    SILGenFunction SGF(*this, *f, initDC);
+    SGF.emitGeneratorFunction(constant, init, /*EmitProfilerIncrement=*/true);
+    postEmitFunction(constant, f);
+    // Ensure that the SIL function has a module associated with it. This
+    // ensures that SIL serializer serializes the module id for this function
+    // correctly. The parent module can be reset when the function's location is
+    // updated to the autogenerated location above.
+    if (!f->getParentModule())
+      f->setParentModule(parentMod);
+    break;
+  }
+
+  case SILDeclRef::Kind::PropertyWrapperBackingInitializer: {
+    auto *var = cast<VarDecl>(constant.getDecl());
+
+    auto loc = RegularLocation::getAutoGeneratedLocation(var);
+    preEmitFunction(constant, f, loc);
+    PrettyStackTraceSILFunction X(
+        "silgen emitPropertyWrapperBackingInitializer", f);
+
+    auto *init = constant.getInitializationExpr();
+    assert(init);
+
+    f->createProfiler(constant);
+    auto varDC = var->getInnermostDeclContext();
+    SILGenFunction SGF(*this, *f, varDC);
+    SGF.emitGeneratorFunction(constant, init, /*EmitProfilerIncrement*/ true);
+    postEmitFunction(constant, f);
+    break;
+  }
+
+  case SILDeclRef::Kind::PropertyWrapperInitFromProjectedValue: {
+    auto *var = cast<VarDecl>(constant.getDecl());
+
+    auto loc = RegularLocation::getAutoGeneratedLocation(var);
+    preEmitFunction(constant, f, loc);
+    PrettyStackTraceSILFunction X(
+        "silgen emitPropertyWrapperInitFromProjectedValue", f);
+
+    auto *init = constant.getInitializationExpr();
+    assert(init);
+
+    auto varDC = var->getInnermostDeclContext();
+    SILGenFunction SGF(*this, *f, varDC);
+    SGF.emitGeneratorFunction(constant, init);
+    postEmitFunction(constant, f);
+    break;
+  }
+
+  case SILDeclRef::Kind::GlobalAccessor: {
+    auto *global = cast<VarDecl>(constant.getDecl());
+    auto found = delayedGlobals.find(global);
+    assert(found != delayedGlobals.end());
+
+    auto *onceToken = found->second.first;
+    auto *onceFunc = found->second.second;
+
+    auto loc = RegularLocation::getAutoGeneratedLocation(global);
+    preEmitFunction(constant, f, loc);
+    PrettyStackTraceSILFunction X("silgen emitGlobalAccessor", f);
+    SILGenFunction(*this, *f, global->getDeclContext())
+      .emitGlobalAccessor(global, onceToken, onceFunc);
+    postEmitFunction(constant, f);
+    break;
+  }
+
+  case SILDeclRef::Kind::EnumElement: {
+    auto *decl = cast<EnumElementDecl>(constant.getDecl());
+
+    auto loc = RegularLocation::getAutoGeneratedLocation(decl);
+    preEmitFunction(constant, f, loc);
+    PrettyStackTraceSILFunction X("silgen enum constructor", f);
+    SILGenFunction(*this, *f, decl->getDeclContext()).emitEnumConstructor(decl);
+    postEmitFunction(constant, f);
+    break;
+  }
+
+  case SILDeclRef::Kind::Destroyer: {
+    auto *dd = cast<DestructorDecl>(constant.getDecl());
+    preEmitFunction(constant, f, dd);
+    PrettyStackTraceSILFunction X("silgen emitDestroyingDestructor", f);
+    f->createProfiler(constant);
+    SILGenFunction(*this, *f, dd).emitDestroyingDestructor(dd);
+    postEmitFunction(constant, f);
+    return;
+  }
+
+  case SILDeclRef::Kind::IsolatedDeallocator: {
+    emitDeallocatorImpl(constant, f);
+    return;
+  }
+  case SILDeclRef::Kind::Deallocator: {
+    auto *dd = cast<DestructorDecl>(constant.getDecl());
+
+    if (needsIsolatingDestructor(dd)) {
+      auto loc = RegularLocation::getAutoGeneratedLocation(dd);
+      preEmitFunction(constant, f, loc);
+      PrettyStackTraceSILFunction X("silgen emitIsolatingDestructor", f);
+      f->createProfiler(constant);
+      SILGenFunction(*this, *f, dd).emitIsolatingDestructor(dd);
+      postEmitFunction(constant, f);
+      return;
+    }
+
+    emitDeallocatorImpl(constant, f);
+    return;
+  }
+
+  case SILDeclRef::Kind::IVarInitializer: {
+    auto *cd = cast<ClassDecl>(constant.getDecl());
+    auto loc = RegularLocation::getAutoGeneratedLocation(cd);
+    preEmitFunction(constant, f, loc);
+    PrettyStackTraceSILFunction X("silgen emitDestructor ivar initializer", f);
+    SILGenFunction(*this, *f, cd).emitIVarInitializer(constant);
+    postEmitFunction(constant, f);
+    return;
+  }
+
+  case SILDeclRef::Kind::IVarDestroyer: {
+    auto *cd = cast<ClassDecl>(constant.getDecl());
+    auto loc = RegularLocation::getAutoGeneratedLocation(cd);
+    preEmitFunction(constant, f, loc);
+    PrettyStackTraceSILFunction X("silgen emitDestructor ivar destroyer", f);
+    SILGenFunction(*this, *f, cd).emitIVarDestroyer(constant);
+    postEmitFunction(constant, f);
+    return;
+  }
+  case SILDeclRef::Kind::AsyncEntryPoint:
+  case SILDeclRef::Kind::EntryPoint: {
+    f->setBare(IsBare);
+    if (constant.hasFileUnit()) {
+      auto *File = constant.getFileUnit();
+      // In script mode
+      assert(isa<SourceFile>(File) && "Emitting entry-point of non source file?!");
+      auto *SF = cast<SourceFile>(File);
+      emitEntryPoint(SF, f);
+      return;
+    }
+
+    auto loc = constant.getAsRegularLocation();
+    preEmitFunction(constant, f, loc);
+    auto *decl = constant.getDecl();
+    auto *dc = decl->getDeclContext();
+    PrettyStackTraceSILFunction X("silgen emitArtificialTopLevel", f);
+    // In all cases, a constant.kind == EntryPoint indicates the main entrypoint
+    // to the program, @main.
+    // In the synchronous case, the decl is not async, so emitArtificialTopLevel
+    // emits the error unwrapping and call to MainType.$main() into @main.
+    //
+    // In the async case, emitAsyncMainThreadStart is responsible for generating
+    // the contents of @main. This wraps @async_main in a task, passes that task
+    // to swift_job_run to execute the first thunk, and starts the runloop to
+    // run any additional continuations. The kind is EntryPoint, and the decl is
+    // async.
+    // When the kind is 'AsyncMain', we are generating @async_main. In this
+    // case, emitArtificialTopLevel emits the code for calling MaintType.$main,
+    // unwrapping errors, and calling exit(0) into @async_main to run the
+    // user-specified main function.
+    if (constant.kind == SILDeclRef::Kind::EntryPoint && isa<FuncDecl>(decl) &&
+        static_cast<FuncDecl *>(decl)->hasAsync()) {
+      SILDeclRef mainEntryPoint = SILDeclRef::getAsyncMainDeclEntryPoint(decl);
+      SILGenFunction(*this, *f, dc).emitAsyncMainThreadStart(mainEntryPoint);
+    } else {
+      SILGenFunction(*this, *f, dc).emitArtificialTopLevel(decl);
+    }
+    postEmitFunction(constant, f);
+    return;
+  }
+  }
+}
+
+void SILGenModule::emitOrDelayFunction(SILDeclRef constant) {
+  assert(!constant.isThunk());
+  assert(!constant.isClangImported());
+
+  auto emitAfter = lastEmittedFunction;
+
+  // Implicit decls may be delayed if they can't be used externally.
+  auto linkage = constant.getLinkage(ForDefinition);;
+  bool mayDelay = !constant.shouldBeEmittedForDebugger() &&
+                  !constant.hasUserWrittenCode() &&
+                  !constant.isDynamicallyReplaceable() &&
+                  !isPossiblyUsedExternally(linkage, M.isWholeModule());
+
+  if (!mayDelay) {
+    emitFunctionDefinition(constant, getFunction(constant, ForDefinition));
+    return;
+  }
+
+  // If the function is already forced then it was previously delayed and then
+  // referenced. We don't need to emit or delay it again.
+  if (forcedFunctions.contains(constant))
+    return;
+
+  if (auto *f = getEmittedFunction(constant, ForDefinition)) {
+    emitFunctionDefinition(constant, f);
+    return;
+  }
+
+  // This is a delayable function so remember how to emit it in case it gets
+  // referenced later.
+  delayedFunctions.insert({constant, emitAfter});
+  // Even though we didn't emit the function now, update the
+  // lastEmittedFunction so that we preserve the original ordering that
+  // the symbols would have been emitted in.
+  lastEmittedFunction = constant;
+}
+
+void SILGenModule::preEmitFunction(SILDeclRef constant, SILFunction *F,
+                                   SILLocation Loc) {
   assert(F->empty() && "already emitted function?!");
 
-  if (F->getLoweredFunctionType()->isPolymorphic())
-    F->setGenericEnvironment(Types.getConstantInfo(constant).GenericEnv);
+  if (F->getLoweredFunctionType()->isPolymorphic()) {
+    auto [genericEnv, capturedEnvs, forwardingSubs]
+        = Types.getForwardingSubstitutionsForLowering(constant);
+    F->setGenericEnvironment(genericEnv, capturedEnvs, forwardingSubs);
+  }
 
   // Create a debug scope for the function using astNode as source location.
   F->setDebugScope(new (M) SILDebugScope(Loc, F));
 
-  DEBUG(llvm::dbgs() << "lowering ";
-        F->printName(llvm::dbgs());
-        llvm::dbgs() << " : ";
-        F->getLoweredType().print(llvm::dbgs());
-        llvm::dbgs() << '\n';
-        if (astNode) {
-          if (auto *decl = astNode.get<ValueDecl *>())
-            decl->dump(llvm::dbgs());
-          else
-            astNode.get<Expr *>()->dump(llvm::dbgs());
-          llvm::dbgs() << '\n';
-        });
+  // Initialize F with the constant we created for it.
+  F->setDeclRef(constant);
+
+  // Set our actor isolation.
+  F->setActorIsolation(getActorIsolationForFunction(*F));
+
+  LLVM_DEBUG(llvm::dbgs() << "lowering ";
+             F->printName(llvm::dbgs());
+             llvm::dbgs() << " : ";
+             F->getLoweredType().print(llvm::dbgs());
+             llvm::dbgs() << '\n';
+             if (auto *decl = Loc.getAsASTNode<ValueDecl>()) {
+               decl->dump(llvm::dbgs());
+               llvm::dbgs() << '\n';
+             } else if (auto *expr = Loc.getAsASTNode<Expr>()) {
+               expr->dump(llvm::dbgs());
+               llvm::dbgs() << "\n";
+             });
 }
 
 void SILGenModule::postEmitFunction(SILDeclRef constant,
                                     SILFunction *F) {
+  emitLazyConformancesForFunction(F);
+
+  auto sig = Types.getGenericSignatureWithCapturedEnvironments(constant);
+  recontextualizeCapturedLocalArchetypes(F, sig);
+
   assert(!F->isExternalDeclaration() && "did not emit any function body?!");
-  DEBUG(llvm::dbgs() << "lowered sil:\n";
-        F->print(llvm::dbgs()));
-  F->verify();
+  LLVM_DEBUG(llvm::dbgs() << "lowered sil:\n";
+             F->print(llvm::dbgs()));
+  F->verifyIncompleteOSSA();
+
+  emitDifferentiabilityWitnessesForFunction(constant, F);
 }
 
-void SILGenModule::
-emitMarkFunctionEscapeForTopLevelCodeGlobals(SILLocation loc,
-                                             const CaptureInfo &captureInfo) {
-  assert(TopLevelSGF && TopLevelSGF->B.hasValidInsertionPoint()
-         && "no valid code generator for top-level function?!");
+void SILGenModule::emitDifferentiabilityWitnessesForFunction(
+    SILDeclRef constant, SILFunction *F) {
+  // Visit `@derivative` attributes and generate SIL differentiability
+  // witnesses.
+  // Skip if the SILDeclRef is a:
+  // - Default argument generator function.
+  // - Thunk.
+  if (!constant.hasDecl() || !constant.getAbstractFunctionDecl())
+    return;
+  if (constant.kind == SILDeclRef::Kind::DefaultArgGenerator ||
+      constant.isThunk())
+    return;
+  auto *AFD = constant.getAbstractFunctionDecl();
+  auto emitWitnesses = [&](DeclAttributes &Attrs) {
+    for (auto *diffAttr : Attrs.getAttributes<DifferentiableAttr>()) {
+      assert((!F->getLoweredFunctionType()->getSubstGenericSignature() ||
+              diffAttr->getDerivativeGenericSignature()) &&
+             "Type-checking should resolve derivative generic signatures for "
+             "all original SIL functions with generic signatures");
+      auto *resultIndices =
+        autodiff::getFunctionSemanticResultIndices(AFD,
+                                                   diffAttr->getParameterIndices());
+      auto witnessGenSig =
+          autodiff::getDifferentiabilityWitnessGenericSignature(
+              AFD->getGenericSignature(),
+              diffAttr->getDerivativeGenericSignature());
+      AutoDiffConfig config(diffAttr->getParameterIndices(), resultIndices,
+                            witnessGenSig);
+      emitDifferentiabilityWitness(AFD, F, DifferentiabilityKind::Reverse,
+                                   config, /*jvp*/ nullptr,
+                                   /*vjp*/ nullptr, diffAttr);
+    }
+    for (auto *derivAttr : Attrs.getAttributes<DerivativeAttr>()) {
+      SILFunction *jvp = nullptr;
+      SILFunction *vjp = nullptr;
+      switch (derivAttr->getDerivativeKind()) {
+      case AutoDiffDerivativeFunctionKind::JVP:
+        jvp = F;
+        break;
+      case AutoDiffDerivativeFunctionKind::VJP:
+        vjp = F;
+        break;
+      }
+      auto *origAFD = derivAttr->getOriginalFunction(getASTContext());
+      auto origDeclRef =
+          SILDeclRef(origAFD).asForeign(requiresForeignEntryPoint(origAFD));
+      auto *origFn = getFunction(origDeclRef, NotForDefinition);
+      auto witnessGenSig =
+          autodiff::getDifferentiabilityWitnessGenericSignature(
+              origAFD->getGenericSignature(), AFD->getGenericSignature());
+      auto *resultIndices =
+        autodiff::getFunctionSemanticResultIndices(origAFD,
+                                                   derivAttr->getParameterIndices());
+      AutoDiffConfig config(derivAttr->getParameterIndices(), resultIndices,
+                            witnessGenSig);
+      emitDifferentiabilityWitness(origAFD, origFn,
+                                   DifferentiabilityKind::Reverse, config, jvp,
+                                   vjp, derivAttr);
+    }
+  };
+  if (auto *accessor = dyn_cast<AccessorDecl>(AFD))
+    if (accessor->isGetter())
+      emitWitnesses(accessor->getStorage()->getAttrs());
+  emitWitnesses(AFD->getAttrs());
+}
 
-  SmallVector<SILValue, 4> Captures;
-  
-  for (auto capture : captureInfo.getCaptures()) {
-    // Decls captured by value don't escape.
-    auto It = TopLevelSGF->VarLocs.find(capture.getDecl());
-    if (It == TopLevelSGF->VarLocs.end() ||
-        !It->getSecond().value->getType().isAddress())
-      continue;
-    
-    Captures.push_back(It->second.value);
+void SILGenModule::emitDifferentiabilityWitness(
+    AbstractFunctionDecl *originalAFD, SILFunction *originalFunction,
+    DifferentiabilityKind diffKind, const AutoDiffConfig &config,
+    SILFunction *jvp, SILFunction *vjp, const DeclAttribute *attr) {
+  assert(isa<DifferentiableAttr>(attr) || isa<DerivativeAttr>(attr));
+  auto *origFnType = originalAFD->getInterfaceType()->castTo<AnyFunctionType>();
+  auto origSilFnType = originalFunction->getLoweredFunctionType();
+  auto *silParamIndices =
+      autodiff::getLoweredParameterIndices(config.parameterIndices, origFnType);
+
+  // NOTE(TF-893): Extending capacity is necessary when `origSilFnType` has
+  // parameters corresponding to captured variables. These parameters do not
+  // appear in the type of `origFnType`.
+  // TODO: If possible, change `autodiff::getLoweredParameterIndices` to
+  // take `CaptureInfo` into account.
+  if (origSilFnType->getNumParameters() > silParamIndices->getCapacity())
+    silParamIndices = silParamIndices->extendingCapacity(
+        getASTContext(), origSilFnType->getNumParameters());
+
+  // Get or create new SIL differentiability witness.
+  // Witness already exists when there are two `@derivative` attributes
+  // (registering JVP and VJP functions) for the same derivative function
+  // configuration.
+  // Witness JVP and VJP are set below.
+  AutoDiffConfig silConfig(silParamIndices, config.resultIndices,
+                           config.derivativeGenericSignature);
+  SILDifferentiabilityWitnessKey key = {
+      originalFunction->getName(), diffKind, silConfig};
+  auto *diffWitness = M.lookUpDifferentiabilityWitness(key);
+  if (!diffWitness) {
+    // Differentiability witnesses have the same linkage as the original
+    // function, stripping external.
+    auto linkage = stripExternalFromLinkage(originalFunction->getLinkage());
+    diffWitness = SILDifferentiabilityWitness::createDefinition(
+        M, linkage, originalFunction, diffKind, silConfig.parameterIndices,
+        silConfig.resultIndices, config.derivativeGenericSignature,
+        /*jvp*/ nullptr, /*vjp*/ nullptr,
+        /*isSerialized*/ hasPublicVisibility(originalFunction->getLinkage()),
+        attr);
   }
-  
-  if (!Captures.empty())
-    TopLevelSGF->B.createMarkFunctionEscape(loc, Captures);
+
+  // Set derivative function in differentiability witness.
+  auto setDerivativeInDifferentiabilityWitness =
+      [&](AutoDiffDerivativeFunctionKind kind, SILFunction *derivative) {
+        auto derivativeThunk = getOrCreateCustomDerivativeThunk(
+            originalAFD, originalFunction, derivative, silConfig, kind);
+        // Check for existing same derivative.
+        // TODO(TF-835): Remove condition below and simplify assertion to
+        // `!diffWitness->getDerivative(kind)` after `@derivative` attribute
+        // type-checking no longer generates implicit `@differentiable`
+        // attributes.
+        auto *existingDerivative = diffWitness->getDerivative(kind);
+        if (existingDerivative && existingDerivative == derivativeThunk)
+          return;
+        assert(!existingDerivative &&
+               "SIL differentiability witness already has a different existing "
+               "derivative");
+        diffWitness->setDerivative(kind, derivativeThunk);
+      };
+  if (jvp)
+    setDerivativeInDifferentiabilityWitness(AutoDiffDerivativeFunctionKind::JVP,
+                                            jvp);
+  if (vjp)
+    setDerivativeInDifferentiabilityWitness(AutoDiffDerivativeFunctionKind::VJP,
+                                            vjp);
 }
 
 void SILGenModule::emitAbstractFuncDecl(AbstractFunctionDecl *AFD) {
-  // Emit any default argument generators.
-  if (!isa<DestructorDecl>(AFD)) {
-    unsigned paramListIndex = AFD->getDeclContext()->isTypeContext() ? 1 : 0;
-    auto *paramList = AFD->getParameterLists()[paramListIndex];
-    emitDefaultArgGenerators(AFD, paramList);
-  }
+  // Emit default arguments and property wrapper initializers.
+  emitArgumentGenerators(AFD, AFD->getParameters());
 
-  // If this is a function at global scope, it may close over a global variable.
-  // If we're emitting top-level code, then emit a "mark_function_escape" that
-  // lists the captured global variables so that definite initialization can
-  // reason about this escape point.
-  if (!AFD->getDeclContext()->isLocalContext() &&
-      TopLevelSGF && TopLevelSGF->B.hasValidInsertionPoint()) {
-    emitMarkFunctionEscapeForTopLevelCodeGlobals(AFD, AFD->getCaptureInfo());
-  }
-  
   // If the declaration is exported as a C function, emit its native-to-foreign
   // thunk too, if it wasn't already forced.
   if (AFD->getAttrs().hasAttribute<CDeclAttr>()) {
@@ -688,27 +1447,34 @@ void SILGenModule::emitAbstractFuncDecl(AbstractFunctionDecl *AFD) {
     if (!hasFunction(thunk))
       emitNativeToForeignThunk(thunk);
   }
+
+  emitDistributedThunkForDecl(AFD);
+
+  if (AFD->isBackDeployed(M.getASTContext())) {
+    // Emit the fallback function that will be used when the original function
+    // is unavailable at runtime.
+    auto fallback = SILDeclRef(AFD).asBackDeploymentKind(
+        SILDeclRef::BackDeploymentKind::Fallback);
+    emitFunctionDefinition(fallback, getFunction(fallback, ForDefinition));
+
+    // Emit the thunk that either invokes the original function or the fallback
+    // function depending on the availability of the original.
+    auto thunk = SILDeclRef(AFD).asBackDeploymentKind(
+        SILDeclRef::BackDeploymentKind::Thunk);
+    emitBackDeploymentThunk(thunk);
+  }
 }
 
 void SILGenModule::emitFunction(FuncDecl *fd) {
+  assert(!shouldSkipDecl(fd));
+
   SILDeclRef::Loc decl = fd;
 
   emitAbstractFuncDecl(fd);
 
-  if (hasSILBody(fd)) {
-    PrettyStackTraceDecl stackTrace("emitting SIL for", fd);
-
-    SILDeclRef constant(decl);
-
-    emitOrDelayFunction(*this, constant, [this,constant,fd](SILFunction *f){
-      preEmitFunction(constant, fd, f, fd);
-      PrettyStackTraceSILFunction X("silgen emitFunction", f);
-      if (fd->getAccessorKind() == AccessorKind::IsMaterializeForSet)
-        SILGenFunction(*this, *f).emitMaterializeForSet(fd);
-      else
-        SILGenFunction(*this, *f).emitFunction(fd);
-      postEmitFunction(constant, f);
-    });
+  if (shouldEmitFunctionBody(fd)) {
+    Types.setCaptureTypeExpansionContext(SILDeclRef(fd), M);
+    emitOrDelayFunction(SILDeclRef(decl));
   }
 }
 
@@ -726,77 +1492,56 @@ void SILGenModule::emitConstructor(ConstructorDecl *decl) {
   if (isa<ProtocolDecl>(decl->getDeclContext()))
     return;
 
-  // Always-unavailable imported constructors are factory methods
-  // that have been imported as constructors and then hidden by an
-  // imported init method.
-  if (decl->hasClangNode() &&
-      decl->getAttrs().isUnavailable(decl->getASTContext()))
-    return;
-
   SILDeclRef constant(decl);
+  DeclContext *declCtx = decl->getDeclContext();
 
-  if (decl->getDeclContext()->getAsClassOrClassExtensionContext()) {
-    // Class constructors have separate entry points for allocation and
+  if (declCtx->getSelfClassDecl()) {
+    // Designated initializers for classes, as well as @objc convenience
+    // initializers, have separate entry points for allocation and
     // initialization.
-    emitOrDelayFunction(*this, constant, [this,constant,decl](SILFunction *f){
-      preEmitFunction(constant, decl, f, decl);
-      PrettyStackTraceSILFunction X("silgen emitConstructor", f);
-      SILGenFunction(*this, *f)
-        .emitClassConstructorAllocator(decl);
-      postEmitFunction(constant, f);
-    });
+    if (decl->isDesignatedInit() || decl->isObjC()) {
+      emitOrDelayFunction(constant);
 
-    // If this constructor was imported, we don't need the initializing
-    // constructor to be emitted.
-    if (!decl->hasClangNode()) {
-      SILDeclRef initConstant(decl, SILDeclRef::Kind::Initializer);
-      emitOrDelayFunction(*this, initConstant,
-                          [this,initConstant,decl](SILFunction *initF){
-        preEmitFunction(initConstant, decl, initF, decl);
-        PrettyStackTraceSILFunction X("silgen constructor initializer", initF);
-        SILGenFunction(*this, *initF).emitClassConstructorInitializer(decl);
-        postEmitFunction(initConstant, initF);
-      });
+      if (shouldEmitFunctionBody(decl)) {
+        SILDeclRef initConstant(decl, SILDeclRef::Kind::Initializer);
+        emitOrDelayFunction(initConstant);
+      }
+
+      return;
     }
-  } else {
-    // Struct and enum constructors do everything in a single function.
-    emitOrDelayFunction(*this, constant, [this,constant,decl](SILFunction *f) {
-      preEmitFunction(constant, decl, f, decl);
-      PrettyStackTraceSILFunction X("silgen emitConstructor", f);
-      SILGenFunction(*this, *f).emitValueConstructor(decl);
-      postEmitFunction(constant, f);
-    });
+  }
+
+  // Struct and enum constructors do everything in a single function, as do
+  // non-@objc convenience initializers for classes.
+  if (shouldEmitFunctionBody(decl)) {
+    emitOrDelayFunction(constant);
   }
 }
 
-void SILGenModule::emitEnumConstructor(EnumElementDecl *decl) {
-  // Enum element constructors are always emitted by need, so don't need
-  // delayed emission.
-  SILDeclRef constant(decl);
-  SILFunction *f = getFunction(constant, ForDefinition);
-  preEmitFunction(constant, decl, f, decl);
-  PrettyStackTraceSILFunction X("silgen enum constructor", f);
-  SILGenFunction(*this, *f).emitEnumConstructor(decl);
-  postEmitFunction(constant, f);
-}
+SILFunction *SILGenModule::emitClosure(AbstractClosureExpr *e,
+                                       const FunctionTypeInfo &closureInfo) {
+  Types.setCaptureTypeExpansionContext(SILDeclRef(e), M);
 
-SILFunction *SILGenModule::emitClosure(AbstractClosureExpr *ce) {
-  SILDeclRef constant(ce);
-  SILFunction *f = getFunction(constant, ForDefinition);
+  SILFunction *f = nullptr;
+  Types.withClosureTypeInfo(e, closureInfo, [&] {
+    SILDeclRef constant(e);
+    f = getFunction(constant, ForDefinition);
 
-  // Generate the closure function, if we haven't already.
-  //
-  // We may visit the same closure expr multiple times in some cases,
-  // for instance, when closures appear as in-line initializers of stored
-  // properties. In these cases the closure will be emitted into every
-  // initializer of the containing type.
-  if (!f->isExternalDeclaration())
-    return f;
+    // Generate the closure function, if we haven't already.
+    //
+    // We may visit the same closure expr multiple times in some cases,
+    // for instance, when closures appear as in-line initializers of stored
+    // properties. In these cases the closure will be emitted into every
+    // initializer of the containing type.
+    if (!f->isExternalDeclaration())
+      return;
 
-  preEmitFunction(constant, ce, f, ce);
-  PrettyStackTraceSILFunction X("silgen closureexpr", f);
-  SILGenFunction(*this, *f).emitClosure(ce);
-  postEmitFunction(constant, f);
+    // Emit property wrapper argument generators.
+    emitArgumentGenerators(e, e->getParameters());
+
+    emitFunctionDefinition(constant, f);
+  });
+
   return f;
 }
 
@@ -806,12 +1551,12 @@ static bool requiresIVarInitialization(SILGenModule &SGM, ClassDecl *cd) {
   if (!cd->requiresStoredPropertyInits())
     return false;
 
-  for (Decl *member : cd->getMembers()) {
+  for (Decl *member : cd->getImplementationContext()->getAllMembers()) {
     auto pbd = dyn_cast<PatternBindingDecl>(member);
     if (!pbd) continue;
 
-    for (auto entry : pbd->getPatternList())
-      if (entry.getInit())
+    for (auto i : range(pbd->getNumPatternEntries()))
+      if (pbd->getExecutableInit(i))
         return true;
   }
 
@@ -819,11 +1564,13 @@ static bool requiresIVarInitialization(SILGenModule &SGM, ClassDecl *cd) {
 }
 
 bool SILGenModule::hasNonTrivialIVars(ClassDecl *cd) {
-  for (Decl *member : cd->getMembers()) {
+  for (Decl *member : cd->getImplementationContext()->getAllMembers()) {
     auto *vd = dyn_cast<VarDecl>(member);
     if (!vd || !vd->hasStorage()) continue;
 
-    const TypeLowering &ti = Types.getTypeLowering(vd->getType());
+    auto &ti = Types.getTypeLowering(
+        vd->getTypeInContext(),
+        TypeExpansionContext::maximalResilienceExpansionOnly());
     if (!ti.isTrivial())
       return true;
   }
@@ -835,50 +1582,76 @@ bool SILGenModule::requiresIVarDestroyer(ClassDecl *cd) {
   // Only needed if we have non-trivial ivars, we're not a root class, and
   // the superclass is not @objc.
   return (hasNonTrivialIVars(cd) &&
-          cd->getSuperclass() &&
-          !cd->getSuperclass()->getClassOrBoundGenericClass()->hasClangNode());
+          cd->getSuperclassDecl() &&
+          !cd->getSuperclassDecl()->hasClangNode());
 }
 
 /// TODO: This needs a better name.
 void SILGenModule::emitObjCAllocatorDestructor(ClassDecl *cd,
                                                DestructorDecl *dd) {
-  // Emit the native deallocating destructor for -dealloc.
-  // Destructors are a necessary part of class metadata, so can't be delayed.
-  {
-    SILDeclRef dealloc(dd, SILDeclRef::Kind::Deallocator);
-    SILFunction *f = getFunction(dealloc, ForDefinition);
-    preEmitFunction(dealloc, dd, f, dd);
-    PrettyStackTraceSILFunction X("silgen emitDestructor -dealloc", f);
-    SILGenFunction(*this, *f).emitObjCDestructor(dealloc);
-    postEmitFunction(dealloc, f);
+
+  const bool isActorIsolated = needsIsolatingDestructor(dd);
+
+  // Emit the isolated deallocating destructor.
+  // If emitted, it implements actual deallocating and deallocating destructor
+  // only switches executor
+  if (dd->hasBody() && isActorIsolated) {
+    SILDeclRef dealloc(dd, SILDeclRef::Kind::IsolatedDeallocator);
+    emitFunctionDefinition(dealloc, getFunction(dealloc, ForDefinition));
   }
 
-  // Emit the Objective-C -dealloc entry point if it has
-  // something to do beyond messaging the superclass's -dealloc.
-  if (dd->getBody()->getNumElements() != 0)
-    emitObjCDestructorThunk(dd);
+  // Emit the native deallocating destructor for -dealloc.
+  // Destructors are a necessary part of class metadata, so can't be delayed.
+  if (shouldEmitFunctionBody(dd)) {
+    SILDeclRef dealloc(dd, SILDeclRef::Kind::Deallocator);
+    emitFunctionDefinition(dealloc, getFunction(dealloc, ForDefinition));
+
+    // Emit the Objective-C -dealloc entry point if it has
+    // something to do beyond messaging the superclass's -dealloc.
+    if (!dd->getBody()->empty() || isActorIsolated)
+      emitObjCDestructorThunk(dd);
+  }
 
   // Emit the ivar initializer, if needed.
   if (requiresIVarInitialization(*this, cd)) {
     auto ivarInitializer = SILDeclRef(cd, SILDeclRef::Kind::IVarInitializer)
       .asForeign();
-    SILFunction *f = getFunction(ivarInitializer, ForDefinition);
-    preEmitFunction(ivarInitializer, dd, f, dd);
-    PrettyStackTraceSILFunction X("silgen emitDestructor ivar initializer", f);
-    SILGenFunction(*this, *f).emitIVarInitializer(ivarInitializer);
-    postEmitFunction(ivarInitializer, f);
+    emitFunctionDefinition(ivarInitializer,
+                           getFunction(ivarInitializer, ForDefinition));
   }
 
   // Emit the ivar destroyer, if needed.
   if (hasNonTrivialIVars(cd)) {
     auto ivarDestroyer = SILDeclRef(cd, SILDeclRef::Kind::IVarDestroyer)
       .asForeign();
-    SILFunction *f = getFunction(ivarDestroyer, ForDefinition);
-    preEmitFunction(ivarDestroyer, dd, f, dd);
-    PrettyStackTraceSILFunction X("silgen emitDestructor ivar destroyer", f);
-    SILGenFunction(*this, *f).emitIVarDestroyer(ivarDestroyer);
-    postEmitFunction(ivarDestroyer, f);
+    emitFunctionDefinition(ivarDestroyer,
+                           getFunction(ivarDestroyer, ForDefinition));
   }
+}
+
+void SILGenModule::emitDeallocatorImpl(SILDeclRef constant, SILFunction *f) {
+  auto *dd = cast<DestructorDecl>(constant.getDecl());
+  auto *nom = dd->getDeclContext()->getSelfNominalTypeDecl();
+
+  if (auto *cd = dyn_cast<ClassDecl>(nom)) {
+    if (usesObjCAllocator(cd)) {
+      preEmitFunction(constant, f, dd);
+      PrettyStackTraceSILFunction X("silgen emitDestructor -dealloc", f);
+      f->createProfiler(constant);
+      SILGenFunction(*this, *f, dd).emitObjCDestructor(constant);
+      postEmitFunction(constant, f);
+      return;
+    }
+  }
+
+  auto loc = RegularLocation::getAutoGeneratedLocation(dd);
+  preEmitFunction(constant, f, loc);
+  PrettyStackTraceSILFunction X("silgen emitDeallocatingDestructor", f);
+  bool isIsolated = constant.kind == SILDeclRef::Kind::IsolatedDeallocator;
+  SILGenFunction(*this, *f, dd).emitDeallocatingDestructor(dd, isIsolated);
+
+  postEmitFunction(constant, f);
+  return;
 }
 
 void SILGenModule::emitDestructor(ClassDecl *cd, DestructorDecl *dd) {
@@ -887,11 +1660,8 @@ void SILGenModule::emitDestructor(ClassDecl *cd, DestructorDecl *dd) {
   // Emit the ivar destroyer, if needed.
   if (requiresIVarDestroyer(cd)) {
     SILDeclRef ivarDestroyer(cd, SILDeclRef::Kind::IVarDestroyer);
-    SILFunction *f = getFunction(ivarDestroyer, ForDefinition);
-    preEmitFunction(ivarDestroyer, dd, f, dd);
-    PrettyStackTraceSILFunction X("silgen emitDestructor ivar destroyer", f);
-    SILGenFunction(*this, *f).emitIVarDestroyer(ivarDestroyer);
-    postEmitFunction(ivarDestroyer, f);
+    emitFunctionDefinition(ivarDestroyer,
+                           getFunction(ivarDestroyer, ForDefinition));
   }
 
   // If the class would use the Objective-C allocator, only emit -dealloc.
@@ -902,93 +1672,127 @@ void SILGenModule::emitDestructor(ClassDecl *cd, DestructorDecl *dd) {
 
   // Emit the destroying destructor.
   // Destructors are a necessary part of class metadata, so can't be delayed.
-  {
+  if (shouldEmitFunctionBody(dd)) {
     SILDeclRef destroyer(dd, SILDeclRef::Kind::Destroyer);
-    SILFunction *f = getFunction(destroyer, ForDefinition);
-    preEmitFunction(destroyer, dd, f, dd);
-    PrettyStackTraceSILFunction X("silgen emitDestroyingDestructor", f);
-    SILGenFunction(*this, *f).emitDestroyingDestructor(dd);
-    f->setDebugScope(new (M) SILDebugScope(dd, f));
-    postEmitFunction(destroyer, f);
+    emitFunctionDefinition(destroyer, getFunction(destroyer, ForDefinition));
+  }
+
+  // Emit the isolated deallocating destructor.
+  // If emitted, it implements actual deallocating and deallocating destructor
+  // only switches executor
+  if (needsIsolatingDestructor(dd)) {
+    SILDeclRef deallocator(dd, SILDeclRef::Kind::IsolatedDeallocator);
+    emitFunctionDefinition(deallocator,
+                           getFunction(deallocator, ForDefinition));
   }
 
   // Emit the deallocating destructor.
   {
     SILDeclRef deallocator(dd, SILDeclRef::Kind::Deallocator);
-    SILFunction *f = getFunction(deallocator, ForDefinition);
-    preEmitFunction(deallocator, dd, f, dd);
-    PrettyStackTraceSILFunction X("silgen emitDeallocatingDestructor", f);
-    SILGenFunction(*this, *f).emitDeallocatingDestructor(dd);
-    f->setDebugScope(new (M) SILDebugScope(dd, f));
-    postEmitFunction(deallocator, f);
+    emitFunctionDefinition(deallocator,
+                           getFunction(deallocator, ForDefinition));
   }
 }
 
-void SILGenModule::emitDefaultArgGenerator(SILDeclRef constant, Expr *arg,
-                                           DefaultArgumentKind kind) {
-  switch (kind) {
+void SILGenModule::emitMoveOnlyDestructor(NominalTypeDecl *cd,
+                                          DestructorDecl *dd) {
+  assert(!cd->canBeCopyable());
+
+  emitAbstractFuncDecl(dd);
+
+  // Emit the deallocating destructor if we have a body.
+  if (shouldEmitFunctionBody(dd)) {
+    SILDeclRef deallocator(dd, SILDeclRef::Kind::Deallocator);
+    emitFunctionDefinition(deallocator,
+                           getFunction(deallocator, ForDefinition));
+  }
+}
+
+void SILGenModule::emitDefaultArgGenerator(SILDeclRef constant,
+                                           ParamDecl *param) {
+  switch (param->getDefaultArgumentKind()) {
   case DefaultArgumentKind::None:
     llvm_unreachable("No default argument here?");
 
   case DefaultArgumentKind::Normal:
+  case DefaultArgumentKind::StoredProperty:
+    emitOrDelayFunction(constant);
     break;
 
   case DefaultArgumentKind::Inherited:
-    return;
-
-  case DefaultArgumentKind::Column:
-  case DefaultArgumentKind::File:
-  case DefaultArgumentKind::Line:
-  case DefaultArgumentKind::Function:
-  case DefaultArgumentKind::DSOHandle:
+#define MAGIC_IDENTIFIER(NAME, STRING, SYNTAX_KIND) \
+  case DefaultArgumentKind::NAME:
+#include "swift/AST/MagicIdentifierKinds.def"
   case DefaultArgumentKind::NilLiteral:
   case DefaultArgumentKind::EmptyArray:
   case DefaultArgumentKind::EmptyDictionary:
-    return;
+  case DefaultArgumentKind::ExpressionMacro:
+    break;
   }
-
-  emitOrDelayFunction(*this, constant, [this,constant,arg](SILFunction *f) {
-    preEmitFunction(constant, arg, f, arg);
-    PrettyStackTraceSILFunction X("silgen emitDefaultArgGenerator ", f);
-    SILGenFunction SGF(*this, *f);
-    SGF.emitGeneratorFunction(constant, arg);
-    postEmitFunction(constant, f);
-  });
 }
 
 void SILGenModule::
 emitStoredPropertyInitialization(PatternBindingDecl *pbd, unsigned i) {
-  const PatternBindingEntry &pbdEntry = pbd->getPatternList()[i];
-  auto *var = pbdEntry.getAnchoringVarDecl();
-  auto *init = pbdEntry.getInit();
+  // The SIL emitted for property init expressions is only needed by clients of
+  // resilient modules if the property belongs to a frozen type. When
+  // -experimental-skip-non-exportable-decls is specified, skip emitting
+  // property inits if possible.
+  if (M.getOptions().SkipNonExportableDecls &&
+      !pbd->getAnchoringVarDecl(i)->isInitExposedToClients())
+    return;
 
+  // Force the executable init to be type checked before emission.
+  if (!pbd->getCheckedAndContextualizedExecutableInit(i))
+    return;
+
+  auto *var = pbd->getAnchoringVarDecl(i);
   SILDeclRef constant(var, SILDeclRef::Kind::StoredPropertyInitializer);
-  emitOrDelayFunction(*this, constant, [this,constant,init](SILFunction *f) {
-    preEmitFunction(constant, init, f, init);
-    PrettyStackTraceSILFunction X("silgen emitStoredPropertyInitialization", f);
-    SILGenFunction(*this, *f).emitGeneratorFunction(constant, init);
-    postEmitFunction(constant, f);
-  });
+  emitOrDelayFunction(constant);
+}
+
+void SILGenModule::
+emitPropertyWrapperBackingInitializer(VarDecl *var) {
+  if (M.getOptions().SkipNonExportableDecls)
+    return;
+
+  auto initInfo = var->getPropertyWrapperInitializerInfo();
+
+  if (initInfo.hasInitFromWrappedValue()) {
+    // FIXME: Fully typecheck the original property's init expression on-demand
+    // for lazy typechecking mode.
+
+    SILDeclRef constant(var, SILDeclRef::Kind::PropertyWrapperBackingInitializer);
+    emitOrDelayFunction(constant);
+  }
+
+  if (initInfo.hasInitFromProjectedValue()) {
+    SILDeclRef constant(var, SILDeclRef::Kind::PropertyWrapperInitFromProjectedValue);
+    emitOrDelayFunction(constant);
+  }
 }
 
 SILFunction *SILGenModule::emitLazyGlobalInitializer(StringRef funcName,
                                                  PatternBindingDecl *binding,
                                                      unsigned pbdEntry) {
   ASTContext &C = M.getASTContext();
-  Type initType = FunctionType::get(
-                    TupleType::getEmpty(C), TupleType::getEmpty(C),
-                    FunctionType::ExtInfo()
-                      .withRepresentation(FunctionType::Representation::Thin));
-  auto initSILType = getLoweredType(initType).castTo<SILFunctionType>();
+  auto *onceBuiltin =
+      cast<FuncDecl>(getBuiltinValueDecl(C, C.getIdentifier("once")));
+  auto blockParam = onceBuiltin->getParameters()->get(1);
+  auto *initType = blockParam->getTypeInContext()->castTo<FunctionType>();
+  auto initSILType = cast<SILFunctionType>(
+      Types.getLoweredRValueType(TypeExpansionContext::minimal(), initType));
 
-  auto *f =
-      M.createFunction(SILLinkage::Private,
-                       funcName, initSILType, nullptr,
-                       SILLocation(binding), IsNotBare, IsNotTransparent,
-                       IsNotSerialized);
+  SILGenFunctionBuilder builder(*this);
+  auto *f = builder.createFunction(
+      SILLinkage::Private, funcName, initSILType, nullptr, SILLocation(binding),
+      IsNotBare, IsNotTransparent, IsNotSerialized, IsNotDynamic,
+      IsNotDistributed, IsNotRuntimeAccessible);
+  f->setSpecialPurpose(SILFunction::Purpose::GlobalInitOnceFunction);
   f->setDebugScope(new (M) SILDebugScope(RegularLocation(binding), f));
-  SILGenFunction(*this, *f).emitLazyGlobalInitializer(binding, pbdEntry);
-  f->verify();
+  auto dc = binding->getDeclContext();
+  SILGenFunction(*this, *f, dc).emitLazyGlobalInitializer(binding, pbdEntry);
+  emitLazyConformancesForFunction(f);
+  f->verifyIncompleteOSSA();
 
   return f;
 }
@@ -997,37 +1801,21 @@ void SILGenModule::emitGlobalAccessor(VarDecl *global,
                                       SILGlobalVariable *onceToken,
                                       SILFunction *onceFunc) {
   SILDeclRef accessor(global, SILDeclRef::Kind::GlobalAccessor);
-  emitOrDelayFunction(*this, accessor,
-                      [this,accessor,global,onceToken,onceFunc](SILFunction *f){
-    preEmitFunction(accessor, global, f, global);
-    PrettyStackTraceSILFunction X("silgen emitGlobalAccessor", f);
-    SILGenFunction(*this, *f)
-      .emitGlobalAccessor(global, onceToken, onceFunc);
-    postEmitFunction(accessor, f);
-  });
+  delayedGlobals[global] = std::make_pair(onceToken, onceFunc);
+  emitOrDelayFunction(accessor);
 }
 
-void SILGenModule::emitGlobalGetter(VarDecl *global,
-                                    SILGlobalVariable *onceToken,
-                                    SILFunction *onceFunc) {
-  SILDeclRef accessor(global, SILDeclRef::Kind::GlobalGetter);
-  emitOrDelayFunction(*this, accessor,
-                      [this,accessor,global,onceToken,onceFunc](SILFunction *f){
-    preEmitFunction(accessor, global, f, global);
-    PrettyStackTraceSILFunction X("silgen emitGlobalGetter", f);
-    SILGenFunction(*this, *f)
-      .emitGlobalGetter(global, onceToken, onceFunc);
-    postEmitFunction(accessor, f);
-  });
-}
-
-void SILGenModule::emitDefaultArgGenerators(SILDeclRef::Loc decl,
-                                            ParameterList *paramList) {
+void SILGenModule::emitArgumentGenerators(SILDeclRef::Loc decl,
+                                          ParameterList *paramList) {
   unsigned index = 0;
   for (auto param : *paramList) {
-    if (auto defaultArg = param->getDefaultValue())
+    if (param->isDefaultArgument())
       emitDefaultArgGenerator(SILDeclRef::getDefaultArgGenerator(decl, index),
-                              defaultArg, param->getDefaultArgumentKind());
+                              param);
+
+    if (param->hasExternalPropertyWrapper())
+      emitPropertyWrapperBackingInitializer(param);
+
     ++index;
   }
 }
@@ -1040,56 +1828,33 @@ void SILGenModule::emitObjCMethodThunk(FuncDecl *method) {
     return;
 
   // ObjC entry points are always externally usable, so can't be delay-emitted.
-
-  SILFunction *f = getFunction(thunk, ForDefinition);
-  preEmitFunction(thunk, method, f, method);
-  PrettyStackTraceSILFunction X("silgen emitObjCMethodThunk", f);
-  f->setBare(IsBare);
-  f->setThunk(IsThunk);
-  SILGenFunction(*this, *f).emitNativeToForeignThunk(thunk);
-  postEmitFunction(thunk, f);
+  emitNativeToForeignThunk(thunk);
 }
 
 void SILGenModule::emitObjCPropertyMethodThunks(AbstractStorageDecl *prop) {
+  auto *getter = prop->getOpaqueAccessor(AccessorKind::Get);
+
   // If we don't actually need an entry point for the getter, do nothing.
-  if (!prop->getGetter() || !requiresObjCMethodEntryPoint(prop->getGetter()))
+  if (!getter || !requiresObjCMethodEntryPoint(getter))
     return;
 
-  auto getter = SILDeclRef(prop->getGetter(), SILDeclRef::Kind::Func)
-    .asForeign();
+  auto getterRef = SILDeclRef(getter, SILDeclRef::Kind::Func).asForeign();
 
   // Don't emit the thunks if they already exist.
-  if (hasFunction(getter))
+  if (hasFunction(getterRef))
     return;
 
-  RegularLocation ThunkBodyLoc(prop);
-  ThunkBodyLoc.markAutoGenerated();
   // ObjC entry points are always externally usable, so emitting can't be
   // delayed.
-  {
-    SILFunction *f = getFunction(getter, ForDefinition);
-    preEmitFunction(getter, prop, f, ThunkBodyLoc);
-    PrettyStackTraceSILFunction X("silgen objc property getter thunk", f);
-    f->setBare(IsBare);
-    f->setThunk(IsThunk);
-    SILGenFunction(*this, *f).emitNativeToForeignThunk(getter);
-    postEmitFunction(getter, f);
-  }
+  emitNativeToForeignThunk(getterRef);
 
   if (!prop->isSettable(prop->getDeclContext()))
     return;
 
   // FIXME: Add proper location.
-  auto setter = SILDeclRef(prop->getSetter(), SILDeclRef::Kind::Func)
-    .asForeign();
-
-  SILFunction *f = getFunction(setter, ForDefinition);
-  preEmitFunction(setter, prop, f, ThunkBodyLoc);
-  PrettyStackTraceSILFunction X("silgen objc property setter thunk", f);
-  f->setBare(IsBare);
-  f->setThunk(IsThunk);
-  SILGenFunction(*this, *f).emitNativeToForeignThunk(setter);
-  postEmitFunction(setter, f);
+  auto *setter = prop->getOpaqueAccessor(AccessorKind::Set);
+  auto setterRef = SILDeclRef(setter, SILDeclRef::Kind::Func).asForeign();
+  emitNativeToForeignThunk(setterRef);
 }
 
 void SILGenModule::emitObjCConstructorThunk(ConstructorDecl *constructor) {
@@ -1101,14 +1866,7 @@ void SILGenModule::emitObjCConstructorThunk(ConstructorDecl *constructor) {
     return;
   // ObjC entry points are always externally usable, so emitting can't be
   // delayed.
-
-  SILFunction *f = getFunction(thunk, ForDefinition);
-  preEmitFunction(thunk, constructor, f, constructor);
-  PrettyStackTraceSILFunction X("silgen objc constructor thunk", f);
-  f->setBare(IsBare);
-  f->setThunk(IsThunk);
-  SILGenFunction(*this, *f).emitNativeToForeignThunk(thunk);
-  postEmitFunction(thunk, f);
+  emitNativeToForeignThunk(thunk);
 }
 
 void SILGenModule::emitObjCDestructorThunk(DestructorDecl *destructor) {
@@ -1118,368 +1876,399 @@ void SILGenModule::emitObjCDestructorThunk(DestructorDecl *destructor) {
   // Don't emit the thunk if it already exists.
   if (hasFunction(thunk))
     return;
-  SILFunction *f = getFunction(thunk, ForDefinition);
-  preEmitFunction(thunk, destructor, f, destructor);
-  PrettyStackTraceSILFunction X("silgen objc destructor thunk", f);
-  f->setBare(IsBare);
-  f->setThunk(IsThunk);
-  SILGenFunction(*this, *f).emitNativeToForeignThunk(thunk);
-  postEmitFunction(thunk, f);
+
+  emitNativeToForeignThunk(thunk);
 }
 
 void SILGenModule::visitPatternBindingDecl(PatternBindingDecl *pd) {
-  assert(!TopLevelSGF && "script mode PBDs should be in TopLevelCodeDecls");
-  for (unsigned i = 0, e = pd->getNumPatternEntries(); i != e; ++i)
-    if (pd->getInit(i))
+  for (auto i : range(pd->getNumPatternEntries()))
+    if (pd->getExecutableInit(i))
       emitGlobalInitialization(pd, i);
 }
 
 void SILGenModule::visitVarDecl(VarDecl *vd) {
-  if (vd->hasBehavior())
-    emitPropertyBehavior(vd);
-
   if (vd->hasStorage())
     addGlobalVariable(vd);
 
-  if (vd->getStorageKind() == AbstractStorageDecl::StoredWithTrivialAccessors) {
-    // If the global variable has storage, it might also have synthesized
-    // accessors. Emit them here, since they won't appear anywhere else.
-    if (auto getter = vd->getGetter())
-      emitFunction(getter);
-    if (auto setter = vd->getSetter())
-      emitFunction(setter);
-  }
+  visitEmittedAccessors(vd, [&](AccessorDecl *accessor) {
+    emitFunction(accessor);
+  });
+
+  tryEmitPropertyDescriptor(vd);
 }
 
-void SILGenModule::emitPropertyBehavior(VarDecl *vd) {
-  assert(vd->hasBehavior());
-  // Emit the protocol conformance to the behavior.
-  getWitnessTable(*vd->getBehavior()->Conformance);
+void SILGenModule::visitSubscriptDecl(SubscriptDecl *sd) {
+  llvm_unreachable("top-level subscript?");
 }
 
-void SILGenModule::visitIfConfigDecl(IfConfigDecl *ICD) {
-  // Nothing to do for these kinds of decls - anything active has been added
-  // to the enclosing declaration.
+void SILGenModule::visitMissingDecl(MissingDecl *sd) {
+  llvm_unreachable("missing decl in SILGen");
 }
 
-void SILGenModule::visitTopLevelCodeDecl(TopLevelCodeDecl *td) {
-  assert(TopLevelSGF && "top-level code in a non-main source file!");
+void SILGenModule::visitMacroDecl(MacroDecl *d) {
+  // nothing to emit for macros
+}
 
-  if (!TopLevelSGF->B.hasValidInsertionPoint())
-    return;
+void SILGenModule::visitMacroExpansionDecl(MacroExpansionDecl *d) {
+  // Expansion already visited as auxiliary decls.
+}
 
-  ProfilerRAII Profiler(*this, td);
-  TopLevelSGF->emitProfilerIncrement(td->getBody());
- 
-  for (auto &ESD : td->getBody()->getElements()) {
-    if (!TopLevelSGF->B.hasValidInsertionPoint()) {
-      if (auto *S = ESD.dyn_cast<Stmt*>()) {
-        if (S->isImplicit())
-          continue;
-      } else if (auto *E = ESD.dyn_cast<Expr*>()) {
-        if (E->isImplicit())
-          continue;
-      }
-
-      diagnose(ESD.getStartLoc(), diag::unreachable_code);
-      // There's no point in trying to emit anything else.
+void SILGenModule::visitEmittedAccessors(
+    AbstractStorageDecl *D, llvm::function_ref<void(AccessorDecl *)> callback) {
+  D->visitEmittedAccessors([&](AccessorDecl *accessor) {
+    if (shouldSkipDecl(accessor))
       return;
-    }
 
-    if (auto *S = ESD.dyn_cast<Stmt*>()) {
-      TopLevelSGF->emitStmt(S);
-    } else if (auto *E = ESD.dyn_cast<Expr*>()) {
-      TopLevelSGF->emitIgnoredExpr(E);
-    } else {
-      TopLevelSGF->visit(ESD.get<Decl*>());
-    }
-  }
+    callback(accessor);
+  });
 }
 
-void SILGenModule::useConformance(ProtocolConformanceRef conformanceRef) {
-  // We don't need to emit dependent conformances.
-  if (conformanceRef.isAbstract()) 
-    return;
+bool
+SILGenModule::canStorageUseStoredKeyPathComponent(AbstractStorageDecl *decl,
+                                                  ResilienceExpansion expansion) {
+  // If the declaration is resilient, we have to treat the component as
+  // computed.
+  if (decl->isResilient(M.getSwiftModule(), expansion))
+    return false;
 
-  auto conformance = conformanceRef.getConcrete();
-  auto root = conformance->getRootNormalConformance();
+  auto strategy = decl->getAccessStrategy(
+      AccessSemantics::Ordinary,
+      decl->supportsMutation() ? AccessKind::ReadWrite : AccessKind::Read,
+      M.getSwiftModule(), expansion,
+      /*useOldABI=*/false);
+  switch (strategy.getKind()) {
+  case AccessStrategy::Storage: {
+    // Keypaths rely on accessors to handle the special behavior of weak,
+    // unowned, or static properties.
+    if (decl->getInterfaceType()->is<ReferenceStorageType>() ||
+        decl->isStatic())
+      return false;
 
-  // If we already emitted this witness table, we don't need to track the fact
-  // we need it.
-  if (emittedWitnessTables.count(root))
-    return;
-
-  // If we delayed emitting this witness table, force it.
-  auto foundDelayed = delayedConformances.find(root);
-  if (foundDelayed != delayedConformances.end()) {
-    forcedConformances.push_back(*foundDelayed);
-    delayedConformances.erase(foundDelayed);
-    return;
-  }
-
-  // Otherwise, just remember the fact we used this conformance.
-  usedConformances.insert(root);
-}
-
-void
-SILGenModule::useConformancesFromSubstitutions(SubstitutionList subs) {
-  for (auto &sub : subs) {
-    for (auto conformance : sub.getConformances())
-      useConformance(conformance);
-  }
-}
-
-namespace {
-
-/// An RAII class to scope source file codegen.
-class SourceFileScope {
-  SILGenModule &sgm;
-  SourceFile *sf;
-  Optional<Scope> scope;
-public:
-  SourceFileScope(SILGenModule &sgm, SourceFile *sf) : sgm(sgm), sf(sf) {
-    // If this is the script-mode file for the module, create a toplevel.
-    if (sf->isScriptMode()) {
-      assert(!sgm.TopLevelSGF && "already emitted toplevel?!");
-      assert(!sgm.M.lookUpFunction(SWIFT_ENTRY_POINT_FUNCTION)
-             && "already emitted toplevel?!");
-
-      RegularLocation TopLevelLoc = RegularLocation::getModuleLocation();
-      SILFunction *toplevel = sgm.emitTopLevelFunction(TopLevelLoc);
-
-      // Assign a debug scope pointing into the void to the top level function.
-      toplevel->setDebugScope(new (sgm.M) SILDebugScope(TopLevelLoc, toplevel));
-
-      sgm.TopLevelSGF = new SILGenFunction(sgm, *toplevel);
-      sgm.TopLevelSGF->MagicFunctionName = sgm.SwiftModule->getName();
-      sgm.TopLevelSGF->prepareEpilog(Type(), false,
-                                 CleanupLocation::getModuleCleanupLocation());
-
-      sgm.TopLevelSGF->prepareRethrowEpilog(
-                                 CleanupLocation::getModuleCleanupLocation());
-
-      // Create the argc and argv arguments.
-      auto PrologueLoc = RegularLocation::getModuleLocation();
-      PrologueLoc.markAsPrologue();
-      auto entry = sgm.TopLevelSGF->B.getInsertionBB();
-      auto paramTypeIter =
-          sgm.TopLevelSGF->F.getConventions().getParameterSILTypes().begin();
-      entry->createFunctionArgument(*paramTypeIter);
-      entry->createFunctionArgument(*std::next(paramTypeIter));
-
-      scope.emplace(sgm.TopLevelSGF->Cleanups,
-                    CleanupLocation::getModuleCleanupLocation());
-    }
-  }
-
-  ~SourceFileScope() {
-    if (sgm.TopLevelSGF) {
-      scope.reset();
-
-      // Unregister the top-level function emitter.
-      auto &SGF = *sgm.TopLevelSGF;
-      sgm.TopLevelSGF = nullptr;
-
-      // Write out the epilog.
-      auto moduleLoc = RegularLocation::getModuleLocation();
-      moduleLoc.markAutoGenerated();
-      auto returnInfo = SGF.emitEpilogBB(moduleLoc);
-      auto returnLoc = returnInfo.second;
-      returnLoc.markAutoGenerated();
-
-      SILType returnType = SGF.F.getConventions().getSingleSILResultType();
-      auto emitTopLevelReturnValue = [&](unsigned value) -> SILValue {
-        // Create an integer literal for the value.
-        auto litType = SILType::getBuiltinIntegerType(32, sgm.getASTContext());
-        SILValue retValue =
-          SGF.B.createIntegerLiteral(moduleLoc, litType, value);
-
-        // Wrap that in a struct if necessary.
-        if (litType != returnType) {
-          retValue = SGF.B.createStruct(moduleLoc, returnType, retValue);
-        }
-        return retValue;
-      };
-
-      // Fallthrough should signal a normal exit by returning 0.
-      SILValue returnValue;
-      if (SGF.B.hasValidInsertionPoint())
-        returnValue = emitTopLevelReturnValue(0);
-
-      // Handle the implicit rethrow block.
-      auto rethrowBB = SGF.ThrowDest.getBlock();
-      SGF.ThrowDest = JumpDest::invalid();
-
-      // If the rethrow block wasn't actually used, just remove it.
-      if (rethrowBB->pred_empty()) {
-        SGF.eraseBasicBlock(rethrowBB);
-
-      // Otherwise, we need to produce a unified return block.
-      } else {
-        auto returnBB = SGF.createBasicBlock();
-        if (SGF.B.hasValidInsertionPoint())
-          SGF.B.createBranch(returnLoc, returnBB, returnValue);
-        returnValue =
-            returnBB->createPHIArgument(returnType, ValueOwnershipKind::Owned);
-        SGF.B.emitBlock(returnBB);
-
-        // Emit the rethrow block.
-        SILGenSavedInsertionPoint savedIP(SGF, rethrowBB,
-                                          FunctionSection::Postmatter);
-
-        // Log the error.
-        SILValue error = rethrowBB->getArgument(0);
-        SGF.B.createBuiltin(moduleLoc,
-                            sgm.getASTContext().getIdentifier("errorInMain"),
-                            sgm.Types.getEmptyTupleType(), {}, {error});
-
-        // Signal an abnormal exit by returning 1.
-        SGF.Cleanups.emitCleanupsForReturn(CleanupLocation::get(moduleLoc));
-        SGF.B.createBranch(returnLoc, returnBB, emitTopLevelReturnValue(1));
+    // If the field offset depends on the generic instantiation, we have to
+    // load it from metadata when instantiating the keypath component.
+    //
+    // However the metadata offset itself will not be fixed if the superclass
+    // is resilient. Fall back to treating the property as computed in this
+    // case.
+    //
+    // See the call to getClassFieldOffsetOffset() inside
+    // emitKeyPathComponent().
+    if (auto *parentClass = dyn_cast<ClassDecl>(decl->getDeclContext())) {
+      if (parentClass->isGeneric()) {
+        auto ancestry = parentClass->checkAncestry();
+        if (ancestry.contains(AncestryFlags::ResilientOther))
+          return false;
       }
-
-      // Return.
-      if (SGF.B.hasValidInsertionPoint())
-        SGF.B.createReturn(returnLoc, returnValue);
-
-      // Okay, we're done emitting the top-level function; destroy the
-      // emitter and verify the result.
-      SILFunction *toplevel = &SGF.getFunction();
-      delete &SGF;
-
-      DEBUG(llvm::dbgs() << "lowered toplevel sil:\n";
-            toplevel->print(llvm::dbgs()));
-      toplevel->verify();
     }
 
-    // If the source file contains an artificial main, emit the implicit
-    // toplevel code.
-    if (auto mainClass = sf->getMainClass()) {
-      assert(!sgm.M.lookUpFunction(SWIFT_ENTRY_POINT_FUNCTION)
-             && "already emitted toplevel before main class?!");
+    // If the stored value would need to be reabstracted in fully opaque
+    // context, then we have to treat the component as computed.
+    auto componentObjTy = decl->getValueInterfaceType();
+    if (auto genericEnv =
+              decl->getInnermostDeclContext()->getGenericEnvironmentOfContext())
+      componentObjTy = genericEnv->mapTypeIntoContext(componentObjTy);
+    auto storageTy = M.Types.getSubstitutedStorageType(
+        TypeExpansionContext::minimal(), decl, componentObjTy);
+    auto opaqueTy = M.Types.getLoweredRValueType(
+        TypeExpansionContext::noOpaqueTypeArchetypesSubstitution(expansion),
+        AbstractionPattern::getOpaque(), componentObjTy);
 
-      RegularLocation TopLevelLoc = RegularLocation::getModuleLocation();
-      SILFunction *toplevel = sgm.emitTopLevelFunction(TopLevelLoc);
-
-      // Assign a debug scope pointing into the void to the top level function.
-      toplevel->setDebugScope(new (sgm.M) SILDebugScope(TopLevelLoc, toplevel));
-
-      // Create the argc and argv arguments.
-      SILGenFunction SGF(sgm, *toplevel);
-      auto entry = SGF.B.getInsertionBB();
-      auto paramTypeIter =
-          SGF.F.getConventions().getParameterSILTypes().begin();
-      entry->createFunctionArgument(*paramTypeIter);
-      entry->createFunctionArgument(*std::next(paramTypeIter));
-      SGF.emitArtificialTopLevel(mainClass);
-    }
+    return storageTy.getASTType() == opaqueTy;
   }
-};
-
-} // end anonymous namespace
-
-void SILGenModule::emitSourceFile(SourceFile *sf, unsigned startElem) {
-  SourceFileScope scope(*this, sf);
-  for (Decl *D : llvm::makeArrayRef(sf->Decls).slice(startElem))
-    visit(D);
-
-  for (Decl *D : sf->LocalTypeDecls)
-    visit(D);
-
-  // Mark any conformances as "used".
-  for (auto conformance : sf->getUsedConformances())
-    useConformance(ProtocolConformanceRef(conformance));
+  case AccessStrategy::DirectToAccessor:
+  case AccessStrategy::DispatchToAccessor:
+  case AccessStrategy::MaterializeToTemporary:
+  case AccessStrategy::DispatchToDistributedThunk:
+    return false;
+  }
+  llvm_unreachable("unhandled strategy");
 }
 
-//===----------------------------------------------------------------------===//
-// SILModule::constructSIL method implementation
-//===----------------------------------------------------------------------===//
+static bool canStorageUseTrivialDescriptor(SILGenModule &SGM,
+                                           AbstractStorageDecl *decl) {
+  // A property can use a trivial property descriptor if the key path component
+  // that an external module would form given publicly-exported information
+  // about the property is never equivalent to the canonical component for the
+  // key path.
+  // This means that the property isn't stored (without promising to be always
+  // stored) and doesn't have a setter with less-than-public visibility.
+  auto expansion = ResilienceExpansion::Maximal;
+
+  if (!SGM.M.getSwiftModule()->isResilient()) {
+    if (SGM.canStorageUseStoredKeyPathComponent(decl, expansion)) {
+      // External modules can't directly access storage, unless this is a
+      // property in a fixed-layout type.
+      // Assert here as key path component cannot refer to a static var.
+      assert(!decl->isStatic());
+      // By this point, decl is a fixed layout or its enclosing type is non-resilient.
+      return true;
+    }
+
+    // If the type is computed and doesn't have a setter that's hidden from
+    // the public, then external components can form the canonical key path
+    // without our help.
+    auto *setter = decl->getOpaqueAccessor(AccessorKind::Set);
+    if (!setter)
+      return true;
+
+    if (setter->getFormalAccessScope(nullptr, true).isPublicOrPackage())
+      return true;
+
+    return false;
+  }
+
+  // A resilient module needs to handle binaries compiled against its older
+  // versions. This means we have to be a bit more conservative, since in
+  // earlier versions, a settable property may have withheld the setter,
+  // or a fixed-layout type may not have been.
+  // Without availability information, only get-only computed properties
+  // can resiliently use trivial descriptors.
+  return (!SGM.canStorageUseStoredKeyPathComponent(decl, expansion) &&
+          !decl->supportsMutation());
+}
+
+void SILGenModule::tryEmitPropertyDescriptor(AbstractStorageDecl *decl) {
+  // TODO: Key path code emission doesn't handle opaque values properly yet.
+  if (!SILModuleConventions(M).useLoweredAddresses())
+    return;
+  
+  if (!decl->exportsPropertyDescriptor())
+    return;
+
+  PrettyStackTraceDecl stackTrace("emitting property descriptor for", decl);
+
+  Type baseTy;
+  if (decl->getDeclContext()->isTypeContext()) {
+
+    baseTy = decl->getDeclContext()->getSelfInterfaceType()
+                 ->getReducedType(decl->getInnermostDeclContext()
+                                      ->getGenericSignatureOfContext());
+    
+    if (decl->isStatic()) {
+      baseTy = MetatypeType::get(baseTy);
+    }
+  } else {
+    // TODO: Global variables should eventually be referenceable as
+    // key paths from (), viz. baseTy = TupleType::getEmpty(getASTContext());
+    llvm_unreachable("should not export a property descriptor yet");
+  }
+
+  auto genericEnv = decl->getInnermostDeclContext()
+                        ->getGenericEnvironmentOfContext();
+  unsigned baseOperand = 0;
+  bool needsGenericContext = true;
+  
+  if (canStorageUseTrivialDescriptor(*this, decl)) {
+    (void)SILProperty::create(M, /*serializedKind*/ 0, decl, std::nullopt);
+    return;
+  }
+  
+  SubstitutionMap subs;
+  if (genericEnv)
+    subs = genericEnv->getForwardingSubstitutionMap();
+  
+  auto component = emitKeyPathComponentForDecl(SILLocation(decl),
+                                               genericEnv,
+                                               ResilienceExpansion::Maximal,
+                                               baseOperand, needsGenericContext,
+                                               subs, decl, {},
+                                               baseTy->getCanonicalType(),
+                                               M.getSwiftModule(),
+                                               /*property descriptor*/ true);
+  
+  (void)SILProperty::create(M, /*serializedKind*/ 0, decl, component);
+}
+
+void SILGenModule::visitPoundDiagnosticDecl(PoundDiagnosticDecl *PDD) {
+  // Nothing to do for #error/#warning; they've already been emitted.
+}
+
+void SILGenModule::emitSourceFile(SourceFile *sf) {
+  // Type-check the file if we haven't already.
+  performTypeChecking(*sf);
+
+  if (sf->isScriptMode()) {
+    emitEntryPoint(sf);
+  }
+
+  for (auto *D : sf->getTopLevelDecls()) {
+    // Emit auxiliary decls.
+    D->visitAuxiliaryDecls([&](Decl *auxiliaryDecl) {
+      visit(auxiliaryDecl);
+    });
+
+    visit(D);
+  }
+
+  // FIXME: Visit macro-generated extensions separately.
+  //
+  // The code below that visits auxiliary decls of the top-level
+  // decls in the source file does not work for nested types with
+  // attached conformance macros:
+  // ```
+  // struct Outer {
+  //   @AddConformance struct Inner {}
+  // }
+  // ```
+  // Because the attached-to decl is not at the top-level. To fix this,
+  // visit the macro-generated conformances that are recorded in the
+  // synthesized file unit to cover all macro-generated extension decls.
+  if (auto *synthesizedFile = sf->getSynthesizedFile()) {
+    for (auto *D : synthesizedFile->getTopLevelDecls()) {
+      if (!isa<ExtensionDecl>(D))
+        continue;
+
+      auto *sf = D->getInnermostDeclContext()->getParentSourceFile();
+      if (sf->getFulfilledMacroRole() != MacroRole::Conformance &&
+          sf->getFulfilledMacroRole() != MacroRole::Extension)
+        continue;
+
+      visit(D);
+    }
+  }
+
+  for (Decl *D : sf->getHoistedDecls()) {
+    visit(D);
+  }
+
+  for (TypeDecl *TD : sf->getLocalTypeDecls()) {
+    // FIXME: Delayed parsing would prevent these types from being added to
+    //        the module in the first place.
+    if (TD->getDeclContext()->getInnermostSkippedFunctionContext())
+      continue;
+    visit(TD);
+  }
+
+  // If the source file contains an artificial main, emit the implicit
+  // top-level code.
+  if (auto *mainDecl = sf->getMainDecl()) {
+    if (isa<FuncDecl>(mainDecl) &&
+        static_cast<FuncDecl *>(mainDecl)->hasAsync()) {
+      auto ref = SILDeclRef::getAsyncMainDeclEntryPoint(mainDecl);
+      emitFunctionDefinition(ref, getFunction(ref, ForDefinition));
+    }
+    auto ref = SILDeclRef::getMainDeclEntryPoint(mainDecl);
+    emitFunctionDefinition(ref, getFunction(ref, ForDefinition));
+  }
+}
+
+void SILGenModule::emitSymbolSource(SymbolSource Source) {
+  switch (Source.kind) {
+  case SymbolSource::Kind::SIL: {
+    auto ref = Source.getSILDeclRef();
+    emitFunctionDefinition(ref, getFunction(ref, ForDefinition));
+    break;
+  }
+  case SymbolSource::Kind::Global:
+    addGlobalVariable(Source.getGlobal());
+    break;
+  case SymbolSource::Kind::IR:
+    llvm_unreachable("Unimplemented: Emission of LinkEntities");
+  case SymbolSource::Kind::Unknown:
+  case SymbolSource::Kind::LinkerDirective:
+    // Nothing to do
+    break;
+  }
+}
 
 std::unique_ptr<SILModule>
-SILModule::constructSIL(ModuleDecl *mod, SILOptions &options, FileUnit *SF,
-                        Optional<unsigned> startElem,
-                        bool isWholeModule) {
-  SharedTimer timer("SILGen");
-  const DeclContext *DC;
-  if (startElem) {
-    assert(SF && "cannot have a start element without a source file");
-    // Because more decls may be added to the SourceFile, we can't assume
-    // anything about the compilation context.
-    DC = nullptr;
-  } else if (SF) {
-    DC = SF;
-  } else {
-    DC = mod;
+ASTLoweringRequest::evaluate(Evaluator &evaluator,
+                             ASTLoweringDescriptor desc) const {
+  // If we have a .sil file to parse, defer to the parsing request.
+  if (desc.getSourceFileToParse()) {
+    return evaluateOrFatal(evaluator, ParseSILModuleRequest{desc});
   }
 
-  std::unique_ptr<SILModule> M(
-      new SILModule(mod, options, DC, isWholeModule));
-  SILGenModule SGM(*M, mod);
+  auto silMod = SILModule::createEmptyModule(desc.context, desc.conv,
+                                             desc.opts, desc.irgenOptions);
 
-  if (SF) {
-    if (auto *file = dyn_cast<SourceFile>(SF)) {
-      SGM.emitSourceFile(file, startElem.getValueOr(0));
-    } else if (auto *file = dyn_cast<SerializedASTFile>(SF)) {
-      if (file->isSIB())
-        M->getSILLoader()->getAllForModule(mod->getName(), file);
-    }
-  } else {
-    for (auto file : mod->getFiles()) {
-      auto nextSF = dyn_cast<SourceFile>(file);
-      if (!nextSF || nextSF->ASTStage != SourceFile::TypeChecked)
-        continue;
-      SGM.emitSourceFile(nextSF, 0);
-    }
+  auto &ctx = silMod->getASTContext();
+  FrontendStatsTracer tracer(ctx.Stats, "SILGen");
 
-    // Also make sure to process any intermediate files that may contain SIL
-    bool hasSIB = std::any_of(mod->getFiles().begin(),
-                              mod->getFiles().end(),
-                              [](const FileUnit *File) -> bool {
-      auto *SASTF = dyn_cast<SerializedASTFile>(File);
-      return SASTF && SASTF->isSIB();
-    });
-    if (hasSIB)
-      M->getSILLoader()->getAllForModule(mod->getName(), nullptr);
+  // If all function bodies are being skipped there's no reason to do any
+  // SIL generation.
+  if (desc.opts.SkipFunctionBodies == FunctionBodySkipping::All)
+    return silMod;
+
+  // Skip emitting SIL if there's been any compilation errors
+  if (ctx.hadError() &&
+      ctx.LangOpts.AllowModuleWithCompilerErrors)
+    return silMod;
+
+  SILGenModule SGM(*silMod, silMod->getSwiftModule());
+
+  // Emit a specific set of SILDeclRefs if needed.
+  if (auto Sources = desc.SourcesToEmit) {
+    for (auto Source : *Sources)
+      SGM.emitSymbolSource(std::move(Source));
   }
 
-  // Emit external definitions used by this module.
-  for (size_t i = 0, e = mod->getASTContext().LastCheckedExternalDefinition;
-       i != e; ++i) {
-    auto def = mod->getASTContext().ExternalDefinitions[i];
-    SGM.emitExternalDefinition(def);
+  // Emit any whole-files needed.
+  for (auto file : desc.getFilesToEmit()) {
+    if (auto *nextSF = dyn_cast<SourceFile>(file))
+      SGM.emitSourceFile(nextSF);
+  }
+
+  // Also make sure to process any intermediate files that may contain SIL.
+  bool shouldDeserialize =
+      llvm::any_of(desc.getFilesToEmit(), [](const FileUnit *File) -> bool {
+        return isa<SerializedASTFile>(File);
+      });
+  if (shouldDeserialize) {
+    auto *primary = desc.context.dyn_cast<FileUnit *>();
+    silMod->getSILLoader()->getAllForModule(silMod->getSwiftModule()->getName(),
+                                            primary);
   }
 
   // Emit any delayed definitions that were forced.
-  // Emitting these may in turn force more definitions, so we have to take care
-  // to keep pumping the queues.
-  while (!SGM.forcedFunctions.empty()
-         || !SGM.forcedConformances.empty()) {
-    while (!SGM.forcedFunctions.empty()) {
-      auto &front = SGM.forcedFunctions.front();
-      front.second.emitter(SGM.getFunction(front.first, ForDefinition));
-      SGM.forcedFunctions.pop_front();
+  // Emitting these may in turn force more definitions, so we have to take
+  // care to keep pumping the queues.
+  while (!SGM.pendingForcedFunctions.empty()
+         || !SGM.pendingConformances.empty()) {
+    while (!SGM.pendingForcedFunctions.empty()) {
+      auto &front = SGM.pendingForcedFunctions.front();
+      SGM.emitFunctionDefinition(
+          front, SGM.getEmittedFunction(front, ForDefinition));
+      SGM.pendingForcedFunctions.pop_front();
     }
-    while (!SGM.forcedConformances.empty()) {
-      auto &front = SGM.forcedConformances.front();
-      SGM.getWitnessTable(front.first);
-      SGM.forcedConformances.pop_front();
+    while (!SGM.pendingConformances.empty()) {
+      (void)SGM.getWitnessTable(SGM.pendingConformances.front());
+      SGM.pendingConformances.pop_front();
     }
   }
 
-  return M;
+  return silMod;
 }
 
 std::unique_ptr<SILModule>
-swift::performSILGeneration(ModuleDecl *mod,
-                            SILOptions &options,
-                            bool wholeModuleCompilation) {
-  return SILModule::constructSIL(mod, options, nullptr, None,
-                                 wholeModuleCompilation);
+swift::performASTLowering(ModuleDecl *mod, Lowering::TypeConverter &tc,
+                          const SILOptions &options,
+                          const IRGenOptions *irgenOptions) {
+  auto desc = ASTLoweringDescriptor::forWholeModule(mod, tc, options,
+                                                    std::nullopt, irgenOptions);
+  return evaluateOrFatal(mod->getASTContext().evaluator,
+                         ASTLoweringRequest{desc});
+}
+
+std::unique_ptr<SILModule> swift::performASTLowering(CompilerInstance &CI,
+                                                     SymbolSources Sources) {
+  auto *M = CI.getMainModule();
+  const auto &Invocation = CI.getInvocation();
+  const auto &SILOpts = Invocation.getSILOptions();
+  const auto &IRGenOpts = Invocation.getIRGenOptions();
+  auto &TC = CI.getSILTypes();
+  auto Desc = ASTLoweringDescriptor::forWholeModule(
+      M, TC, SILOpts, std::move(Sources), &IRGenOpts);
+  return evaluateOrFatal(M->getASTContext().evaluator,
+                         ASTLoweringRequest{Desc});
 }
 
 std::unique_ptr<SILModule>
-swift::performSILGeneration(FileUnit &sf, SILOptions &options,
-                            Optional<unsigned> startElem) {
-  return SILModule::constructSIL(sf.getParentModule(), options, &sf, startElem,
-                                 false);
+swift::performASTLowering(FileUnit &sf, Lowering::TypeConverter &tc,
+                          const SILOptions &options,
+                          const IRGenOptions *irgenOptions) {
+  auto desc =
+      ASTLoweringDescriptor::forFile(sf, tc, options, std::nullopt, irgenOptions);
+  return evaluateOrFatal(sf.getASTContext().evaluator,
+                         ASTLoweringRequest{desc});
 }

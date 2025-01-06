@@ -10,23 +10,17 @@ import Foundation
 
 // REQUIRES: objc_interop
 
-// NO_STDLIB_PRIVATE: Begin completions
-// NO_STDLIB_PRIVATE-NOT: _convertStringToNSString
-// NO_STDLIB_PRIVATE: End completions
+// NO_STDLIB_PRIVATE-NOT: _convertErrorToNSError
 
 #^PLAIN_TOP_LEVEL_1^#
 
-// PLAIN_TOP_LEVEL: Begin completions
-// PLAIN_TOP_LEVEL-DAG: Decl[Struct]/OtherModule[Foundation.NSURL]: URLResourceKey[#URLResourceKey#]{{; name=.+}}
-// PLAIN_TOP_LEVEL: End completions
+// PLAIN_TOP_LEVEL-DAG: Decl[Struct]/OtherModule[Foundation.NSURL]/IsSystem: URLResourceKey[#URLResourceKey#]{{; name=.+}}
 
 func privateNominalMembers(a: String) {
   a.#^PRIVATE_NOMINAL_MEMBERS_1^#
 }
 
-// PRIVATE_NOMINAL_MEMBERS_1: Begin completions
 
 // FIXME: we should show the qualified String.Index type.
 // rdar://problem/20788802
-// PRIVATE_NOMINAL_MEMBERS_1-DAG: Decl[InstanceVar]/CurrNominal: startIndex[#String.Index#]{{; name=.+$}}
-// PRIVATE_NOMINAL_MEMBERS_1: End completions
+// PRIVATE_NOMINAL_MEMBERS_1-DAG: Decl[InstanceVar]/CurrNominal/IsSystem: startIndex[#String.Index#]{{; name=.+$}}

@@ -24,6 +24,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/Comment.h"
 #include "clang/AST/Decl.h"
 #include "clang/Index/CommentToXML.h"
 
@@ -70,6 +71,18 @@ struct CommentToXMLConverter {
 
   void printDocument(const Document *D) {
     llvm_unreachable("Can't print a swift::markup::Document as XML directly");
+  }
+
+  void printInlineAttributes(const InlineAttributes *A) {
+    OS << "<InlineAttributes attributes=\"";
+    appendWithXMLEscaping(OS, A->getAttributes());
+    OS << "\">";
+
+    for (const auto *N : A->getChildren()) {
+      printASTNode(N);
+    }
+
+    OS << "</InlineAttributes>";
   }
 
   void printBlockQuote(const BlockQuote *BQ) {
@@ -219,7 +232,7 @@ struct CommentToXMLConverter {
 
     if (PF->isClosureParameter()) {
       OS << "<ClosureParameter>";
-      visitCommentParts(PF->getParts().getValue());
+      visitCommentParts(PF->getParts().value());
       OS << "</ClosureParameter>";
     } else {
       OS << "<Discussion>";
@@ -247,7 +260,7 @@ struct CommentToXMLConverter {
 
   void printTagFields(ArrayRef<StringRef> Tags) {
     OS << "<Tags>";
-    for (const auto Tag : Tags) {
+    for (const auto &Tag : Tags) {
       if (Tag.empty()) {
         continue;
       }
@@ -258,15 +271,15 @@ struct CommentToXMLConverter {
     OS << "</Tags>";
   }
 
-  void visitDocComment(const DocComment *DC);
+  void visitDocComment(const DocComment *DC, TypeOrExtensionDecl SynthesizedTarget);
   void visitCommentParts(const swift::markup::CommentParts &Parts);
 };
 } // unnamed namespace
 
 void CommentToXMLConverter::visitCommentParts(const swift::markup::CommentParts &Parts) {
-  if (Parts.Brief.hasValue()) {
+  if (Parts.Brief.has_value()) {
     OS << "<Abstract>";
-    printASTNode(Parts.Brief.getValue());
+    printASTNode(Parts.Brief.value());
     OS << "</Abstract>";
   }
 
@@ -278,14 +291,14 @@ void CommentToXMLConverter::visitCommentParts(const swift::markup::CommentParts 
     OS << "</Parameters>";
   }
 
-  if (Parts.ReturnsField.hasValue())
-    printResultDiscussion(Parts.ReturnsField.getValue());
+  if (Parts.ReturnsField.has_value())
+    printResultDiscussion(Parts.ReturnsField.value());
 
-  if (Parts.ThrowsField.hasValue())
-    printThrowsDiscussion(Parts.ThrowsField.getValue());
+  if (Parts.ThrowsField.has_value())
+    printThrowsDiscussion(Parts.ThrowsField.value());
 
   if (!Parts.Tags.empty()) {
-    printTagFields(llvm::makeArrayRef(Parts.Tags.begin(), Parts.Tags.end()));
+    printTagFields(llvm::ArrayRef(Parts.Tags.begin(), Parts.Tags.end()));
   }
 
   if (!Parts.BodyNodes.empty()) {
@@ -297,7 +310,8 @@ void CommentToXMLConverter::visitCommentParts(const swift::markup::CommentParts 
   }
 }
 
-void CommentToXMLConverter::visitDocComment(const DocComment *DC) {
+void CommentToXMLConverter::
+visitDocComment(const DocComment *DC, TypeOrExtensionDecl SynthesizedTarget) {
   const Decl *D = DC->getDecl();
 
   StringRef RootEndTag;
@@ -314,12 +328,11 @@ void CommentToXMLConverter::visitDocComment(const DocComment *DC) {
 
   {
     // Print line and column number.
-    auto Loc = D->getLoc();
+    auto Loc = D->getLoc(/*SerializedOK=*/true);
     if (Loc.isValid()) {
       const auto &SM = D->getASTContext().SourceMgr;
-      unsigned BufferID = SM.findBufferContainingLoc(Loc);
-      StringRef FileName = SM.getIdentifierForBuffer(BufferID);
-      auto LineAndColumn = SM.getLineAndColumn(Loc);
+      StringRef FileName = SM.getDisplayNameForLoc(Loc);
+      auto LineAndColumn = SM.getPresumedLineAndColumnForLoc(Loc);
       OS << " file=\"";
       appendWithXMLEscaping(OS, FileName);
       OS << "\"";
@@ -337,7 +350,7 @@ void CommentToXMLConverter::visitDocComment(const DocComment *DC) {
   if (VD && VD->hasName()) {
     llvm::SmallString<64> SS;
     llvm::raw_svector_ostream NameOS(SS);
-    NameOS << VD->getFullName();
+    NameOS << VD->getName();
     appendWithXMLEscaping(OS, NameOS.str());
   }
   OS << "</Name>";
@@ -347,7 +360,11 @@ void CommentToXMLConverter::visitDocComment(const DocComment *DC) {
     bool Failed;
     {
       llvm::raw_svector_ostream OS(SS);
-      Failed = ide::printDeclUSR(VD, OS);
+      Failed = ide::printValueDeclUSR(VD, OS);
+      if (!Failed && SynthesizedTarget) {
+        OS << "::SYNTHESIZED::";
+        Failed = ide::printValueDeclUSR(SynthesizedTarget.getBaseNominal(), OS);
+      }
     }
     if (!Failed && !SS.empty()) {
       OS << "<USR>" << SS << "</USR>";
@@ -355,7 +372,8 @@ void CommentToXMLConverter::visitDocComment(const DocComment *DC) {
   }
 
   {
-    PrintOptions PO = PrintOptions::printInterface();
+    PrintOptions PO = PrintOptions::printInterface(
+        D->getASTContext().TypeCheckerOpts.PrintFullConvention);
     PO.PrintAccess = false;
     PO.AccessFilter = AccessLevel::Private;
     PO.PrintDocumentationComments = false;
@@ -363,6 +381,9 @@ void CommentToXMLConverter::visitDocComment(const DocComment *DC) {
     PO.VarInitializers = false;
     PO.ShouldQualifyNestedDeclarations =
         PrintOptions::QualifyNestedDeclarations::TypesOnly;
+    PO.SkipUnderscoredSystemProtocols = false;
+    if (SynthesizedTarget)
+      PO.initForSynthesizedExtension(SynthesizedTarget);
 
     OS << "<Declaration>";
     llvm::SmallString<32> DeclSS;
@@ -399,23 +420,27 @@ static bool getClangDocumentationCommentAsXML(const clang::Decl *D,
   return true;
 }
 
-static void replaceObjcDeclarationsWithSwiftOnes(const Decl *D,
-                                                       StringRef Doc,
-                                                       raw_ostream &OS) {
+static void
+replaceObjcDeclarationsWithSwiftOnes(const Decl *D, StringRef Doc,
+                                     raw_ostream &OS,
+                                     TypeOrExtensionDecl SynthesizedTarget) {
   StringRef Open = "<Declaration>";
   StringRef Close = "</Declaration>";
   PrintOptions Options = PrintOptions::printQuickHelpDeclaration();
+  if (SynthesizedTarget)
+      Options.initForSynthesizedExtension(SynthesizedTarget);
   std::string S;
   llvm::raw_string_ostream SS(S);
   D->print(SS, Options);
-  std::string Signature = SS.str();
   auto OI = Doc.find(Open);
   auto CI = Doc.find(Close);
-  if (StringRef::npos != OI && StringRef::npos != CI && CI > OI)
-    OS << Doc.substr(0, OI) << Open << Signature << Close <<
-      Doc.substr(CI + Close.size());
-  else
+  if (StringRef::npos != OI && StringRef::npos != CI && CI > OI) {
+    OS << Doc.substr(0, OI) << Open;
+    appendWithXMLEscaping(OS, SS.str());
+    OS << Close << Doc.substr(CI + Close.size());
+  } else {
     OS << Doc;
+  }
 }
 
 static LineList getLineListFromComment(SourceManager &SourceMgr,
@@ -444,14 +469,42 @@ std::string ide::extractPlainTextFromComment(const StringRef Text) {
   return getLineListFromComment(SourceMgr, MC, Text).str();
 }
 
-bool ide::getDocumentationCommentAsXML(const Decl *D, raw_ostream &OS) {
+static DocComment *getCascadingDocComment(swift::markup::MarkupContext &MC,
+                                          const Decl *D) {
+  auto *docD = D->getDocCommentProvidingDecl();
+  if (!docD)
+    return nullptr;
+
+  auto *doc = getSingleDocComment(MC, docD);
+  assert(doc && "getDocCommentProvidingDecl() returned decl with no comment");
+
+  // If the doc-comment is inherited from other decl, add a note about it.
+  if (docD != D) {
+    doc->setDecl(D);
+    if (auto baseD = docD->getDeclContext()->getSelfNominalTypeDecl()) {
+      doc->addInheritanceNote(MC, baseD);
+
+      // If the doc is inherited from protocol requirement, associate the
+      // requirement with the doc-comment.
+      // FIXME: This is to keep the old behavior.
+      if (isa<ProtocolDecl>(baseD))
+        doc->setDecl(docD);
+    }
+  }
+
+  return doc;
+}
+
+bool ide::getDocumentationCommentAsXML(const Decl *D, raw_ostream &OS,
+                                       TypeOrExtensionDecl SynthesizedTarget) {
   auto MaybeClangNode = D->getClangNode();
   if (MaybeClangNode) {
     if (auto *CD = MaybeClangNode.getAsDecl()) {
       std::string S;
       llvm::raw_string_ostream SS(S);
       if (getClangDocumentationCommentAsXML(CD, SS)) {
-        replaceObjcDeclarationsWithSwiftOnes(D, SS.str(), OS);
+        replaceObjcDeclarationsWithSwiftOnes(D, SS.str(), OS,
+                                             SynthesizedTarget);
         return true;
       }
     }
@@ -460,12 +513,44 @@ bool ide::getDocumentationCommentAsXML(const Decl *D, raw_ostream &OS) {
 
   swift::markup::MarkupContext MC;
   auto DC = getCascadingDocComment(MC, D);
-  if (!DC.hasValue())
+  if (!DC)
     return false;
 
   CommentToXMLConverter Converter(OS);
-  Converter.visitDocComment(DC.getValue());
+  Converter.visitDocComment(DC, SynthesizedTarget);
 
+  OS.flush();
+  return true;
+}
+
+bool ide::getRawDocumentationComment(const Decl *D, raw_ostream &OS) {
+  ClangNode MaybeClangNode = D->getClangNode();
+  if (MaybeClangNode) {
+    const clang::Decl *CD = MaybeClangNode.getAsDecl();
+    if (!CD) {
+      return false;
+    }
+    const clang::ASTContext &ClangContext = CD->getASTContext();
+    const clang::comments::FullComment *FC =
+      ClangContext.getCommentForDecl(CD, /*PP=*/nullptr);
+    if (!FC) {
+      return false;
+    }
+    const clang::RawComment *rawComment = ClangContext.getRawCommentForAnyRedecl(FC->getDecl());
+    if (!rawComment) {
+      return false;
+    }
+    OS << rawComment->getFormattedText(ClangContext.getSourceManager(),
+                                       ClangContext.getDiagnostics());
+    return true;
+  }
+
+  const Decl *docD = D->getDocCommentProvidingDecl();
+  if (!docD) {
+    return false;
+  }
+  RawComment rawComment = docD->getRawComment();
+  OS << swift::markup::MarkupContext().getLineList(rawComment).str();
   OS.flush();
   return true;
 }
@@ -473,11 +558,11 @@ bool ide::getDocumentationCommentAsXML(const Decl *D, raw_ostream &OS) {
 bool ide::getLocalizationKey(const Decl *D, raw_ostream &OS) {
   swift::markup::MarkupContext MC;
   auto DC = getCascadingDocComment(MC, D);
-  if (!DC.hasValue())
+  if (!DC)
     return false;
 
-  if (const auto LKF = DC.getValue()->getLocalizationKeyField()) {
-    printInlinesUnder(LKF.getValue(), OS);
+  if (const auto LKF = DC->getLocalizationKeyField()) {
+    printInlinesUnder(LKF.value(), OS);
     return true;
   }
 
@@ -546,9 +631,9 @@ class DoxygenConverter : public MarkupASTVisitor<DoxygenConverter> {
   }
 
   void printNestedParamField(const ParamField *PF) {
-    auto Parts = PF->getParts().getValue();
-    if (Parts.Brief.hasValue()) {
-      visit(Parts.Brief.getValue());
+    auto Parts = PF->getParts().value();
+    if (Parts.Brief.has_value()) {
+      visit(Parts.Brief.value());
     }
 
     if (!Parts.ParamFields.empty()) {
@@ -574,24 +659,24 @@ class DoxygenConverter : public MarkupASTVisitor<DoxygenConverter> {
       printNewline();
     }
 
-    if (Parts.ReturnsField.hasValue()) {
+    if (Parts.ReturnsField.has_value()) {
       printNewline();
       print("\\a ");
       print(PF->getName());
       print(" returns: ");
 
-      for (auto Child : Parts.ReturnsField.getValue()->getChildren()) {
+      for (auto Child : Parts.ReturnsField.value()->getChildren()) {
         visit(Child);
       }
     }
 
-    if (Parts.ThrowsField.hasValue()) {
+    if (Parts.ThrowsField.has_value()) {
       printNewline();
       print("\\a ");
       print(PF->getName());
       print(" error: ");
 
-      for (auto Child : Parts.ThrowsField.getValue()->getChildren()) {
+      for (auto Child : Parts.ThrowsField.value()->getChildren()) {
         visit(Child);
       }
     }
@@ -621,6 +706,12 @@ public:
 
   void visitDocument(const Document *D) {
     for (const auto *Child : D->getChildren())
+      visit(Child);
+  }
+
+  void visitInlineAttributes(const InlineAttributes *A) {
+    // attributed strings don't have an analogue in Doxygen, so just print out the text
+    for (const auto *Child : A->getChildren())
       visit(Child);
   }
 
@@ -809,8 +900,8 @@ void ide::getDocumentationCommentAsDoxygen(const DocComment *DC,
   DoxygenConverter Converter(OS);
 
   auto Brief = DC->getBrief();
-  if (Brief.hasValue()) {
-    Converter.visit(Brief.getValue());
+  if (Brief.has_value()) {
+    Converter.visit(Brief.value());
   }
 
   for (const auto *N : DC->getBodyNodes()) {
@@ -821,20 +912,20 @@ void ide::getDocumentationCommentAsDoxygen(const DocComment *DC,
     Converter.visit(N);
   }
 
-  for (const auto PF : DC->getParamFields()) {
+  for (const auto &PF : DC->getParamFields()) {
     Converter.visit(PF);
   }
 
   auto TF = DC->getThrowsField();
-  if (TF.hasValue()) {
+  if (TF.has_value()) {
     Converter.printNewline();
-    Converter.visit(TF.getValue());
+    Converter.visit(TF.value());
   }
 
   auto RF = DC->getReturnsField();
-  if (RF.hasValue()) {
+  if (RF.has_value()) {
     Converter.printNewline();
-    Converter.visit(RF.getValue());
+    Converter.visit(RF.value());
   }
 }
 

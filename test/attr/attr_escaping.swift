@@ -5,17 +5,17 @@ func paramDeclEscaping(@escaping fn: (Int) -> Void) {} // expected-error {{attri
 
 func wrongParamType(a: @escaping Int) {} // expected-error {{@escaping attribute only applies to function types}}
 
-func conflictingAttrs(_ fn: @noescape @escaping () -> Int) {} // expected-error {{@escaping conflicts with @noescape}}
- // expected-error@-1{{@noescape is the default and has been removed}} {{29-39=}}
+func conflictingAttrs(_ fn: @noescape @escaping () -> Int) {} // expected-error {{unknown attribute 'noescape'}}
 
 func takesEscaping(_ fn: @escaping () -> Int) {} // ok
 
 func callEscapingWithNoEscape(_ fn: () -> Int) {
   // expected-note@-1{{parameter 'fn' is implicitly non-escaping}} {{37-37=@escaping }}
-  // expected-note@-2{{parameter 'fn' is implicitly non-escaping}} {{37-37=@escaping }}
 
   takesEscaping(fn) // expected-error{{passing non-escaping parameter 'fn' to function expecting an @escaping closure}}
-  let _ = fn // expected-error{{non-escaping parameter 'fn' may only be called}}
+
+  // This is a non-escaping use:
+  let _ = fn
 }
 
 typealias IntSugar = Int
@@ -39,6 +39,16 @@ struct StoresClosure {
     return [fn] // expected-error{{using non-escaping parameter 'fn' in a context expecting an @escaping closure}}
   }
 
+  func dictPack(_ fn: () -> Int) -> [String: () -> Int] {
+    // expected-note@-1{{parameter 'fn' is implicitly non-escaping}} {{23-23=@escaping }}
+    return ["ultimate answer": fn] // expected-error{{using non-escaping parameter 'fn' in a context expecting an @escaping closure}}
+  }
+
+  func autoclosureDictPack(_ fn: @autoclosure () -> Int) -> [String: () -> Int] {
+    // expected-note@-1{{parameter 'fn' is implicitly non-escaping}} {{46-46= @escaping}}
+    return ["ultimate answer": fn] // expected-error{{using non-escaping parameter 'fn' in a context expecting an @escaping closure}}
+  }
+
   func arrayPack(_ fn: @escaping () -> Int, _ fn2 : () -> Int) -> [() -> Int] {
     // expected-note@-1{{parameter 'fn2' is implicitly non-escaping}} {{53-53=@escaping }}
 
@@ -60,39 +70,25 @@ func takesEscapingAutoclosure(_ fn: @autoclosure @escaping () -> Int) {}
 func callEscapingAutoclosureWithNoEscape(_ fn: () -> Int) {
   takesEscapingAutoclosure(1+1)
 }
-func callEscapingAutoclosureWithNoEscape_2(_ fn: () -> Int) {
-  // expected-note@-1{{parameter 'fn' is implicitly non-escaping}}
-
-  takesEscapingAutoclosure(fn()) // expected-error{{closure use of non-escaping parameter 'fn' may allow it to escape}}
-}
-func callEscapingAutoclosureWithNoEscape_3(_ fn: @autoclosure () -> Int) {
-  // expected-note@-1{{parameter 'fn' is implicitly non-escaping}}
-
-  takesEscapingAutoclosure(fn()) // expected-error{{closure use of non-escaping parameter 'fn' may allow it to escape}}
-}
 
 let foo: @escaping (Int) -> Int // expected-error{{@escaping attribute may only be used in function parameter position}} {{10-20=}}
 
 struct GenericStruct<T> {}
 
-func misuseEscaping(_ a: @escaping Int) {} // expected-error{{@escaping attribute only applies to function types}} {{26-38=}}
-func misuseEscaping(_ a: (@escaping Int)?) {} // expected-error{{@escaping attribute only applies to function types}} {{27-39=}}
-func misuseEscaping(opt a: @escaping ((Int) -> Int)?) {} // expected-error{{@escaping attribute only applies to function types}} {{28-38=}}
-  // expected-note@-1{{closure is already escaping in optional type argument}}
+func misuseEscaping(_ a: @escaping Int) {} // expected-error{{@escaping attribute only applies to function types}} {{26-36=}}
+func misuseEscaping(_ a: (@escaping Int)?) {} // expected-error{{@escaping attribute only applies to function types}} {{27-36=}}
+func misuseEscaping(opt a: @escaping ((Int) -> Int)?) {} // expected-error{{closure is already escaping in optional type argument}} {{28-38=}}
 
-func misuseEscaping(_ a: (@escaping (Int) -> Int)?) {} // expected-error{{@escaping attribute may only be used in function parameter position}} {{27-37=}}
-  // expected-note@-1{{closure is already escaping in optional type argument}}
-func misuseEscaping(nest a: (((@escaping (Int) -> Int))?)) {} // expected-error{{@escaping attribute may only be used in function parameter position}} {{32-42=}}
-  // expected-note@-1{{closure is already escaping in optional type argument}}
-func misuseEscaping(iuo a: (@escaping (Int) -> Int)!) {} // expected-error{{@escaping attribute may only be used in function parameter position}} {{29-39=}}
-  // expected-note@-1{{closure is already escaping in optional type argument}}
+func misuseEscaping(_ a: (@escaping (Int) -> Int)?) {} // expected-error{{closure is already escaping in optional type argument}} {{27-36=}}
+func misuseEscaping(nest a: (((@escaping (Int) -> Int))?)) {} // expected-error{{closure is already escaping in optional type argument}} {{32-41=}}
+func misuseEscaping(iuo a: (@escaping (Int) -> Int)!) {} // expected-error{{closure is already escaping in optional type argument}} {{29-38=}}
 
-func misuseEscaping(_ a: Optional<@escaping (Int) -> Int>, _ b: Int) {} // expected-error{{@escaping attribute may only be used in function parameter position}} {{35-45=}}
-func misuseEscaping(_ a: (@escaping (Int) -> Int, Int)) {} // expected-error{{@escaping attribute may only be used in function parameter position}} {{27-37=}}
-func misuseEscaping(_ a: [@escaping (Int) -> Int]) {} // expected-error{{@escaping attribute may only be used in function parameter position}} {{27-37=}}
-func misuseEscaping(_ a: [@escaping (Int) -> Int]?) {} // expected-error{{@escaping attribute may only be used in function parameter position}} {{27-37=}}
+func misuseEscaping(_ a: Optional<@escaping (Int) -> Int>, _ b: Int) {} // expected-error{{@escaping attribute may only be used in function parameter position}} {{35-44=}}
+func misuseEscaping(_ a: (@escaping (Int) -> Int, Int)) {} // expected-error{{@escaping attribute may only be used in function parameter position}} {{27-36=}}
+func misuseEscaping(_ a: [@escaping (Int) -> Int]) {} // expected-error{{@escaping attribute may only be used in function parameter position}} {{27-36=}}
+func misuseEscaping(_ a: [@escaping (Int) -> Int]?) {} // expected-error{{@escaping attribute may only be used in function parameter position}} {{27-36=}}
 func misuseEscaping(_ a: [Int : @escaping (Int) -> Int]) {} // expected-error{{@escaping attribute may only be used in function parameter position}} {{33-43=}}
-func misuseEscaping(_ a: GenericStruct<@escaping (Int) -> Int>) {} // expected-error{{@escaping attribute may only be used in function parameter position}} {{40-50=}}
+func misuseEscaping(_ a: GenericStruct<@escaping (Int) -> Int>) {} // expected-error{{@escaping attribute may only be used in function parameter position}} {{40-49=}}
 
 func takesEscapingGeneric<T>(_ fn: @escaping () -> T) {}
 func callEscapingGeneric<T>(_ fn: () -> T) { // expected-note {{parameter 'fn' is implicitly non-escaping}} {{35-35=@escaping }}
@@ -150,14 +146,15 @@ func takesNoEscapeFunction(fn: () -> ()) { // expected-note {{parameter 'fn' is 
 
 
 class FooClass {
-  var stored : Optional<(()->Int)->Void> = nil
+  var stored : Optional<(()->Int)->Void> = nil  // expected-note {{add explicit @escaping to function parameter #0}} {{26-26=@escaping }}
   var computed : (()->Int)->Void {
     get { return stored! }
     set(newValue) { stored = newValue } // ok
   }
   var computedEscaping : (@escaping ()->Int)->Void {
     get { return stored! }
-    set(newValue) { stored = newValue } // expected-error{{cannot assign value of type '(@escaping () -> Int) -> Void' to type 'Optional<(() -> Int) -> Void>'}}
+    set(newValue) { stored = newValue } // expected-error{{cannot assign value of type '(@escaping () -> Int) -> Void' to type '(() -> Int) -> Void'}}
+    // expected-note@-1{{parameter #0 expects escaping value of type '() -> Int'}}
   }
 }
 
@@ -215,5 +212,62 @@ class HasIVarCaptures {
     _ = ({ () -> () in
       x += 1 // no-error
     })()
+  }
+}
+
+// https://github.com/apple/swift/issues/52188
+
+protocol P_52188 {
+  typealias F = () -> Void
+  typealias G<T> = (T) -> Void
+  func foo<T>(_: T, _: @escaping F) // Ok
+  func bar<T>(_: @escaping G<T>) // Ok
+}
+
+extension P_52188 {
+  func fiz<T>(_: T, _: @escaping F) {} // Ok
+  func baz<T>(_: @escaping G<T>) {} // Ok
+}
+
+// https://github.com/apple/swift/issues/51669
+
+func f_51669<T>(_ x: @escaping T) {} // expected-error 1{{@escaping attribute only applies to function types}}
+
+// https://github.com/apple/swift/issues/57070
+
+var global: ((() -> Void) -> Void)? = nil
+// expected-note@-1 {{add explicit @escaping to function parameter #0}} {{15-15=@escaping }}
+
+class C_57070 {
+  let ok: (@escaping () -> Void) -> Void // OK
+  let callback: (() -> Void) -> Void // expected-note {{add explicit @escaping to function parameter #0}} {{18-18=@escaping }}
+  let callback1: (() -> Void, () -> Void) -> Void // expected-note {{add explicit @escaping to function parameter #1}} {{31-31=@escaping }} 
+  let callbackAuto: (@autoclosure () -> Void) -> Void // expected-note {{add explicit @escaping to function parameter #0}} {{34-34= @escaping}}
+  let callbackOpt: ((() -> Void) -> Void)? // expected-note{{add explicit @escaping to function parameter #0}} {{22-22=@escaping }}
+
+  init(f: @escaping (@escaping() -> Void) -> Void) {
+    self.callback = f // expected-error{{cannot assign value of type '(@escaping () -> Void) -> Void' to type '(() -> Void) -> Void'}}
+    // expected-note@-1{{parameter #0 expects escaping value of type '() -> Void'}}
+    self.ok = f // Ok
+  }
+
+  init(af: @escaping (@escaping() -> Void) -> Void) {
+    self.callbackOpt = af // expected-error{{cannot assign value of type '(@escaping () -> Void) -> Void' to type '(() -> Void) -> Void'}}
+    // expected-note@-1{{parameter #0 expects escaping value of type '() -> Void'}}  
+  }
+
+  init(ag: @escaping (@escaping() -> Void) -> Void) {
+    global = ag // expected-error{{cannot assign value of type '(@escaping () -> Void) -> Void' to type '(() -> Void) -> Void'}}
+    // expected-note@-1{{parameter #0 expects escaping value of type '() -> Void'}}
+  }
+
+  init(a: @escaping (@escaping () -> Void) -> Void) {
+    self.callbackAuto = a // expected-error{{cannot assign value of type '(@escaping () -> Void) -> Void' to type '(@autoclosure () -> Void) -> Void'}}
+    // expected-note@-1{{parameter #0 expects escaping value of type '() -> Void'}}
+  }
+
+  init(f: @escaping (() -> Void, @escaping() -> Void) -> Void) {
+    self.callback1 = f // expected-error{{cannot assign value of type '(() -> Void, @escaping () -> Void) -> Void' to type '(() -> Void, () -> Void) -> Void'}}
+    // expected-note@-1{{parameter #1 expects escaping value of type '() -> Void'}}
   }
 }

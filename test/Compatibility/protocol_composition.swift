@@ -1,6 +1,5 @@
 // RUN: %empty-directory(%t)
-// RUN: %utils/split_file.py -o %t %s
-// RUN: %target-swift-frontend -typecheck -primary-file %t/swift3.swift %t/common.swift -verify -swift-version 3
+// RUN: %{python} %utils/split_file.py -o %t %s
 // RUN: %target-swift-frontend -typecheck -primary-file %t/swift4.swift %t/common.swift -verify -swift-version 4
 
 // BEGIN common.swift
@@ -34,16 +33,17 @@ typealias A1 = P1.Type & P2 // expected-error {{non-protocol, non-class type 'P1
 
 // BEGIN swift4.swift
 
-func foo(x: P1 & Any & P2.Type?) { // expected-error {{non-protocol, non-class type 'P2.Type?' cannot be used within a protocol-constrained type}}
-  let _: (P1 & P2).Type? = x // expected-error {{cannot convert value of type 'P1' to specified type '(P1 & P2).Type?'}}
-  let _: (P1 & P2).Type = x! // expected-error {{cannot force unwrap value of non-optional type 'P1'}}
-  let _: Int = x!.p1() // expected-error {{cannot force unwrap value of non-optional type 'P1'}}
-  let _: Int? = x?.p2 // expected-error {{cannot use optional chaining on non-optional value of type 'P1'}}
+func foo(x: P1 & Any & P2.Type?) { // expected-error {{non-protocol, non-class type '(any P2.Type)?' cannot be used within a protocol-constrained type}}
+  let _: (P1 & P2).Type? = x
+  let _: (P1 & P2).Type = x!
+
+  let _: Int = x!.p1()
+  let _: Int? = x?.p2
 }
 
 func bar() -> ((P1 & P2)?).Type {
-  let x = (P1 & P2?).self // expected-error {{non-protocol, non-class type 'P2?' cannot be used within a protocol-constrained type}}
-  return x // expected-error {{cannot convert return expression}}
+  let x = (P1 & P2?).self // expected-error {{non-protocol, non-class type '(any P2)?' cannot be used within a protocol-constrained type}}
+  return x
 }
 
-typealias A1 = P1.Type & P2 // expected-error {{non-protocol, non-class type 'P1.Type' cannot be used within a protocol-constrained type}}
+typealias A1 = P1.Type & P2 // expected-error {{non-protocol, non-class type 'any P1.Type' cannot be used within a protocol-constrained type}}

@@ -1,32 +1,35 @@
 // RUN: %target-typecheck-verify-swift -swift-version 4
 
-// SR-2505: "Call arguments did not match up" assertion
+// https://github.com/apple/swift/issues/45110
+// Call arguments did not match up assertion
 
-func sr_2505(_ a: Any) {} // expected-note {{}}
-sr_2505()          // expected-error {{missing argument for parameter #1 in call}}
-sr_2505(a: 1)      // expected-error {{extraneous argument label 'a:' in call}}
-sr_2505(1, 2)      // expected-error {{extra argument in call}}
-sr_2505(a: 1, 2)   // expected-error {{extra argument in call}}
+func f_45110(_ a: Any) {} // expected-note {{}}
+do {
+  f_45110()        // expected-error {{missing argument for parameter #1 in call}}
+  f_45110(a: 1)    // expected-error {{extraneous argument label 'a:' in call}}
+  f_45110(1, 2)    // expected-error {{extra argument in call}}
+  f_45110(a: 1, 2) // expected-error {{extra argument in call}}
+}
 
-struct C_2505 {
+struct S_45110 {
   init(_ arg: Any) {
   }
 }
 
-protocol P_2505 {
+protocol P_45110 {
 }
 
-extension C_2505 {
-  init<T>(from: [T]) where T: P_2505 {
+extension S_45110 {
+  init<T>(from: [T]) where T: P_45110 {
   }
 }
 
-class C2_2505: P_2505 {
+class C_45110: P_45110 {
 }
 
-let c_2505 = C_2505(arg: [C2_2505()]) // expected-error {{argument labels '(arg:)' do not match any available overloads}} expected-note {{overloads for 'C_2505' exist}}
+let _ = S_45110(arg: [C_45110()]) // expected-error {{extraneous argument label 'arg:' in call}}
 
-// rdar://problem/31898542 - Swift 4: 'type of expression is ambiguous without more context' errors, without a fixit
+// rdar://problem/31898542 - Swift 4: 'type of expression is ambiguous without a type annotation' errors, without a fixit
 
 enum R31898542<T> {
   case success(T) // expected-note {{'success' declared here}}
@@ -34,7 +37,7 @@ enum R31898542<T> {
 }
 
 func foo() -> R31898542<()> {
-  return .success() // expected-error {{missing argument for parameter #1 in call}} {{19-19=<#T#>}}
+  return .success() // expected-error {{missing argument for parameter #1 in call}} {{19-19=<#()#>}}
 }
 
 // rdar://problem/31973368 - Cannot convert value of type '(K, V) -> ()' to expected argument type '((key: _, value: _)) -> Void'
@@ -54,5 +57,3 @@ class R<K: Hashable, V> {
 infix operator +=+ : AdditionPrecedence
 func +=+(_ lhs: Int, _ rhs: Int) -> Bool { return lhs == rhs }
 func +=+<T: BinaryInteger>(_ lhs: T, _ rhs: Int) -> Bool { return lhs == rhs }
-// FIXME: uncomment when <rdar://problem/32726173> is resolved and DoubleWidth is back
-// let _ = DoubleWidth<Int>(Int.min) - 1 +=+ Int.min // Ok

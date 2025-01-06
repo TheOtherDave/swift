@@ -8,13 +8,21 @@
 import Foundation
 
 @objc class Foo : NSObject {
-  // CHECK: define internal void @_T013objc_pointers3FooC16pointerArgumentsySpySiG_Sv1ySPySiG1zs33AutoreleasingUnsafeMutablePointerVyACSgG1wtFTo(%0*, i8*, i64*, i8*, i64*, %0**)
+  // CHECK: define internal void @"$s13objc_pointers3FooC16pointerArguments_1y1z1wySpySiG_SvSPySiGSAyACSgGtFTo"(ptr %0, ptr %1, ptr %2, ptr %3, ptr %4, ptr %5)
   @objc func pointerArguments(_ x: UnsafeMutablePointer<Int>,
                               y: UnsafeMutableRawPointer,
                               z: UnsafePointer<Int>,
                               w: AutoreleasingUnsafeMutablePointer<Foo?>) {}
 
-  // CHECK: define internal void @_T013objc_pointers3FooC24pointerMetatypeArgumentsys33AutoreleasingUnsafeMutablePointerVyyXlXpG1x_AFyyXlXpSgG1ytFTo(%0*, i8*, i8**, i8**)
+  // CHECK: define internal void @"$s13objc_pointers3FooC24pointerMetatypeArguments1x1yySAyyXlXpG_SAyyXlXpSgGtFTo"(ptr %0, ptr %1, ptr %2, ptr %3)
   @objc func pointerMetatypeArguments(x: AutoreleasingUnsafeMutablePointer<AnyClass>,
                                       y: AutoreleasingUnsafeMutablePointer<AnyClass?>) {}
+}
+
+// CHECK-LABEL: s13objc_pointers14returnNSObject3objSo0D0CAE_tF
+@_semantics("no.preserve.debugger")
+func returnNSObject(obj: NSObject) -> NSObject {
+  // CHECK-NOT: return
+  // CHECK: @llvm.objc.retain
+  return obj
 }

@@ -1,5 +1,5 @@
 // RUN: %target-swift-frontend -Xllvm -sil-full-demangle %s -emit-ir -g -o - | %FileCheck %s
-// RUN: %target-swift-frontend -Xllvm -sil-full-demangle %s -emit-sil -emit-verbose-sil -g -o - | %FileCheck -check-prefix=CHECK-SIL %s
+// RUN: %target-swift-frontend -Xllvm -sil-full-demangle %s -Xllvm -sil-print-types -emit-sil -emit-verbose-sil -g -o - | %FileCheck --check-prefixes=CHECK-SIL %s
 import StdlibUnittest
 
 class Obj {}
@@ -16,6 +16,7 @@ func testDoStmt() throws -> Void {
   do {
     let obj = Obj()
     _blackHole(obj)
+    // The poison debug_value takes the location of the original decl.
     try foo(100)
     // CHECK-SIL: bb{{.*}}(%{{[0-9]+}} : $()):
     // CHECK-SIL-NEXT: strong_release {{.*}}: $Obj{{.*}} line:[[@LINE+1]]:3:cleanup

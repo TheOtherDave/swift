@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -enable-sil-ownership -emit-sil %s -o /dev/null -verify
+// RUN: %target-swift-emit-sil %s -verify | %FileCheck %s
 
 func testUnreachableAfterReturn() -> Int {
   var x: Int = 3
@@ -67,8 +67,7 @@ func testUnreachableCase1(a : Tree) {
   case let Leaf:
     _ = Leaf
     return
-  case .Branch(_):  // expected-warning {{case will never be executed}}
-  // expected-warning@-1 {{case is already handled by previous patterns; consider removing it}}
+  case .Branch(_): // expected-warning {{case is already handled by previous patterns; consider removing it}}
     return
   }
 }
@@ -87,8 +86,7 @@ func testUnreachableCase3(a : Tree) {
   switch a {
   case _:
     break
-  case .Branch(_):  // expected-warning {{case will never be executed}}
-  // expected-warning@-1 {{case is already handled by previous patterns; consider removing it}}
+  case .Branch(_): // expected-warning {{case is already handled by previous patterns; consider removing it}}
     return
   }
 }
@@ -111,9 +109,10 @@ func testUnreachableCase5(a : Tree) {
   }
 }
 
+// https://github.com/apple/swift/issues/48333
 func testOptionalEvaluationBreak(a : Tree) {
-  class SR5763 { func foo() {} }
-  func createOptional() -> SR5763? { return SR5763() }
+  class C { func foo() {} }
+  func createOptional() -> C? { return C() }
   switch a {
   case _:
     break
@@ -132,8 +131,48 @@ class TestThrowInInit {
   }
 }
 
-func sr6141() {
+// https://github.com/apple/swift/issues/48696
+func f_48696() {
   var bar: String? = ""
   return;
   bar?.append("x")  // expected-warning{{code after 'return' will never be executed}}
+}
+
+func testUnreachableCatchClause() {
+  enum ErrorEnum: Error { case someError }
+  do {
+    throw ErrorEnum.someError
+  } catch let error {
+    print(error)
+  } catch ErrorEnum.someError { // expected-warning {{case will never be executed}}
+    print("some error")
+  }
+}
+
+// https://github.com/apple/swift/issues/56075
+func f_56075() -> Int {
+  return Foo.bar
+  struct Foo { // no-warning
+    static var bar = 0
+    // CHECK: sil private @$s16unreachable_code7f_56075SiyF3FooL_V7fooFuncyyF : $@convention(method) (Foo) -> ()
+    func fooFunc() {}
+  }
+  func appendix() {} // no-warning
+}
+
+// https://github.com/apple/swift/issues/73649
+func testUnreachableExistential() {
+  protocol P {
+    func run()
+  }
+
+  func unreachableExistential(_ it: any P) -> Bool {
+    return true
+    it.run() // expected-warning {{code after 'return' will never be executed}}
+  }
+
+  func unreachableOptionalChainedExistential(_ it: (any P)?) -> Bool {
+    return false
+    it?.run() // expected-warning {{code after 'return' will never be executed}}
+  }
 }

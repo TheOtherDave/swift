@@ -11,10 +11,13 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-access-summary-analysis"
+#include "swift/Basic/Assertions.h"
+#include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SILOptimizer/Analysis/AccessSummaryAnalysis.h"
 #include "swift/SILOptimizer/Analysis/FunctionOrder.h"
 #include "swift/SILOptimizer/PassManager/PassManager.h"
+#include "swift/SIL/DebugUtils.h"
 
 using namespace swift;
 
@@ -30,7 +33,7 @@ void AccessSummaryAnalysis::processFunction(FunctionInfo *info,
     FunctionSummary &functionSummary = info->getSummary();
     ArgumentSummary &argSummary =
         functionSummary.getAccessForArgument(index);
-    index++;
+    ++index;
 
     auto *functionArg = cast<SILFunctionArgument>(arg);
     // Only summarize @inout_aliasable arguments.
@@ -47,9 +50,9 @@ void AccessSummaryAnalysis::processFunction(FunctionInfo *info,
 /// started by a begin_access and any flows of the arguments to other
 /// functions.
 void AccessSummaryAnalysis::processArgument(FunctionInfo *info,
-                                             SILFunctionArgument *argument,
-                                             ArgumentSummary &summary,
-                                             FunctionOrder &order) {
+                                            SILFunctionArgument *argument,
+                                            ArgumentSummary &summary,
+                                            FunctionOrder &order) {
   unsigned argumentIndex = argument->getIndex();
 
   // Use a worklist to track argument uses to be processed.
@@ -63,16 +66,47 @@ void AccessSummaryAnalysis::processArgument(FunctionInfo *info,
     Operand *operand = worklist.pop_back_val();
     SILInstruction *user = operand->getUser();
 
+    // Handle all types of full applies without switching over them.
+    // Ultimately, this analysis only considers calls with @inout_aliasable
+    // arguments because other argument conventions require an access on the
+    // caller side.
+    if (auto apply = FullApplySite::isa(user)) {
+      SILFunction *callee = apply.getCalleeFunction();
+      // We can't apply a summary for function whose body we can't see.  Since
+      // user-provided closures are always in the same module as their callee
+      // This likely indicates a missing begin_access before an open-coded
+      // call.
+      if (!callee || callee->empty()) {
+        summary.mergeWith(SILAccessKind::Modify, apply.getLoc(),
+                          apply.getModule().getIndexTrieRoot());
+        continue;
+      }
+      unsigned operandNumber = operand->getOperandNumber();
+      assert(operandNumber > 0 && "Summarizing apply for non-argument?");
+
+      unsigned calleeArgumentIndex = operandNumber - 1;
+      processCall(info, argumentIndex, callee, calleeArgumentIndex, order);
+      continue;
+    }
+
     switch (user->getKind()) {
+    case SILInstructionKind::MarkUnresolvedNonCopyableValueInst: {
+      // Pass through to the address being checked.
+      auto inst = cast<MarkUnresolvedNonCopyableValueInst>(user);
+      worklist.append(inst->use_begin(), inst->use_end());
+      break;
+    }
     case SILInstructionKind::BeginAccessInst: {
       auto *BAI = cast<BeginAccessInst>(user);
-      const IndexTrieNode *subPath = findSubPathAccessed(BAI);
-      summary.mergeWith(BAI->getAccessKind(), BAI->getLoc(), subPath);
-      // We don't add the users of the begin_access to the worklist because
-      // even if these users eventually begin an access to the address
-      // or a projection from it, that access can't begin more exclusive
-      // access than this access -- otherwise it will be diagnosed
-      // elsewhere.
+      if (BAI->getEnforcement() != SILAccessEnforcement::Unsafe) {
+        const IndexTrieNode *subPath = findSubPathAccessed(BAI);
+        summary.mergeWith(BAI->getAccessKind(), BAI->getLoc(), subPath);
+        // We don't add the users of the begin_access to the worklist because
+        // even if these users eventually begin an access to the address
+        // or a projection from it, that access can't begin more exclusive
+        // access than this access -- otherwise it will be diagnosed
+        // elsewhere.
+      }
       break;
     }
     case SILInstructionKind::EndUnpairedAccessInst:
@@ -89,7 +123,6 @@ void AccessSummaryAnalysis::processArgument(FunctionInfo *info,
       worklist.append(inst->use_begin(), inst->use_end());
       break;
     }
-    case SILInstructionKind::DebugValueAddrInst:
     case SILInstructionKind::AddressToPointerInst:
       // Ignore these uses, they don't affect formal accesses.
       break;
@@ -97,14 +130,10 @@ void AccessSummaryAnalysis::processArgument(FunctionInfo *info,
       processPartialApply(info, argumentIndex, cast<PartialApplyInst>(user),
                           operand, order);
       break;
-    case SILInstructionKind::ApplyInst:
-      processFullApply(info, argumentIndex, cast<ApplyInst>(user), operand,
-                       order);
-      break;
-    case SILInstructionKind::TryApplyInst:
-      processFullApply(info, argumentIndex, cast<TryApplyInst>(user), operand,
-                       order);
-      break;
+    case SILInstructionKind::DebugValueInst:
+      if (DebugValueInst::hasAddrVal(user))
+        break;
+      LLVM_FALLTHROUGH;
     default:
       // FIXME: These likely represent scenarios in which we're not generating
       // begin access markers. Ignore these for now. But we really should
@@ -120,36 +149,78 @@ void AccessSummaryAnalysis::processArgument(FunctionInfo *info,
 }
 
 #ifndef NDEBUG
-/// Sanity check to make sure that a noescape partial apply is
-/// only ultimately used by an apply, a try_apply or as an argument (but not
-/// the called function) in a partial_apply.
+/// Soundness check to make sure that a noescape partial apply is only ultimately
+/// used by directly calling it or passing it as argument, but not using it as a
+/// partial_apply callee.
 ///
-/// FIXME: This needs to be checked in the SILVerifier.
+/// An error found in DiagnoseInvalidEscapingCaptures can indicate invalid SIL
+/// that is detected here but not in normal SIL verification. When the
+/// source-level closure captures an inout argument, it appears in SIL to be a
+/// non-escaping closure. The following verification then fails because the
+/// "nonescaping" closure actually escapes.
+///
+/// FIXME: This should be checked in the SILVerifier, with consideration for the
+/// caveat above where an inout has been captured be an escaping closure.
 static bool hasExpectedUsesOfNoEscapePartialApply(Operand *partialApplyUse) {
   SILInstruction *user = partialApplyUse->getUser();
+
+  // Bypass this verification when a diagnostic error is present. See comments
+  // on DiagnoseInvalidEscapingCaptures above.
+  if (user->getModule().getASTContext().hadError())
+    return true;
+
+  if (isIncidentalUse(user))
+    return true;
 
   // It is fine to call the partial apply
   switch (user->getKind()) {
   case SILInstructionKind::ApplyInst:
   case SILInstructionKind::TryApplyInst:
+  case SILInstructionKind::BeginApplyInst:
+    // The partial_apply must be passed to a @noescape argument type, but that
+    // is already checked by the SIL verifier.
+    return true;
+  // partial_apply [stack] is terminated by a dealloc_stack.
+  case SILInstructionKind::DeallocStackInst:
     return true;
 
   case SILInstructionKind::ConvertFunctionInst:
     return llvm::all_of(cast<ConvertFunctionInst>(user)->getUses(),
                         hasExpectedUsesOfNoEscapePartialApply);
 
+  case SILInstructionKind::ConvertEscapeToNoEscapeInst:
+    return llvm::all_of(cast<ConvertEscapeToNoEscapeInst>(user)->getUses(),
+                        hasExpectedUsesOfNoEscapePartialApply);
+
   case SILInstructionKind::PartialApplyInst:
-    return partialApplyUse->get() != cast<PartialApplyInst>(user)->getCallee();
+    if (partialApplyUse->get() == cast<PartialApplyInst>(user)->getCallee())
+      return false;
+    return llvm::all_of(cast<PartialApplyInst>(user)->getUses(),
+                        hasExpectedUsesOfNoEscapePartialApply);
 
   // Look through begin_borrow.
   case SILInstructionKind::BeginBorrowInst:
     return llvm::all_of(cast<BeginBorrowInst>(user)->getUses(),
                         hasExpectedUsesOfNoEscapePartialApply);
 
-  // End borrow is always ok.
-  case SILInstructionKind::EndBorrowInst:
-    return true;
+  // Look through mark_dependence.
+  case SILInstructionKind::MarkDependenceInst:
+    return llvm::all_of(cast<MarkDependenceInst>(user)->getUses(),
+                        hasExpectedUsesOfNoEscapePartialApply);
 
+  case SILInstructionKind::CopyBlockWithoutEscapingInst:
+    return partialApplyUse->getOperandNumber() ==
+           CopyBlockWithoutEscapingInst::Closure;
+
+  case SILInstructionKind::CopyValueInst:
+    return llvm::all_of(cast<CopyValueInst>(user)->getUses(),
+                        hasExpectedUsesOfNoEscapePartialApply);
+
+  case SILInstructionKind::MoveValueInst:
+    return llvm::all_of(cast<MoveValueInst>(user)->getUses(),
+                        hasExpectedUsesOfNoEscapePartialApply);
+
+  case SILInstructionKind::IsEscapingClosureInst:
   case SILInstructionKind::StoreInst:
   case SILInstructionKind::DestroyValueInst:
     // @block_storage is passed by storing it to the stack. We know this is
@@ -172,8 +243,15 @@ static bool hasExpectedUsesOfNoEscapePartialApply(Operand *partialApplyUse) {
     // destroy_value %storage : $@callee_owned () -> ()
     return true;
   default:
-    return false;
+    break;
   }
+  if (auto *startAsyncLet = dyn_cast<BuiltinInst>(user)) {
+    if (startAsyncLet->getBuiltinKind() ==
+        BuiltinValueKind::StartAsyncLetWithLocalBuffer) {
+      return true;
+    }
+  }
+  return false;
 }
 #endif
 
@@ -188,8 +266,8 @@ void AccessSummaryAnalysis::processPartialApply(FunctionInfo *callerInfo,
 
   // Make sure the partial_apply is not calling the result of another
   // partial_apply.
-  assert(isa<FunctionRefInst>(apply->getCallee()) &&
-         "Noescape partial apply of non-functionref?");
+  assert(isa<FunctionRefBaseInst>(apply->getCallee())
+         && "Noescape partial apply of non-functionref?");
 
   assert(llvm::all_of(apply->getUses(),
                       hasExpectedUsesOfNoEscapePartialApply) &&
@@ -201,27 +279,6 @@ void AccessSummaryAnalysis::processPartialApply(FunctionInfo *callerInfo,
 
   processCall(callerInfo, callerArgumentIndex, calleeFunction,
               calleeArgumentIndex, order);
-}
-
-void AccessSummaryAnalysis::processFullApply(FunctionInfo *callerInfo,
-                                             unsigned callerArgumentIndex,
-                                             FullApplySite apply,
-                                             Operand *argumentOperand,
-                                             FunctionOrder &order) {
-  unsigned operandNumber = argumentOperand->getOperandNumber();
-  assert(operandNumber > 0 && "Summarizing apply for non-argument?");
-
-  unsigned calleeArgumentIndex = operandNumber - 1;
-  SILFunction *callee = apply.getCalleeFunction();
-  // We can't apply a summary for function whose body we can't see.
-  // Since user-provided closures are always in the same module as their callee
-  // This likely indicates a missing begin_access before an open-coded
-  // call.
-  if (!callee || callee->empty())
-    return;
-
-  processCall(callerInfo, callerArgumentIndex, callee, calleeArgumentIndex,
-              order);
 }
 
 void AccessSummaryAnalysis::processCall(FunctionInfo *callerInfo,
@@ -338,13 +395,13 @@ void AccessSummaryAnalysis::recompute(FunctionInfo *initial) {
   } while (needAnotherIteration);
 }
 
-std::string
-AccessSummaryAnalysis::SubAccessSummary::getDescription(SILType BaseType,
-                                                        SILModule &M) const {
+std::string AccessSummaryAnalysis::SubAccessSummary::getDescription(
+    SILType BaseType, SILModule &M, TypeExpansionContext context) const {
   std::string sbuf;
   llvm::raw_string_ostream os(sbuf);
 
-  os << AccessSummaryAnalysis::getSubPathDescription(BaseType, SubPath, M);
+  os << AccessSummaryAnalysis::getSubPathDescription(BaseType, SubPath, M,
+                                                     context);
 
   if (!SubPath->isRoot())
     os << " ";
@@ -367,9 +424,8 @@ void AccessSummaryAnalysis::ArgumentSummary::getSortedSubAccesses(
   assert(storage.size() == SubAccesses.size());
 }
 
-std::string
-AccessSummaryAnalysis::ArgumentSummary::getDescription(SILType BaseType,
-                                                       SILModule &M) const {
+std::string AccessSummaryAnalysis::ArgumentSummary::getDescription(
+    SILType BaseType, SILModule &M, TypeExpansionContext context) const {
   std::string sbuf;
   llvm::raw_string_ostream os(sbuf);
   os << "[";
@@ -383,8 +439,8 @@ AccessSummaryAnalysis::ArgumentSummary::getDescription(SILType BaseType,
     if (index > 0) {
       os << ", ";
     }
-    os << subAccess.getDescription(BaseType, M);
-    index++;
+    os << subAccess.getDescription(BaseType, M, context);
+    ++index;
   }
   os << "]";
 
@@ -427,8 +483,6 @@ AccessSummaryAnalysis::getOrCreateSummary(SILFunction *fn) {
 void AccessSummaryAnalysis::AccessSummaryAnalysis::invalidate() {
   FunctionInfos.clear();
   Allocator.DestroyAll();
-  delete SubPathTrie;
-  SubPathTrie = new IndexTrieNode();
 }
 
 void AccessSummaryAnalysis::invalidate(SILFunction *F, InvalidationKind K) {
@@ -453,6 +507,12 @@ getSingleAddressProjectionUser(SingleValueInstruction *I) {
     if (isa<BeginAccessInst>(I) && isa<EndAccessInst>(User))
       continue;
 
+    // Ignore sanitizer instrumentation when looking for a single projection
+    // user. This ensures that we're able to find a single projection subpath
+    // even when sanitization is enabled.
+    if (isSanitizerInstrumentation(User))
+      continue;
+
     // We have more than a single user so bail.
     if (SingleUser)
       return std::make_pair(nullptr, 0);
@@ -460,13 +520,13 @@ getSingleAddressProjectionUser(SingleValueInstruction *I) {
     switch (User->getKind()) {
     case SILInstructionKind::StructElementAddrInst: {
       auto inst = cast<StructElementAddrInst>(User);
-      ProjectionIndex = inst->getFieldNo();
+      ProjectionIndex = inst->getFieldIndex();
       SingleUser = inst;
       break;
     }
     case SILInstructionKind::TupleElementAddrInst: {
       auto inst = cast<TupleElementAddrInst>(User);
-      ProjectionIndex = inst->getFieldNo();
+      ProjectionIndex = inst->getFieldIndex();
       SingleUser = inst;
       break;
     }
@@ -480,7 +540,7 @@ getSingleAddressProjectionUser(SingleValueInstruction *I) {
 
 const IndexTrieNode *
 AccessSummaryAnalysis::findSubPathAccessed(BeginAccessInst *BAI) {
-  IndexTrieNode *SubPath = SubPathTrie;
+  IndexTrieNode *SubPath = BAI->getModule().getIndexTrieRoot();
 
   // For each single-user projection of BAI, construct or get a node
   // from the trie representing the index of the field or tuple element
@@ -499,12 +559,44 @@ AccessSummaryAnalysis::findSubPathAccessed(BeginAccessInst *BAI) {
   return SubPath;
 }
 
+SILType AccessSummaryAnalysis::getSubPathType(SILType baseType,
+                                              const IndexTrieNode *subPath,
+                                              SILModule &mod,
+                                              TypeExpansionContext context) {
+  // Walk the trie to the root to collect the sequence (in reverse order).
+  llvm::SmallVector<unsigned, 4> reversedIndices;
+  const IndexTrieNode *indexTrieNode = subPath;
+  while (!indexTrieNode->isRoot()) {
+    reversedIndices.push_back(indexTrieNode->getIndex());
+    indexTrieNode = indexTrieNode->getParent();
+  }
+
+  SILType iterType = baseType;
+  for (unsigned index : llvm::reverse(reversedIndices)) {
+    if (StructDecl *decl = iterType.getStructOrBoundGenericStruct()) {
+      VarDecl *var = decl->getStoredProperties()[index];
+      iterType = iterType.getFieldType(var, mod, context);
+      continue;
+    }
+
+    if (auto tupleTy = iterType.getAs<TupleType>()) {
+      iterType = iterType.getTupleElementType(index);
+      continue;
+    }
+
+    llvm_unreachable("unexpected type in projection subpath!");
+  }
+
+  return iterType;
+}
+
 /// Returns a string representation of the SubPath
 /// suitable for use in diagnostic text. Only supports the Projections
 /// that stored-property relaxation supports: struct stored properties
 /// and tuple elements.
 std::string AccessSummaryAnalysis::getSubPathDescription(
-    SILType baseType, const IndexTrieNode *subPath, SILModule &M) {
+    SILType baseType, const IndexTrieNode *subPath, SILModule &M,
+    TypeExpansionContext context) {
   // Walk the trie to the root to collect the sequence (in reverse order).
   llvm::SmallVector<unsigned, 4> reversedIndices;
   const IndexTrieNode *I = subPath;
@@ -517,15 +609,13 @@ std::string AccessSummaryAnalysis::getSubPathDescription(
   llvm::raw_string_ostream os(sbuf);
 
   SILType containingType = baseType;
-  for (unsigned index : reversed(reversedIndices)) {
+  for (unsigned index : llvm::reverse(reversedIndices)) {
     os << ".";
 
     if (StructDecl *D = containingType.getStructOrBoundGenericStruct()) {
-      auto iter = D->getStoredProperties().begin();
-      std::advance(iter, index);
-      VarDecl *var = *iter;
+      VarDecl *var = D->getStoredProperties()[index];
       os << var->getBaseName();
-      containingType = containingType.getFieldType(var, M);
+      containingType = containingType.getFieldType(var, M, context);
       continue;
     }
 
@@ -550,7 +640,7 @@ static unsigned subPathLength(const IndexTrieNode *subPath) {
 
   const IndexTrieNode *iter = subPath;
   while (iter) {
-    length++;
+    ++length;
     iter = iter->getParent();
   }
 
@@ -584,14 +674,20 @@ void AccessSummaryAnalysis::FunctionSummary::print(raw_ostream &os,
   unsigned argCount = getArgumentCount();
   os << "(";
 
-  for (unsigned i = 0; i < argCount; i++) {
+  for (unsigned i = 0; i < argCount; ++i) {
     if (i > 0) {
       os << ",  ";
     }
     SILArgument *arg = fn->getArgument(i);
     SILModule &m = fn->getModule();
-    os << getAccessForArgument(i).getDescription(arg->getType(), m);
+    os << getAccessForArgument(i).getDescription(arg->getType(), m,
+                                                 TypeExpansionContext(*fn));
   }
 
   os << ")";
+}
+
+void AccessSummaryAnalysis::FunctionSummary::dump(SILFunction *fn) const {
+  print(llvm::errs(), fn);
+  llvm::errs() << '\n';
 }

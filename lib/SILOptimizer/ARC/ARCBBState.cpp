@@ -12,6 +12,7 @@
 
 #define DEBUG_TYPE "arc-sequence-opts"
 #include "ARCBBState.h"
+#include "swift/Basic/Assertions.h"
 #include "llvm/Support/Debug.h"
 
 using namespace swift;
@@ -31,7 +32,7 @@ using ARCBBState = ARCSequenceDataflowEvaluator::ARCBBState;
 void ARCBBState::mergeSuccBottomUp(ARCBBState &SuccBBState) {
   // For each [(SILValue, BottomUpState)] that we are tracking...
   for (auto &Pair : getBottomupStates()) {
-    if (!Pair.hasValue())
+    if (!Pair.has_value())
       continue;
 
     SILValue RefCountedValue = Pair->first;
@@ -48,7 +49,7 @@ void ARCBBState::mergeSuccBottomUp(ARCBBState &SuccBBState) {
     // effect of an intersection.
     auto Other = SuccBBState.PtrToBottomUpState.find(RefCountedValue);
     if (Other == SuccBBState.PtrToBottomUpState.end()) {
-      PtrToBottomUpState.blot(RefCountedValue);
+      PtrToBottomUpState.erase(RefCountedValue);
       continue;
     }
 
@@ -58,7 +59,7 @@ void ARCBBState::mergeSuccBottomUp(ARCBBState &SuccBBState) {
     // This has the effect of an intersection since we already checked earlier
     // that RefCountedValue was not blotted.
     if (!OtherRefCountedValue) {
-      PtrToBottomUpState.blot(RefCountedValue);
+      PtrToBottomUpState.erase(RefCountedValue);
       continue;
     }
 
@@ -69,7 +70,7 @@ void ARCBBState::mergeSuccBottomUp(ARCBBState &SuccBBState) {
     // of instructions which together semantically act as one ref count
     // increment. Merge the two states together.
     if (!RefCountState.merge(OtherRefCountState)) {
-      PtrToBottomUpState.blot(RefCountedValue);
+      PtrToBottomUpState.erase(RefCountedValue);
     }
   }
 }
@@ -85,7 +86,7 @@ void ARCBBState::initSuccBottomUp(ARCBBState &SuccBBState) {
 void ARCBBState::mergePredTopDown(ARCBBState &PredBBState) {
   // For each [(SILValue, TopDownState)] that we are tracking...
   for (auto &Pair : getTopDownStates()) {
-    if (!Pair.hasValue())
+    if (!Pair.has_value())
       continue;
 
     SILValue RefCountedValue = Pair->first;
@@ -102,7 +103,7 @@ void ARCBBState::mergePredTopDown(ARCBBState &PredBBState) {
     // effect of an intersection.
     auto Other = PredBBState.PtrToTopDownState.find(RefCountedValue);
     if (Other == PredBBState.PtrToTopDownState.end()) {
-      PtrToTopDownState.blot(RefCountedValue);
+      PtrToTopDownState.erase(RefCountedValue);
       continue;
     }
 
@@ -111,7 +112,7 @@ void ARCBBState::mergePredTopDown(ARCBBState &PredBBState) {
     // If the other ref count value was blotted, blot our value and continue.
     // This has the effect of an intersection.
     if (!OtherRefCountedValue) {
-      PtrToTopDownState.blot(RefCountedValue);
+      PtrToTopDownState.erase(RefCountedValue);
       continue;
     }
 
@@ -123,8 +124,8 @@ void ARCBBState::mergePredTopDown(ARCBBState &PredBBState) {
     // Attempt to merge Other into this ref count state. If we fail, blot this
     // ref counted value and continue.
     if (!RefCountState.merge(OtherRefCountState)) {
-      DEBUG(llvm::dbgs() << "Failed to merge!\n");
-      PtrToTopDownState.blot(RefCountedValue);
+      LLVM_DEBUG(llvm::dbgs() << "Failed to merge!\n");
+      PtrToTopDownState.erase(RefCountedValue);
       continue;
     }
   }
@@ -135,6 +136,34 @@ void ARCBBState::mergePredTopDown(ARCBBState &PredBBState) {
 /// predecessors.
 void ARCBBState::initPredTopDown(ARCBBState &PredBBState) {
   PtrToTopDownState = PredBBState.PtrToTopDownState;
+}
+
+void ARCBBState::dumpBottomUpState() {
+  for (auto state : getBottomupStates()) {
+    if (!state.has_value())
+      continue;
+    auto elem = state.value();
+    if (!elem.first)
+      continue;
+    llvm::dbgs() << "SILValue: ";
+    elem.first->dump();
+    llvm::dbgs() << "RefCountState: ";
+    elem.second.dump();
+  }
+}
+
+void ARCBBState::dumpTopDownState() {
+  for (auto state : getTopDownStates()) {
+    if (!state.has_value())
+      continue;
+    auto elem = state.value();
+    if (!elem.first)
+      continue;
+    llvm::dbgs() << "SILValue: ";
+    elem.first->dump();
+    llvm::dbgs() << "RefCountState: ";
+    elem.second.dump();
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -171,13 +200,13 @@ ARCBBStateInfo::ARCBBStateInfo(SILFunction *F, PostOrderAnalysis *POA,
   }
 }
 
-llvm::Optional<ARCBBStateInfoHandle>
+std::optional<ARCBBStateInfoHandle>
 ARCBBStateInfo::getBottomUpBBHandle(SILBasicBlock *BB) {
   auto OptID = getBBID(BB);
-  if (!OptID.hasValue())
-    return None;
+  if (!OptID.has_value())
+    return std::nullopt;
 
-  unsigned ID = OptID.getValue();
+  unsigned ID = OptID.value();
 
   auto BackedgeIter = BackedgeMap.find(BB);
   if (BackedgeIter == BackedgeMap.end())
@@ -186,13 +215,13 @@ ARCBBStateInfo::getBottomUpBBHandle(SILBasicBlock *BB) {
                               BackedgeIter->second);
 }
 
-llvm::Optional<ARCBBStateInfoHandle>
+std::optional<ARCBBStateInfoHandle>
 ARCBBStateInfo::getTopDownBBHandle(SILBasicBlock *BB) {
   auto MaybeID = getBBID(BB);
-  if (!MaybeID.hasValue())
-    return None;
+  if (!MaybeID.has_value())
+    return std::nullopt;
 
-  unsigned ID = MaybeID.getValue();
+  unsigned ID = MaybeID.value();
 
   auto BackedgeIter = BackedgeMap.find(BB);
   if (BackedgeIter == BackedgeMap.end())
@@ -201,10 +230,10 @@ ARCBBStateInfo::getTopDownBBHandle(SILBasicBlock *BB) {
                               BackedgeIter->second);
 }
 
-llvm::Optional<unsigned> ARCBBStateInfo::getBBID(SILBasicBlock *BB) const {
+std::optional<unsigned> ARCBBStateInfo::getBBID(SILBasicBlock *BB) const {
   auto Iter = BBToBBIDMap.find(BB);
   if (Iter == BBToBBIDMap.end())
-    return None;
+    return std::nullopt;
   return Iter->second;
 }
 

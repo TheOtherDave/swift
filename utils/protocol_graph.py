@@ -23,8 +23,6 @@
 #
 # ===---------------------------------------------------------------------===//
 
-from __future__ import print_function
-
 import cgi
 import os
 import re
@@ -186,8 +184,8 @@ for node in sorted(graph.keys()):
               else ''
 
     label = node if len(requirements + generics) == 0 else (
-        '\n<TABLE BORDER="0">\n<TR><TD>\n%s\n</TD></TR><HR/>' +
-        '\n%s%s%s</TABLE>\n' % (
+        ('\n<TABLE BORDER="0">\n<TR><TD>\n%s\n</TD></TR><HR/>' +
+            '\n%s%s%s</TABLE>\n') % (
             node,
             '\n'.join('<TR><TD>%s</TD></TR>' % r for r in requirements),
             divider,

@@ -19,13 +19,14 @@ enum G_E<T> {
 let arr: [String] = []
 let _ = arr.map(E.foo) // Ok
 let _ = arr.map(E.bar) // Ok
-let _ = arr.map(E.two) // expected-error {{cannot convert value of type '(Int, Int) -> E' to expected argument type '(String) -> _'}}
-let _ = arr.map(E.tuple) // expected-error {{cannot convert value of type '((x: Int, y: Int)) -> E' to expected argument type '(String) -> _'}}
+let _ = arr.map(E.two) // expected-error {{cannot convert value of type '(Int, Int) -> E' to expected argument type '(String) -> E'}}
+
+let _ = arr.map(E.tuple) // expected-error {{cannot convert value of type '((x: Int, y: Int)) -> E' to expected argument type '(String) -> E'}}
 
 let _ = arr.map(G_E<String>.foo) // Ok
 let _ = arr.map(G_E<String>.bar) // Ok
-let _ = arr.map(G_E<String>.two) // expected-error {{cannot convert value of type '(String, String) -> G_E<String>' to expected argument type '(String) -> _'}}
-let _ = arr.map(G_E<Int>.tuple) // expected-error {{cannot convert value of type '((x: Int, y: Int)) -> G_E<Int>' to expected argument type '(String) -> _'}}
+let _ = arr.map(G_E<String>.two) // expected-error {{cannot convert value of type '(String, String) -> G_E<String>' to expected argument type '(String) -> G_E<String>'}}
+let _ = arr.map(G_E<Int>.tuple) // expected-error {{cannot convert value of type '((x: Int, y: Int)) -> G_E<Int>' to expected argument type '(String) -> G_E<Int>'}}
 
 let _ = E.foo("hello") // expected-error {{missing argument label 'bar:' in call}}
 let _ = E.bar("hello") // Ok
@@ -49,8 +50,8 @@ bar_1(E.tuple) // Ok - it's going to be ((x: Int, y: Int))
 
 bar_2(G_E<String>.foo) // Ok
 bar_2(G_E<Int>.bar) // Ok
-bar_2(G_E<Int>.two) // expected-error {{cannot convert value of type '(Int, Int) -> G_E<Int>' to expected argument type '(_) -> G_E<_>'}}
-bar_2(G_E<Int>.tuple) // expected-error {{cannot convert value of type '((x: Int, y: Int)) -> G_E<Int>' to expected argument type '(_) -> G_E<_>'}}
+bar_2(G_E<Int>.two) // expected-error {{cannot convert value of type '(Int, Int) -> G_E<Int>' to expected argument type '(Int) -> G_E<Int>'}}
+bar_2(G_E<Int>.tuple) // expected-error {{cannot convert value of type '((x: Int, y: Int)) -> G_E<Int>' to expected argument type '(Int) -> G_E<Int>'}}
 bar_3(G_E<Int>.tuple) // Ok
 
 // Regular enum case assigned as a value
@@ -99,6 +100,100 @@ enum E_32551313<L, R> {
 
 struct Foo_32551313 {
   static func bar() -> E_32551313<(String, Foo_32551313?), (String, String)>? {
-    return E_32551313.Left("", Foo_32551313()) // expected-error {{extra argument in call}}
+    return E_32551313.Left("", Foo_32551313())
+    // expected-error@-1 {{cannot convert value of type 'String' to expected argument type '(String, Foo_32551313?)'}}
+    // expected-error@-2 {{extra argument in call}}
   }
+}
+
+func rdar34583132() {
+  enum E {
+    case timeOut
+  }
+
+  struct S {
+    func foo(_ x: Int) -> E { return .timeOut }
+  }
+
+  func bar(_ s: S) {
+    guard s.foo(1 + 2) == .timeout else {
+    // expected-error@-1 {{enum type 'E' has no case 'timeout'; did you mean 'timeOut'?}}
+      fatalError()
+    }
+  }
+}
+
+func rdar_49159472() {
+  struct A {}
+  struct B {}
+  struct C {}
+
+  enum E {
+  case foo(a: A, b: B?)
+
+    var foo: C? {
+      return nil
+    }
+  }
+
+  class Test {
+    var e: E
+
+    init(_ e: E) {
+      self.e = e
+    }
+
+    func bar() {
+      e = .foo(a: A(), b: nil)   // Ok
+      e = E.foo(a: A(), b: nil)  // Ok
+      baz(e: .foo(a: A(), b: nil))  // Ok
+      baz(e: E.foo(a: A(), b: nil)) // Ok
+    }
+
+    func baz(e: E) {}
+  }
+}
+
+struct EnumElementPatternFromContextualType<T> {
+  enum E {
+    case plain
+    case payload(T)
+  }
+
+  func foo(x: Any) where T == EnumElementPatternFromContextualType<Bool>.E {
+    switch x {
+    case T.plain: // Ok
+      break
+    case T.payload(true): // Ok
+      break
+    default:
+      break
+    }
+  }
+}
+
+// https://github.com/apple/swift/issues/56765
+
+enum CompassPoint {
+    case North(Int)
+    case South
+    case East
+    case West
+}
+
+func isNorth(c : CompassPoint) -> Bool {
+  // expected-error@+1{{member 'North' expects argument of type 'Int'}}
+  return c == .North // expected-error {{binary operator '==' cannot be applied to two 'CompassPoint' operands}}
+  // expected-note@-1 {{binary operator '==' cannot be synthesized for enums with associated values}}
+}
+
+func isNorth2(c : CompassPoint) -> Bool {
+  // expected-error@+1{{member 'North' expects argument of type 'Int'}}
+  return .North == c // expected-error {{binary operator '==' cannot be applied to two 'CompassPoint' operands}}
+  // expected-note@-1 {{binary operator '==' cannot be synthesized for enums with associated values}}
+}
+
+func isSouth(c : CompassPoint) -> Bool {
+  return c == .South // expected-error {{binary operator '==' cannot be applied to two 'CompassPoint' operands}}
+  // expected-note@-1 {{binary operator '==' cannot be synthesized for enums with associated values}}
 }

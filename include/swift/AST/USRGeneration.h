@@ -9,16 +9,26 @@
 // See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
+//
+// Unique Symbol References (USRs) provide a textual encoding for
+// declarations. These are used for indexing, analogous to how mangled names
+// are used in object files.
+//
+//===----------------------------------------------------------------------===//
 
 #ifndef SWIFT_AST_USRGENERATION_H
 #define SWIFT_AST_USRGENERATION_H
 
 #include "swift/Basic/LLVM.h"
 
+#include <string>
+
 namespace swift {
+class Decl;
 class AbstractStorageDecl;
 class ValueDecl;
 class ExtensionDecl;
+class ModuleEntity;
 enum class AccessorKind;
 class Type;
 
@@ -32,9 +42,17 @@ bool printTypeUSR(Type Ty, raw_ostream &OS);
 /// \returns true if it failed, false on success.
 bool printDeclTypeUSR(const ValueDecl *D, raw_ostream &OS);
 
-/// Prints out the USR for the given Decl.
+/// Prints out the USR for the given ValueDecl.
 /// \returns true if it failed, false on success.
-bool printDeclUSR(const ValueDecl *D, raw_ostream &OS);
+bool printValueDeclUSR(const ValueDecl *D, raw_ostream &OS);
+
+/// Prints out the USR for the given ModuleEntity.
+/// In case module aliasing is used, it prints the real module name. For example,
+/// if a file has `import Foo` and `-module-alias Foo=Bar` is passed, treat Foo as
+/// an alias and Bar as the real module name as its dependency. Note that the
+/// aliasing only applies to Swift modules.
+/// \returns true if it failed, false on success.
+bool printModuleUSR(ModuleEntity Mod, raw_ostream &OS);
 
 /// Prints out the accessor USR for the given storage Decl.
 /// \returns true if it failed, false on success.
@@ -44,6 +62,13 @@ bool printAccessorUSR(const AbstractStorageDecl *D, AccessorKind AccKind,
 /// Prints out the extension USR for the given extension Decl.
 /// \returns true if it failed, false on success.
 bool printExtensionUSR(const ExtensionDecl *ED, raw_ostream &OS);
+
+/// Prints out the USR for the given Decl.
+/// \returns true if it failed, false on success.
+bool printDeclUSR(const Decl *D, raw_ostream &OS);
+
+/// Demangle a mangle-name-based USR to a human readable name.
+std::string demangleUSR(StringRef mangled);
 
 } // namespace ide
 } // namespace swift

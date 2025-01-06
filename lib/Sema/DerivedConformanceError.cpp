@@ -15,6 +15,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "CodeSynthesis.h"
 #include "TypeChecker.h"
 #include "DerivedConformances.h"
 #include "swift/AST/Decl.h"
@@ -22,12 +23,41 @@
 #include "swift/AST/Expr.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/Types.h"
+#include "swift/AST/SwiftNameTranslation.h"
 
 using namespace swift;
-using namespace DerivedConformance;
+using namespace swift::objc_translation;
 
-static void deriveBodyBridgedNSError_enum_nsErrorDomain(
-              AbstractFunctionDecl *domainDecl) {
+static std::pair<BraceStmt *, bool>
+deriveBodyBridgedNSError_enum_nsErrorDomain(AbstractFunctionDecl *domainDecl,
+                                            void *) {
+  // enum SomeEnum {
+  //   @derived
+  //   static var _nsErrorDomain: String {
+  //     return String(reflecting: self)
+  //   }
+  // }
+
+  auto M = domainDecl->getParentModule();
+  auto &C = M->getASTContext();
+  auto self = domainDecl->getImplicitSelfDecl();
+
+  auto selfRef = new (C) DeclRefExpr(self, DeclNameLoc(), /*implicit*/ true);
+  auto stringType = TypeExpr::createImplicitForDecl(
+      DeclNameLoc(), C.getStringDecl(), domainDecl,
+      C.getStringDecl()->getInterfaceType());
+  auto *argList = ArgumentList::forImplicitSingle(
+      C, C.getIdentifier("reflecting"), selfRef);
+  auto *initReflectingCall = CallExpr::createImplicit(C, stringType, argList);
+  auto *ret = ReturnStmt::createImplicit(C, initReflectingCall);
+
+  auto body = BraceStmt::create(C, SourceLoc(), ASTNode(ret), SourceLoc());
+  return { body, /*isTypeChecked=*/false };
+}
+
+static std::pair<BraceStmt *, bool>
+deriveBodyBridgedNSError_printAsObjCEnum_nsErrorDomain(
+                    AbstractFunctionDecl *domainDecl, void *) {
   // enum SomeEnum {
   //   @derived
   //   static var _nsErrorDomain: String {
@@ -38,76 +68,66 @@ static void deriveBodyBridgedNSError_enum_nsErrorDomain(
   auto M = domainDecl->getParentModule();
   auto &C = M->getASTContext();
   auto TC = domainDecl->getInnermostTypeContext();
-  auto ED = TC->getAsEnumOrEnumExtensionContext();
+  auto ED = TC->getSelfEnumDecl();
 
-  std::string buffer = M->getNameStr();
-  buffer += ".";
-  buffer += ED->getNameStr();
-  StringRef value(C.AllocateCopy(buffer));
+  StringRef value(C.AllocateCopy(getErrorDomainStringForObjC(ED)));
 
   auto string = new (C) StringLiteralExpr(value, SourceRange(), /*implicit*/ true);
-  auto ret = new (C) ReturnStmt(SourceLoc(), string, /*implicit*/ true);
+  auto *ret = ReturnStmt::createImplicit(C, SourceLoc(), string);
   auto body = BraceStmt::create(C, SourceLoc(),
                                 ASTNode(ret),
                                 SourceLoc());
-  domainDecl->setBody(body);
+  return { body, /*isTypeChecked=*/false };
 }
 
-static ValueDecl *deriveBridgedNSError_enum_nsErrorDomain(TypeChecker &tc,
-                                                          Decl *parentDecl,
-                                                          EnumDecl *enumDecl) {
+static ValueDecl *
+deriveBridgedNSError_enum_nsErrorDomain(
+    DerivedConformance &derived,
+    std::pair<BraceStmt *, bool> (*synthesizer)(AbstractFunctionDecl *, void*)) {
   // enum SomeEnum {
   //   @derived
   //   static var _nsErrorDomain: String {
-  //     return "\(self)"
+  //     ...
   //   }
   // }
 
-  // Note that for @objc enums the format is assumed to be "MyModule.SomeEnum".
-  // If this changes, please change PrintAsObjC as well.
-  
-  ASTContext &C = tc.Context;
-  
-  auto stringTy = C.getStringDecl()->getDeclaredType();
+  auto stringTy = derived.Context.getStringType();
 
-  // Define the getter.
-  auto getterDecl = declareDerivedPropertyGetter(tc, parentDecl, enumDecl,
-                                                 stringTy, stringTy,
-                                                 /*isStatic=*/true,
-                                                 /*isFinal=*/true);
-  getterDecl->setBodySynthesizer(&deriveBodyBridgedNSError_enum_nsErrorDomain);
-  
   // Define the property.
   VarDecl *propDecl;
   PatternBindingDecl *pbDecl;
-  std::tie(propDecl, pbDecl)
-    = declareDerivedReadOnlyProperty(tc, parentDecl, enumDecl,
-                                     C.Id_nsErrorDomain,
-                                     stringTy, stringTy,
-                                     getterDecl, /*isStatic=*/true,
-                                     /*isFinal=*/true);
-  
-  auto dc = cast<IterableDeclContext>(parentDecl);
-  dc->addMember(getterDecl);
-  dc->addMember(propDecl);
-  dc->addMember(pbDecl);
+  std::tie(propDecl, pbDecl) = derived.declareDerivedProperty(
+      DerivedConformance::SynthesizedIntroducer::Var,
+      derived.Context.Id_nsErrorDomain, stringTy, /*isStatic=*/true,
+      /*isFinal=*/true);
+  addNonIsolatedToSynthesized(derived.Nominal, propDecl);
+
+  // Define the getter.
+  auto getterDecl = derived.addGetterToReadOnlyDerivedProperty(propDecl);
+  getterDecl->setBodySynthesizer(synthesizer);
+
+  derived.addMembersToConformanceContext({propDecl, pbDecl});
 
   return propDecl;
 }
 
-ValueDecl *DerivedConformance::deriveBridgedNSError(TypeChecker &tc,
-                                                    Decl *parentDecl,
-                                                    NominalTypeDecl *type,
-                                                    ValueDecl *requirement) {
-  if (!isa<EnumDecl>(type))
+ValueDecl *DerivedConformance::deriveBridgedNSError(ValueDecl *requirement) {
+  if (!isa<EnumDecl>(Nominal))
     return nullptr;
 
-  auto enumType = cast<EnumDecl>(type);
+  if (requirement->getBaseName() == Context.Id_nsErrorDomain) {
+    auto synthesizer = deriveBodyBridgedNSError_enum_nsErrorDomain;
 
-  if (requirement->getBaseName() == tc.Context.Id_nsErrorDomain)
-    return deriveBridgedNSError_enum_nsErrorDomain(tc, parentDecl, enumType);
+    auto scope = Nominal->getFormalAccessScope(Nominal->getModuleScopeContext());
+    if (scope.isPublic() || scope.isInternal())
+      // PrintAsClang may print this domain, so we should make sure we use the
+      // same string it will.
+      synthesizer = deriveBodyBridgedNSError_printAsObjCEnum_nsErrorDomain;
 
-  tc.diagnose(requirement->getLoc(),
-              diag::broken_errortype_requirement);
+    return deriveBridgedNSError_enum_nsErrorDomain(*this, synthesizer);
+  }
+
+  Context.Diags.diagnose(requirement->getLoc(),
+                         diag::broken_errortype_requirement);
   return nullptr;
 }

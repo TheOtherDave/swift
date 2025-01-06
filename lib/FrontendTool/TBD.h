@@ -18,21 +18,25 @@
 namespace llvm {
 class StringRef;
 class Module;
+namespace vfs {
+class OutputBackend;
+}
 }
 namespace swift {
 class ModuleDecl;
 class FileUnit;
 class FrontendOptions;
+struct TBDGenOptions;
 
-bool writeTBD(ModuleDecl *M, bool hasMultipleIRGenThreads,
-              llvm::StringRef OutputFilename,
-              llvm::StringRef installName);
-bool inputFileKindCanHaveTBDValidated(InputFileKind kind);
-bool validateTBD(ModuleDecl *M, llvm::Module &IRModule,
-                 bool hasMultipleIRGenThreads,
+bool writeTBD(ModuleDecl *M, StringRef OutputFilename,
+              llvm::vfs::OutputBackend &Backend, const TBDGenOptions &Opts);
+bool validateTBD(ModuleDecl *M,
+                 const llvm::Module &IRModule,
+                 const TBDGenOptions &opts,
                  bool diagnoseExtraSymbolsInTBD);
-bool validateTBD(FileUnit *M, llvm::Module &IRModule,
-                 bool hasMultipleIRGenThreads,
+bool validateTBD(FileUnit *M,
+                 const llvm::Module &IRModule,
+                 const TBDGenOptions &opts,
                  bool diagnoseExtraSymbolsInTBD);
 }
 

@@ -50,24 +50,24 @@ public:
   SILValue getRCIdentityRoot(SILValue V);
 
   /// Return all recursive users of V, looking through users which propagate
-  /// RCIdentity. *NOTE* This ignores obvious ARC escapes where the a potential
+  /// RCIdentity.
+  ///
+  /// *NOTE* This ignores obvious ARC escapes where the a potential
   /// user of the RC is not managed by ARC. For instance
   /// unchecked_trivial_bit_cast.
-  void getRCUsers(SILValue V, llvm::SmallVectorImpl<SILInstruction *> &Users);
+  void getRCUses(SILValue V, SmallVectorImpl<Operand *> &Uses);
 
-  void handleDeleteNotification(SILNode *node) {
-    auto value = dyn_cast<ValueBase>(node);
-    if (!value)
-      return;
+  /// A helper method that calls getRCUses and then maps each operand to the
+  /// operands user and then uniques the list.
+  ///
+  /// *NOTE* The routine asserts that the passed in Users array is empty for
+  /// simplicity. If needed this can be changed, but it is not necessary given
+  /// current uses.
+  void getRCUsers(SILValue V, SmallVectorImpl<SILInstruction *> &Users);
 
-    // Check the cache. If we don't find it, there is nothing to do.
-    auto Iter = RCCache.find(SILValue(value));
-    if (Iter == RCCache.end())
-      return;
-
-    // Then erase Iter from the cache.
-    RCCache.erase(Iter);
-  }
+  /// Like getRCUses except uses a callback to prevent the need for an
+  /// intermediate array.
+  void visitRCUses(SILValue V, function_ref<void(Operand *)> Visitor);
 
 private:
   SILValue getRCIdentityRootInner(SILValue V, unsigned RecursionDepth);
@@ -83,32 +83,22 @@ class RCIdentityAnalysis : public FunctionAnalysisBase<RCIdentityFunctionInfo> {
 
 public:
   RCIdentityAnalysis(SILModule *)
-    : FunctionAnalysisBase<RCIdentityFunctionInfo>(AnalysisKind::RCIdentity),
-      DA(nullptr) {}
+      : FunctionAnalysisBase<RCIdentityFunctionInfo>(
+            SILAnalysisKind::RCIdentity),
+        DA(nullptr) {}
 
   RCIdentityAnalysis(const RCIdentityAnalysis &) = delete;
   RCIdentityAnalysis &operator=(const RCIdentityAnalysis &) = delete;
 
-  virtual void handleDeleteNotification(SILNode *node) override {
-    // If the parent function of this instruction was just turned into an
-    // external declaration, bail. This happens during SILFunction destruction.
-    SILFunction *F = node->getFunction();
-    if (F->isExternalDeclaration()) {
-      return;
-    }
-    get(F)->handleDeleteNotification(node);
-  }
-
-  virtual bool needsNotifications() override { return true; }
-
   static bool classof(const SILAnalysis *S) {
-    return S->getKind() == AnalysisKind::RCIdentity;
+    return S->getKind() == SILAnalysisKind::RCIdentity;
   }
 
   virtual void initialize(SILPassManager *PM) override;
   
-  virtual RCIdentityFunctionInfo *newFunctionAnalysis(SILFunction *F) override {
-    return new RCIdentityFunctionInfo(DA);
+  virtual std::unique_ptr<RCIdentityFunctionInfo>
+  newFunctionAnalysis(SILFunction *F) override {
+    return std::make_unique<RCIdentityFunctionInfo>(DA);
   }
 
   virtual bool shouldInvalidate(SILAnalysis::InvalidationKind K) override {

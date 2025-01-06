@@ -1,4 +1,3 @@
-// RUN: %target-swift-frontend -module-name main -typecheck -verify -swift-version 3 %s
 // RUN: %target-swift-frontend -module-name main -typecheck -verify -swift-version 4 %s
 
 // Some convenient test points to escape closures to
@@ -11,7 +10,7 @@ func escapeX(_ xx: (Int) -> Int, _ value: Int) { // expected-note* {{non-escapin
   withoutActuallyEscaping(xx) { escapableXX in
     x = xx // expected-error{{non-escaping parameter}}
     x = escapableXX
-    x = xx // expected-error{{non-escaping parameter}}
+    x = xx
 
     _ = x(value)
     _ = xx(value)
@@ -61,6 +60,53 @@ func rethrowThroughWAE(_ zz: (Int, Int, Int) throws -> Int, _ value: Int) throws
   }
 }
 
-let _: ((Int) -> Int, (@escaping (Int) -> Int) -> ()) -> ()
-  = withoutActuallyEscaping(_:do:) // expected-error{{}}
+let _: ((Int) -> Int, (@escaping (Int) -> Int) -> ()) -> () = withoutActuallyEscaping(_:do:)
+// expected-error@-1 {{invalid conversion from 'async' function of type '((Int) -> Int, (@escaping (Int) -> Int) async -> ()) async -> ()' to synchronous function type '((Int) -> Int, (@escaping (Int) -> Int) -> ()) -> ()'}}
 
+
+// Failing to propagate @noescape into non-single-expression
+// closure passed to withoutActuallyEscaping
+
+// https://github.com/apple/swift/issues/50421
+
+class Box<T> {
+  let value: T
+
+  init(_ value: T) {
+    self.value = value
+  }
+
+  func map1<U>(_ transform: (T) -> U) -> Box<U> {
+    return withoutActuallyEscaping(transform) { transform in
+      return Box<U>(transform(value))
+    }
+  }
+
+  func map2<U>(_ transform: (T) -> U) -> Box<U> {
+    return withoutActuallyEscaping(transform) { transform in
+      let v = Box<U>(transform(value))
+      return v
+    }
+  }
+}
+
+enum HomeworkError: Error {
+  case forgot
+  case dogAteIt
+}
+
+enum MyError: Error {
+  case fail
+}
+
+func letEscapeThrowTyped(f: () throws(HomeworkError) -> () -> ()) throws(HomeworkError) -> () -> () {
+  // Note: thrown error type inference for closures will fix this error below.
+  return try withoutActuallyEscaping(f) { return try $0() }
+  // expected-error@-1{{thrown expression type 'any Error' cannot be converted to error type 'HomeworkError'}}
+}
+
+func letEscapeThrowTypedBad(f: () throws(HomeworkError) -> () -> ()) throws(MyError) -> () -> () {
+  // Note: thrown error type inference for closures will change this error below.
+  return try withoutActuallyEscaping(f) { return try $0() }
+  // expected-error@-1{{thrown expression type 'any Error' cannot be converted to error type 'MyError'}}
+}

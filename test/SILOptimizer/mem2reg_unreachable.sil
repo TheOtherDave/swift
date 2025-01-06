@@ -1,4 +1,4 @@
-// RUN: %target-sil-opt -assume-parsing-unqualified-ownership-sil -enable-sil-verify-all %s -mem2reg
+// RUN: %target-sil-opt -enable-sil-verify-all %s -mem2reg
 
 // Make sure we are not crashing on blocks that are not dominated by the entry block.
 
@@ -47,7 +47,7 @@ bb0:
   unreachable
 
 bb1:
-  debug_value_addr %0 : $*S, let, name "newvalue", argno 1
+  debug_value %0 : $*S, let, name "newvalue", argno 1, expr op_deref
   br bb2
 
 bb2:

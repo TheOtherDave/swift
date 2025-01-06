@@ -13,18 +13,21 @@
 #ifndef SWIFT_AST_ANY_FUNCTION_REF_H
 #define SWIFT_AST_ANY_FUNCTION_REF_H
 
-#include "swift/Basic/Compiler.h"
-#include "swift/Basic/LLVM.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Expr.h"
+#include "swift/AST/ParameterList.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Compiler.h"
+#include "swift/Basic/Debug.h"
+#include "swift/Basic/LLVM.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/PointerUnion.h"
+#include <optional>
 
 namespace swift {
 class CaptureInfo;
 
-/// \brief A universal function reference -- can wrap all AST nodes that
+/// A universal function reference -- can wrap all AST nodes that
 /// represent functions and exposes a common interface to them.
 class AnyFunctionRef {
   PointerUnion<AbstractFunctionDecl *, AbstractClosureExpr *> TheFunction;
@@ -52,26 +55,36 @@ public:
     }
   }
 
-  CaptureInfo &getCaptureInfo() const {
+  /// Construct an AnyFunctionRef from a decl context that might be
+  /// some sort of function.
+  static std::optional<AnyFunctionRef> fromDeclContext(DeclContext *dc) {
+    if (auto fn = dyn_cast<AbstractFunctionDecl>(dc)) {
+      return AnyFunctionRef(fn);
+    }
+
+    if (auto ace = dyn_cast<AbstractClosureExpr>(dc)) {
+      return AnyFunctionRef(ace);
+    }
+
+    return std::nullopt;
+  }
+
+  CaptureInfo getCaptureInfo() const {
     if (auto *AFD = TheFunction.dyn_cast<AbstractFunctionDecl *>())
       return AFD->getCaptureInfo();
     return TheFunction.get<AbstractClosureExpr *>()->getCaptureInfo();
   }
 
-  void getLocalCaptures(SmallVectorImpl<CapturedValue> &Result) const {
-    getCaptureInfo().getLocalCaptures(Result);
+  ParameterList *getParameters() const {
+    if (auto *AFD = TheFunction.dyn_cast<AbstractFunctionDecl *>())
+      return AFD->getParameters();
+    return TheFunction.get<AbstractClosureExpr *>()->getParameters();
   }
 
-  ArrayRef<ParameterList *> getParameterLists() const {
-    if (auto *AFD = TheFunction.dyn_cast<AbstractFunctionDecl *>())
-      return AFD->getParameterLists();
-    return TheFunction.get<AbstractClosureExpr *>()->getParameterLists();
-  }
-  
-  bool hasType() const {
-    if (auto *AFD = TheFunction.dyn_cast<AbstractFunctionDecl *>())
-      return AFD->hasInterfaceType();
-    return !TheFunction.get<AbstractClosureExpr *>()->getType().isNull();
+  bool hasExternalPropertyWrapperParameters() const {
+    return llvm::any_of(*getParameters(), [](const ParamDecl *param) {
+      return param->hasExternalPropertyWrapper();
+    });
   }
 
   Type getType() const {
@@ -89,6 +102,16 @@ public:
     return TheFunction.get<AbstractClosureExpr *>()->getResultType();
   }
 
+  ArrayRef<AnyFunctionType::Yield>
+  getYieldResults(SmallVectorImpl<AnyFunctionType::Yield> &buffer) const {
+    return getYieldResultsImpl(buffer, /*mapIntoContext*/ false);
+  }
+
+  ArrayRef<AnyFunctionType::Yield>
+  getBodyYieldResults(SmallVectorImpl<AnyFunctionType::Yield> &buffer) const {
+    return getYieldResultsImpl(buffer, /*mapIntoContext*/ true);
+  }
+
   BraceStmt *getBody() const {
     if (auto *AFD = TheFunction.dyn_cast<AbstractFunctionDecl *>())
       return AFD->getBody();
@@ -97,6 +120,50 @@ public:
       return CE->getBody();
     return cast<AutoClosureExpr>(ACE)->getBody();
   }
+
+  void setParsedBody(BraceStmt *stmt) {
+    if (auto *AFD = TheFunction.dyn_cast<AbstractFunctionDecl *>()) {
+      AFD->setBody(stmt, AbstractFunctionDecl::BodyKind::Parsed);
+      return;
+    }
+
+    auto *ACE = TheFunction.get<AbstractClosureExpr *>();
+    if (auto *CE = dyn_cast<ClosureExpr>(ACE)) {
+      CE->setBody(stmt);
+      CE->setBodyState(ClosureExpr::BodyState::Parsed);
+      return;
+    }
+
+    llvm_unreachable("autoclosures don't have statement bodies");
+  }
+
+  void setTypecheckedBody(BraceStmt *stmt) {
+    if (auto *AFD = TheFunction.dyn_cast<AbstractFunctionDecl *>()) {
+      AFD->setBody(stmt, AbstractFunctionDecl::BodyKind::TypeChecked);
+      return;
+    }
+
+    auto *ACE = TheFunction.get<AbstractClosureExpr *>();
+    if (auto *CE = dyn_cast<ClosureExpr>(ACE)) {
+      CE->setBody(stmt);
+      CE->setBodyState(ClosureExpr::BodyState::TypeChecked);
+      return;
+    }
+
+    llvm_unreachable("autoclosures don't have statement bodies");
+  }
+
+  /// Returns a boolean value indicating whether the body, if any, contains
+  /// an explicit `return` statement.
+  ///
+  /// \returns `true` if the body contains an explicit `return` statement,
+  /// `false` otherwise.
+  bool bodyHasExplicitReturnStmt() const;
+
+  /// Finds occurrences of explicit `return` statements within the body, if any.
+  ///
+  /// \param results An out container to which the results are added.
+  void getExplicitReturnStmts(SmallVectorImpl<ReturnStmt *> &results) const;
 
   DeclContext *getAsDeclContext() const {
     if (auto *AFD = TheFunction.dyn_cast<AbstractFunctionDecl *>())
@@ -112,12 +179,11 @@ public:
     return TheFunction.dyn_cast<AbstractClosureExpr*>();
   }
 
-  /// Return true if this closure is passed as an argument to a function and is
-  /// known not to escape from that function.  In this case, captures can be
-  /// more efficient.
-  bool isKnownNoEscape() const {
-    if (hasType() && !getType()->hasError())
-      return getType()->castTo<AnyFunctionType>()->isNoEscape();
+  /// Whether this function is @Sendable.
+  bool isSendable() const {
+    if (auto *fnType = getType()->getAs<AnyFunctionType>())
+      return fnType->isSendable();
+
     return false;
   }
 
@@ -132,9 +198,9 @@ public:
     llvm_unreachable("unexpected AnyFunctionRef representation");
   }
   
-  SourceLoc getLoc() const {
+  SourceLoc getLoc(bool SerializedOK = true) const {
     if (auto afd = TheFunction.dyn_cast<AbstractFunctionDecl *>()) {
-      return afd->getLoc();
+      return afd->getLoc(SerializedOK);
     }
     if (auto ce = TheFunction.dyn_cast<AbstractClosureExpr *>()) {
       return ce->getLoc();
@@ -147,8 +213,7 @@ public:
 #pragma warning(push)
 #pragma warning(disable: 4996)
 #endif
-  LLVM_ATTRIBUTE_DEPRECATED(void dump() const LLVM_ATTRIBUTE_USED,
-                            "only for use within the debugger") {
+  SWIFT_DEBUG_DUMP {
     if (auto afd = TheFunction.dyn_cast<AbstractFunctionDecl *>()) {
       return afd->dump();
     }
@@ -168,7 +233,7 @@ public:
     llvm_unreachable("unexpected AnyFunctionRef representation");
   }
 
-  GenericSignature *getGenericSignature() const {
+  GenericSignature getGenericSignature() const {
     if (auto afd = TheFunction.dyn_cast<AbstractFunctionDecl *>()) {
       return afd->getGenericSignature();
     }
@@ -177,10 +242,52 @@ public:
     }
     llvm_unreachable("unexpected AnyFunctionRef representation");
   }
+
+  friend bool operator==(AnyFunctionRef lhs, AnyFunctionRef rhs) {
+     return lhs.TheFunction == rhs.TheFunction;
+   }
+
+   friend bool operator!=(AnyFunctionRef lhs, AnyFunctionRef rhs) {
+     return lhs.TheFunction != rhs.TheFunction;
+   }
+
+  friend llvm::hash_code hash_value(AnyFunctionRef fn) {
+    using llvm::hash_value;
+    return hash_value(fn.TheFunction.getOpaqueValue());
+  }
+
+  friend SourceLoc extractNearestSourceLoc(AnyFunctionRef fn) {
+    return fn.getLoc(/*SerializedOK=*/false);
+  }
+
+private:
+  ArrayRef<AnyFunctionType::Yield>
+  getYieldResultsImpl(SmallVectorImpl<AnyFunctionType::Yield> &buffer,
+                      bool mapIntoContext) const {
+    assert(buffer.empty());
+    if (auto *AFD = TheFunction.dyn_cast<AbstractFunctionDecl *>()) {
+      if (auto *AD = dyn_cast<AccessorDecl>(AFD)) {
+        if (AD->isCoroutine()) {
+          auto valueTy = AD->getStorage()->getValueInterfaceType()
+                                         ->getReferenceStorageReferent();
+          if (mapIntoContext)
+            valueTy = AD->mapTypeIntoContext(valueTy);
+          YieldTypeFlags flags(isYieldingMutableAccessor(AD->getAccessorKind())
+                                   ? ParamSpecifier::InOut
+                                   : ParamSpecifier::LegacyShared);
+          buffer.push_back(AnyFunctionType::Yield(valueTy, flags));
+          return buffer;
+        }
+      }
+    }
+    return {};
+  }
 };
 #if SWIFT_COMPILER_IS_MSVC
 #pragma warning(pop)
 #endif
+
+void simple_display(llvm::raw_ostream &out, AnyFunctionRef fn);
 
 } // namespace swift
 
@@ -209,4 +316,3 @@ struct DenseMapInfo<swift::AnyFunctionRef> {
 }
 
 #endif // LLVM_SWIFT_AST_ANY_FUNCTION_REF_H
-

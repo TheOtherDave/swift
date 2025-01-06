@@ -1,4 +1,5 @@
 // RUN: %target-typecheck-verify-swift -swift-version 4
+// RUN: not %target-swift-frontend -typecheck %s -debug-generic-signatures 2>&1 | %FileCheck %s
 
 protocol Fooable {
   associatedtype Foo
@@ -158,6 +159,8 @@ protocol P {
 }
 
 struct S<A: P> {
+  // CHECK-LABEL: .S.init(_:)@
+  // CHECK-NEXT: Generic signature:  <A, Q where A == Q.[P]T, Q : P>
 	init<Q: P>(_ q: Q) where Q.T == A {}
 }
 
@@ -177,6 +180,8 @@ struct SpecificAnimal<F:Food> : Animal {
     typealias EdibleFood=F
     let _eat:(_ f:F) -> ()
 
+    // CHECK-LABEL: .SpecificAnimal.init(_:)@
+    // CHECK-NEXT: Generic signature: <F, A where F == A.[Animal]EdibleFood, A : Animal>
     init<A:Animal>(_ selfie:A) where A.EdibleFood == F {
         _eat = { selfie.eat($0) }
     }
@@ -328,10 +333,12 @@ protocol P9 {
 
 struct X7<T: P9> where T.A : C { }
 
-extension X7 where T.A == Int { } // expected-error {{'T.A' requires that 'Int' inherit from 'C'}}
+extension X7 where T.A == Int { } // expected-error {{no type for 'T.A' can satisfy both 'T.A : _NativeClass' and 'T.A == Int}}
+// expected-error@-1 {{no type for 'T.A' can satisfy both 'T.A : C' and 'T.A == Int'}}
 struct X8<T: C> { }
 
-extension X8 where T == Int { } // expected-error {{'T' requires that 'Int' inherit from 'C'}}
+extension X8 where T == Int { } // expected-error {{no type for 'T' can satisfy both 'T : _NativeClass' and 'T == Int'}}
+// expected-error@-1 {{no type for 'T' can satisfy both 'T : C' and 'T == Int'}}
 
 protocol P10 {
 	associatedtype A
@@ -343,31 +350,76 @@ protocol P10 {
 
 protocol P11: P10 where A == B { }
 
-func intracomponent<T: P11>(_: T) // expected-note{{previous same-type constraint 'T.A' == 'T.B' implied here}}
-  where T.A == T.B { } // expected-warning{{redundant same-type constraint 'T.A' == 'T.B'}}
+// CHECK-LABEL: .intracomponent@
+// CHECK-NEXT: Generic signature: <T where T : P11>
+func intracomponent<T: P11>(_: T)
+  where T.A == T.B { }
 
+// CHECK-LABEL: .intercomponentSameComponents@
+// CHECK-NEXT: Generic signature: <T where T : P10, T.[P10]A == T.[P10]B>
 func intercomponentSameComponents<T: P10>(_: T)
-  where T.A == T.B, // expected-warning{{redundant same-type constraint 'T.A' == 'T.B'}}
-        T.B == T.A { } // expected-note{{previous same-type constraint 'T.B' == 'T.A' written here}}
+  where T.A == T.B,
+        T.B == T.A { }
 
+// CHECK-LABEL: .intercomponentMoreThanSpanningTree@
+// CHECK-NEXT: Generic signature: <T where T : P10, T.[P10]A == T.[P10]B, T.[P10]B == T.[P10]C, T.[P10]C == T.[P10]D, T.[P10]D == T.[P10]E>
 func intercomponentMoreThanSpanningTree<T: P10>(_: T)
   where T.A == T.B,
         T.B == T.C,
-        T.D == T.E, // expected-note{{previous same-type constraint 'T.D' == 'T.E' written here}}
+        T.D == T.E,
         T.D == T.B,
-        T.E == T.B  // expected-warning{{redundant same-type constraint 'T.E' == 'T.B'}}
+        T.E == T.B
         { }
 
-func trivialRedundancy<T: P10>(_: T) where T.A == T.A { } // expected-warning{{redundant same-type constraint 'T.A' == 'T.A'}}
+// CHECK-LABEL: .trivialRedundancy@
+// CHECK-NEXT: Generic signature: <T where T : P10>
+func trivialRedundancy<T: P10>(_: T) where T.A == T.A { }
 
 struct X11<T: P10> where T.A == T.B { }
 
 func intracomponentInferred<T>(_: X11<T>)
   where T.A == T.B { }
 
-// Suppress redundant same-type constraint warnings from result types.
-struct StructTakingP1<T: P1> { }
+// Check directly-concrete same-type constraints
+typealias NotAnInt = Double
 
-func resultTypeSuppress<T: P1>() -> StructTakingP1<T> {
-  return StructTakingP1()
+extension X11 where NotAnInt == Int { }
+// expected-error@-1{{generic signature requires types 'NotAnInt' (aka 'Double') and 'Int' to be the same}}
+
+// rdar://45307061 - dropping delayed same-type constraints when merging
+// equivalence classes
+
+protocol FakeIterator {
+  associatedtype Element
+}
+
+protocol FakeSequence {
+  associatedtype Iterator : FakeIterator
+  associatedtype Element where Iterator.Element == Element
+}
+
+protocol ObserverType {
+  associatedtype E
+}
+
+// CHECK-LABEL: .Bad@
+// CHECK-NEXT: Generic signature: <S, O where S : FakeSequence, O == S.[FakeSequence]Element.[ObserverType]E, S.[FakeSequence]Element : ObserverType>
+struct Bad<S: FakeSequence, O> where S.Element : ObserverType, S.Element.E == O {}
+
+// CHECK-LABEL: .good@
+// CHECK-NEXT: Generic signature: <S, O where S : FakeSequence, O == S.[FakeSequence]Element.[ObserverType]E, S.[FakeSequence]Element : ObserverType>
+func good<S: FakeSequence, O>(_: S, _: O) where S.Element : ObserverType, O == S.Element.E {
+  _ = Bad<S, O>()
+}
+
+// CHECK-LABEL: .bad@
+// CHECK-NEXT: Generic signature: <S, O where S : FakeSequence, O == S.[FakeSequence]Element.[ObserverType]E, S.[FakeSequence]Element : ObserverType>
+func bad<S: FakeSequence, O>(_: S, _: O) where S.Element : ObserverType, O == S.Iterator.Element.E {
+  _ = Bad<S, O>()
+}
+
+// CHECK-LABEL: .ugly@
+// CHECK-NEXT: Generic signature: <S, O where S : FakeSequence, O == S.[FakeSequence]Element.[ObserverType]E, S.[FakeSequence]Element : ObserverType>
+func ugly<S: FakeSequence, O>(_: S, _: O) where S.Element : ObserverType, O == S.Iterator.Element.E, O == S.Element.E {
+  _ = Bad<S, O>()
 }

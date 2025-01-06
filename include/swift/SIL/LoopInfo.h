@@ -46,9 +46,17 @@ public:
     return make_range(begin(), end());
   }
 
-  /// Check whether it is safe to duplicate this instruction when duplicating
-  /// this loop by unrolling or versioning.
-  bool canDuplicate(SILInstruction *Inst) const;
+  void getExitingAndLatchBlocks(
+    SmallVectorImpl<SILBasicBlock *> &ExitingAndLatchBlocks) const {
+    this->getExitingBlocks(ExitingAndLatchBlocks);
+    SILBasicBlock *header = getHeader();
+    for (auto *predBB : header->getPredecessorBlocks()) {
+      if (contains(predBB) && !this->isLoopExiting(predBB))
+        ExitingAndLatchBlocks.push_back(predBB);
+    }
+  }
+
+  SILFunction *getFunction() const { return getHeader()->getParent(); }
 
 private:
   friend class llvm::LoopInfoBase<SILBasicBlock, SILLoop>;

@@ -11,15 +11,172 @@
 //===----------------------------------------------------------------------===//
 
 import SwiftPrivate
-#if os(OSX) || os(iOS) || os(watchOS) || os(tvOS)
+#if canImport(Darwin)
 import Darwin
-#elseif os(Linux) || os(FreeBSD) || os(PS4) || os(Android) || os(Cygwin) || os(Haiku)
+#elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Android)
+import Android
+#elseif os(WASI)
+import WASILibc
+#elseif os(Windows)
+import CRT
+import WinSDK
 #endif
 
-
+#if !os(WASI)
+// No signals support on WASI yet, see https://github.com/WebAssembly/WASI/issues/166.
+internal func _signalToString(_ signal: Int) -> String {
+  switch CInt(signal) {
+  case SIGILL:  return "SIGILL"
+  case SIGABRT: return "SIGABRT"
+  case SIGFPE:  return "SIGFPE"
+  case SIGSEGV: return "SIGSEGV"
 #if !os(Windows)
-// posix_spawn is not available on Windows.
+  case SIGTRAP: return "SIGTRAP"
+  case SIGBUS:  return "SIGBUS"
+  case SIGSYS:  return "SIGSYS"
+#endif
+  default:      return "SIG???? (\(signal))"
+  }
+}
+#endif
+
+public enum ProcessTerminationStatus : CustomStringConvertible {
+  case exit(Int)
+  case signal(Int)
+
+  public var description: String {
+    switch self {
+    case .exit(let status):
+      return "Exit(\(status))"
+    case .signal(let signal):
+#if os(WASI)
+      // No signals support on WASI yet, see https://github.com/WebAssembly/WASI/issues/166.
+      fatalError("Signals are not supported on WebAssembly/WASI")
+#else
+      return "Signal(\(_signalToString(signal)))"
+#endif
+    }
+  }
+}
+
+#if !SWIFT_STDLIB_HAS_COMMANDLINE
+@_silgen_name("_swift_stdlib_getUnsafeArgvArgc")
+internal func _swift_stdlib_getUnsafeArgvArgc(_: UnsafeMutablePointer<Int32>) -> UnsafeMutablePointer<UnsafeMutablePointer<Int8>?>
+
+public enum CommandLine {
+  public static var arguments: [String] = {
+    var argc: Int32 = 0
+    var unsafeArgv = _swift_stdlib_getUnsafeArgvArgc(&argc)
+    return (0 ..< Int(argc)).map { String(cString: unsafeArgv[$0]!) }
+  }()
+}
+#endif // !SWIFT_STDLIB_HAS_COMMANDLINE
+
+#if os(Windows)
+public func spawnChild(_ args: [String])
+    -> (process: HANDLE, stdin: HANDLE, stdout: HANDLE, stderr: HANDLE) {
+  var _stdin: (read: HANDLE?, write: HANDLE?)
+  var _stdout: (read: HANDLE?, write: HANDLE?)
+  var _stderr: (read: HANDLE?, write: HANDLE?)
+
+  var saAttributes: SECURITY_ATTRIBUTES = SECURITY_ATTRIBUTES()
+  saAttributes.nLength = DWORD(MemoryLayout<SECURITY_ATTRIBUTES>.size)
+  saAttributes.bInheritHandle = true
+  saAttributes.lpSecurityDescriptor = nil
+
+  if !CreatePipe(&_stdin.read, &_stdin.write, &saAttributes, 0) {
+    fatalError("CreatePipe() failed")
+  }
+  if !SetHandleInformation(_stdin.write, HANDLE_FLAG_INHERIT, 0) {
+    fatalError("SetHandleInformation() failed")
+  }
+
+  if !CreatePipe(&_stdout.read, &_stdout.write, &saAttributes, 0) {
+    fatalError("CreatePipe() failed")
+  }
+  if !SetHandleInformation(_stdout.read, HANDLE_FLAG_INHERIT, 0) {
+    fatalError("SetHandleInformation() failed")
+  }
+
+  if !CreatePipe(&_stderr.read, &_stderr.write, &saAttributes, 0) {
+    fatalError("CreatePipe() failed")
+  }
+  if !SetHandleInformation(_stderr.read, HANDLE_FLAG_INHERIT, 0) {
+    fatalError("SetHandleInformation() failed")
+  }
+
+  var siStartupInfo: STARTUPINFOW = STARTUPINFOW()
+  siStartupInfo.cb = DWORD(MemoryLayout<STARTUPINFOW>.size)
+  siStartupInfo.hStdError = _stderr.write
+  siStartupInfo.hStdOutput = _stdout.write
+  siStartupInfo.hStdInput = _stdin.read
+  siStartupInfo.dwFlags |= STARTF_USESTDHANDLES
+
+  var piProcessInfo: PROCESS_INFORMATION = PROCESS_INFORMATION()
+
+  // TODO(compnerd): properly quote the command line being invoked here.  See
+  // https://blogs.msdn.microsoft.com/twistylittlepassagesallalike/2011/04/23/everyone-quotes-command-line-arguments-the-wrong-way/
+  // for more details on how to properly quote the command line for Windows.
+  let command: String =
+      ([CommandLine.arguments[0]] + args).joined(separator: " ")
+  command.withCString(encodedAs: UTF16.self) { cString in
+    if !CreateProcessW(nil, UnsafeMutablePointer<WCHAR>(mutating: cString),
+                       nil, nil, true, 0, nil, nil,
+                       &siStartupInfo, &piProcessInfo) {
+      let dwError: DWORD = GetLastError()
+      fatalError("CreateProcessW() failed \(dwError)")
+    }
+  }
+
+  if !CloseHandle(_stdin.read) {
+    fatalError("CloseHandle() failed")
+  }
+  if !CloseHandle(_stdout.write) {
+    fatalError("CloseHandle() failed")
+  }
+  if !CloseHandle(_stderr.write) {
+    fatalError("CloseHandle() failed")
+  }
+
+  // CloseHandle(piProcessInfo.hProcess)
+  CloseHandle(piProcessInfo.hThread)
+
+  return (piProcessInfo.hProcess,
+          _stdin.write ?? INVALID_HANDLE_VALUE,
+          _stdout.read ?? INVALID_HANDLE_VALUE,
+          _stderr.read ?? INVALID_HANDLE_VALUE)
+}
+
+public func waitProcess(_ process: HANDLE) -> ProcessTerminationStatus {
+  let result = WaitForSingleObject(process, INFINITE)
+  if result != WAIT_OBJECT_0 {
+    fatalError("WaitForSingleObject() failed")
+  }
+
+  var status: DWORD = 0
+  if !GetExitCodeProcess(process, &status) {
+    fatalError("GetExitCodeProcess() failed")
+  }
+
+  if status & DWORD(0x80000000) == DWORD(0x80000000) {
+    return .signal(Int(status))
+  }
+  return .exit(Int(status))
+}
+#elseif os(WASI)
+// WASI doesn't support child processes
+public func spawnChild(_ args: [String])
+  -> (pid: pid_t, stdinFD: CInt, stdoutFD: CInt, stderrFD: CInt) {
+  fatalError("\(#function) is not supported on WebAssembly/WASI")
+}
+public func posixWaitpid(_ pid: pid_t) -> ProcessTerminationStatus {
+  fatalError("\(#function) is not supported on WebAssembly/WASI")
+}
+#else
 // posix_spawn is not available on Android.
 // posix_spawn is not available on Haiku.
 #if !os(Android) && !os(Haiku)
@@ -74,6 +231,30 @@ func posixPipe() -> (readFD: CInt, writeFD: CInt) {
   return (fds[0], fds[1])
 }
 
+#if !SWIFT_STDLIB_HAS_ENVIRON
+@_silgen_name("_NSGetEnviron")
+func _NSGetEnviron() -> UnsafeMutablePointer<UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>>
+
+var environ: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?> {
+  #if os(macOS)
+  return _NSGetEnviron().pointee
+  #elseif os(Windows)
+  return __p_environ().pointee
+  #elseif os(Linux)
+  return __environ
+  #else
+  #error("unsupported platform")
+  #endif
+}
+#endif
+
+#if SWIFT_STDLIB_STATIC_PRINT
+func print(_ s: String) {
+  let data = Array("\(s)\n".utf8)
+  write(STDOUT_FILENO, data, data.count)
+}
+#endif
+
 /// Start the same executable as a child process, redirecting its stdout and
 /// stderr.
 public func spawnChild(_ args: [String])
@@ -95,6 +276,10 @@ public func spawnChild(_ args: [String])
   if pid == 0 {
     // pid of 0 means we are now in the child process.
     // Capture the output before executing the program.
+    close(childStdout.readFD)
+    close(childStdin.writeFD)
+    close(childStderr.readFD)
+    close(childToParentPipe.readFD)
     dup2(childStdout.writeFD, STDOUT_FILENO)
     dup2(childStdin.readFD, STDIN_FILENO)
     dup2(childStderr.writeFD, STDERR_FILENO)
@@ -139,6 +324,41 @@ public func spawnChild(_ args: [String])
 
     // Close the pipe when we're done writing the error.
     close(childToParentPipe.writeFD)
+  } else {
+    close(childToParentPipe.writeFD)
+
+    // Figure out if the child’s call to execve was successful or not.
+    var readfds = _stdlib_fd_set()
+    readfds.set(childToParentPipe.readFD)
+    var writefds = _stdlib_fd_set()
+    var errorfds = _stdlib_fd_set()
+    errorfds.set(childToParentPipe.readFD)
+
+    var ret: CInt
+    repeat {
+      ret = _stdlib_select(&readfds, &writefds, &errorfds, nil)
+    } while ret == -1 && errno == EINTR
+    if ret <= 0 {
+      fatalError("select() returned an error: \(errno)")
+    }
+
+    if readfds.isset(childToParentPipe.readFD) || errorfds.isset(childToParentPipe.readFD) {
+      var childErrno: CInt = 0
+      let readResult: ssize_t = withUnsafeMutablePointer(to: &childErrno) {
+        return read(childToParentPipe.readFD, $0, MemoryLayout.size(ofValue: $0.pointee))
+      }
+      if readResult == 0 {
+        // We read an EOF indicating that the child's call to execve was successful.
+      } else if readResult < 0 {
+        fatalError("read() returned error: \(errno)")
+      } else {
+        // We read an error from the child.
+        print(String(cString: strerror(childErrno)))
+        preconditionFailure("execve() failed")
+      }
+    }
+
+    close(childToParentPipe.readFD)
   }
 #else
   var fileActions = _make_posix_spawn_file_actions_t()
@@ -187,7 +407,7 @@ public func spawnChild(_ args: [String])
   childArgs.insert(CommandLine.arguments[0], at: 0)
   let interpreter = getenv("SWIFT_INTERPRETER")
   if interpreter != nil {
-    if let invocation = String(validatingUTF8: interpreter!) {
+    if let invocation = String(validatingCString: interpreter!) {
       childArgs.insert(invocation, at: 0)
     }
   }
@@ -236,33 +456,6 @@ internal func _make_posix_spawn_file_actions_t()
 }
 #endif
 #endif
-
-internal func _signalToString(_ signal: Int) -> String {
-  switch CInt(signal) {
-  case SIGILL:  return "SIGILL"
-  case SIGTRAP: return "SIGTRAP"
-  case SIGABRT: return "SIGABRT"
-  case SIGFPE:  return "SIGFPE"
-  case SIGBUS:  return "SIGBUS"
-  case SIGSEGV: return "SIGSEGV"
-  case SIGSYS:  return "SIGSYS"
-  default:      return "SIG???? (\(signal))"
-  }
-}
-
-public enum ProcessTerminationStatus : CustomStringConvertible {
-  case exit(Int)
-  case signal(Int)
-
-  public var description: String {
-    switch self {
-    case .exit(let status):
-      return "Exit(\(status))"
-    case .signal(let signal):
-      return "Signal(\(_signalToString(signal)))"
-    }
-  }
-}
 
 public func posixWaitpid(_ pid: pid_t) -> ProcessTerminationStatus {
   var status: CInt = 0

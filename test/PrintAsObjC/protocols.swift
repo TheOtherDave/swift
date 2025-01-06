@@ -3,7 +3,7 @@
 // RUN: %empty-directory(%t)
 
 // FIXME: BEGIN -enable-source-import hackaround
-// RUN:  %target-swift-frontend(mock-sdk: -sdk %S/../Inputs/clang-importer-sdk -I %t) -emit-module -o %t  %S/../Inputs/clang-importer-sdk/swift-modules/ObjectiveC.swift
+// RUN:  %target-swift-frontend(mock-sdk: -sdk %S/../Inputs/clang-importer-sdk -I %t) -emit-module -o %t  %S/../Inputs/clang-importer-sdk/swift-modules/ObjectiveC.swift -disable-objc-attr-requires-foundation-module
 // RUN:  %target-swift-frontend(mock-sdk: -sdk %S/../Inputs/clang-importer-sdk -I %t) -emit-module -o %t  %S/../Inputs/clang-importer-sdk/swift-modules/CoreGraphics.swift
 // RUN:  %target-swift-frontend(mock-sdk: -sdk %S/../Inputs/clang-importer-sdk -I %t) -emit-module -o %t  %S/../Inputs/clang-importer-sdk/swift-modules/Foundation.swift
 // FIXME: END -enable-source-import hackaround
@@ -25,7 +25,21 @@ import objc_generics
 
 // CHECK-LABEL: @protocol B <A>
 // CHECK-NEXT: @end
-@objc protocol B : A {}
+@objc protocol B : A, Sendable {}
+
+// CHECK-LABEL: @protocol CompletionAndAsync
+// CHECK-NEXT: - (void)helloWithCompletion:(void (^ _Nonnull)(BOOL))completion;
+// CHECK-NEXT: @end
+@objc protocol CompletionAndAsync {
+  // We don't want this one printed because it has more limited availability.
+  @available(SwiftStdlib 5.7, *)
+  @objc(helloWithCompletion:)
+  func hello() async -> Bool
+
+  @available(*, renamed: "hello()")
+  @objc(helloWithCompletion:)
+  func hello(completion: @escaping (Bool) -> Void)
+}
 
 // CHECK: @protocol CustomName2;
 // CHECK-LABEL: SWIFT_PROTOCOL_NAMED("CustomName")
@@ -55,7 +69,7 @@ protocol CustomNameType2 {}
 // CHECK-LABEL: @interface MyObject : NSObject <NSCoding, Fungible>
 // CHECK-NEXT: initWithCoder
 // CHECK-NEXT: init SWIFT_UNAVAILABLE
-// CHECK-NEXT: new SWIFT_UNAVAILABLE
+// CHECK-NEXT: new SWIFT_DEPRECATED
 // CHECK-NEXT: @end
 // NEGATIVE-NOT: @protocol NSCoding
 class MyObject : NSObject, NSCoding, Fungible {
@@ -123,18 +137,38 @@ extension NSString : A, ZZZ {}
   @objc optional func f()
 }
 
+// NESTED-LABEL: @interface ParentClass
+// NESTED-NEXT: @end
+@objc class ParentClass {
+
+  // NESTED-LABEL: @protocol Nested
+  // NESTED-NEXT: @end
+  @objc protocol Nested {}
+
+  // NESTED-LABEL: SWIFT_PROTOCOL_NAMED("Nested2")
+  // NESTED-NEXT: @protocol NestedInParent
+  // NESTED-NEXT: @end
+  @objc(NestedInParent) protocol Nested2 {}
+}
+
+extension ParentClass {
+  // NESTED-LABEL: @protocol NestedInExtensionOfParent
+  // NESTED-NEXT: @end
+  @objc protocol NestedInExtensionOfParent {}
+}
+
 // NEGATIVE-NOT: @protocol PrivateProto
 @objc private protocol PrivateProto {}
 
 // CHECK-LABEL: @interface PrivateProtoAdopter{{$}}
 // CHECK-NEXT: init
 // CHECK-NEXT: @end
-@objc class PrivateProtoAdopter : PrivateProto {}
+@objc @objcMembers class PrivateProtoAdopter : PrivateProto {}
 
 // CHECK-LABEL: @interface PrivateProtoAdopter2 <A>
 // CHECK-NEXT: init
 // CHECK-NEXT: @end
-@objc class PrivateProtoAdopter2 : PrivateProto, A {}
+@objc @objcMembers class PrivateProtoAdopter2 : PrivateProto, A {}
 
 // CHECK-LABEL: @protocol Properties
 // CHECK-NEXT: @property (nonatomic, readonly) NSInteger a;
@@ -165,7 +199,7 @@ extension NSString : A, ZZZ {}
   @objc func references(someClassAndZZZ: ReferencesSomeClass2 & ZZZ)
 }
 
-@objc class ReferencesSomeClass2 {}
+@objc @objcMembers class ReferencesSomeClass2 {}
 
 
 // CHECK-LABEL: @protocol ReversedOrder2{{$}}
@@ -189,6 +223,18 @@ extension NSString : A, ZZZ {}
 
 // CHECK-LABEL: @interface Subclass : RootClass1 <ZZZ>{{$}}
 @objc class Subclass : RootClass1, ZZZ {}
+
+// CHECK-LABEL: @protocol UnownedProperty
+// CHECK-NEXT: @property (nonatomic, unsafe_unretained) id _Nonnull unownedProp;
+@objc protocol UnownedProperty {
+  unowned var unownedProp: AnyObject { get set }
+}
+
+// CHECK-LABEL: @protocol WeakProperty
+// CHECK-NEXT: @property (nonatomic, weak) id _Nullable weakProp;
+@objc protocol WeakProperty {
+  weak var weakProp: AnyObject? { get set }
+}
 
 // Deliberately at the end of the file.
 @objc protocol ZZZ {}

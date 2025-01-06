@@ -1,8 +1,23 @@
-// RUN: %target-run-simple-swift
+// RUN: %empty-directory(%t)
+// RUN: %target-build-swift -o %t/Error -DPTR_SIZE_%target-ptrsize -module-name main %/s
+// RUN: %target-codesign %t/Error
+// RUN: %target-run %t/Error
 // REQUIRES: executable_test
+// REQUIRES: reflection
 
 import StdlibUnittest
 
+func shouldCheckErrorLocation() -> Bool {
+  // Location information for runtime traps is only emitted in debug builds.
+  guard _isDebugAssertConfiguration() else { return false }
+  // The runtime error location format changed after the 5.3 release.
+  // (https://github.com/apple/swift/pull/34665)
+  if #available(macOS 11.3, iOS 14.5, tvOS 14.5, watchOS 7.4, *) {
+    return true
+  } else {
+    return false
+  }
+}
 
 var ErrorTests = TestSuite("Error")
 
@@ -13,7 +28,7 @@ protocol OtherProtocol {
   var otherProperty: String { get }
 }
 
-protocol OtherClassProtocol : class {
+protocol OtherClassProtocol : AnyObject {
   var otherClassProperty: String { get }
 }
 
@@ -103,17 +118,31 @@ ErrorTests.test("default domain and code") {
 
 enum SillyError: Error { case JazzHands }
 
+#if !os(WASI)
+// Trap tests aren't available on WASI.
 ErrorTests.test("try!")
   .skip(.custom({ _isFastAssertConfiguration() },
                 reason: "trap is not guaranteed to happen in -Ounchecked"))
-  .crashOutputMatches(_isDebugAssertConfiguration()
+  .crashOutputMatches(shouldCheckErrorLocation()
                         ? "'try!' expression unexpectedly raised an error: "
                           + "main.SillyError.JazzHands"
                         : "")
   .code {
     expectCrashLater()
     let _: () = try! { throw SillyError.JazzHands }()
-  }
+}
+
+ErrorTests.test("try!/location")
+  .skip(.custom({ _isFastAssertConfiguration() },
+                reason: "trap is not guaranteed to happen in -Ounchecked"))
+  .crashOutputMatches(shouldCheckErrorLocation()
+                        ? "main/Error.swift:\(#line + 4)"
+                        : "")
+  .code {
+    expectCrashLater()
+    let _: () = try! { throw SillyError.JazzHands }()
+}
+#endif
 
 ErrorTests.test("try?") {
   var value = try? { () throws -> Int in return 1 }()
@@ -142,6 +171,102 @@ ErrorTests.test("existential in lvalue") {
   }
   expectEqual(0, LifetimeTracked.instances)
 }
+
+enum UnsignedError: UInt, Error {
+#if PTR_SIZE_64
+case negativeOne = 0xFFFFFFFFFFFFFFFF
+#elseif PTR_SIZE_32
+case negativeOne = 0xFFFFFFFF
+#else
+#error ("Unknown pointer size")
+#endif
+}
+
+ErrorTests.test("unsigned raw value") {
+  let negOne: Error = UnsignedError.negativeOne
+  expectEqual(-1, negOne._code)
+}
+
+ErrorTests.test("test dealloc empty error box") {
+  struct Foo<T>: Error { let value: T }
+
+  func makeFoo<T>() throws -> Foo<T> {
+    throw Foo(value: "makeFoo throw error")
+  }
+
+  func makeError<T>(of: T.Type) throws -> Error {
+    return try makeFoo() as Foo<T>
+  }
+
+  do {
+    _ = try makeError(of: Int.self)
+  } catch let foo as Foo<String> {
+    expectEqual(foo.value, "makeFoo throw error")
+  } catch {
+    expectUnreachableCatch(error)
+  }
+}
+
+#if !os(WASI)
+var errors: [Error] = []
+
+@inline(never)
+func throwNegativeOne() throws {
+  throw UnsignedError.negativeOne
+}
+
+@inline(never)
+func throwJazzHands() throws {
+  throw SillyError.JazzHands
+}
+
+@inline(never)
+func throwJazzHandsTyped() throws(SillyError) {
+  throw .JazzHands
+}
+
+// Error isn't allowed in a @convention(c) function when ObjC interop is
+// not available, so pass it through an UnsafeRawPointer.
+@available(SwiftStdlib 5.8, *)
+@_silgen_name("_swift_setWillThrowHandler")
+public func setWillThrowHandler(
+    _ handler: (@convention(c) (UnsafeRawPointer) -> Void)?
+)
+
+ErrorTests.test("willThrow") {
+  guard #available(SwiftStdlib 5.8, *) else {
+    return
+  }
+  setWillThrowHandler {
+    errors.append(unsafeBitCast($0, to: Error.self))
+  }
+  defer {
+    setWillThrowHandler(nil)
+  }
+  expectTrue(errors.isEmpty)
+  do {
+    try throwNegativeOne()
+  } catch {}
+  expectEqual(UnsignedError.self, type(of: errors.last!))
+
+  do {
+    try throwJazzHands()
+  } catch {}
+  expectEqual(2, errors.count)
+  expectEqual(SillyError.self, type(of: errors.last!))
+
+  // Typed errors introduced in Swift 6.0
+  guard #available(SwiftStdlib 6.0, *) else {
+    return
+  }
+
+  do {
+    try throwJazzHandsTyped()
+  } catch {}
+  expectEqual(3, errors.count)
+  expectEqual(SillyError.self, type(of: errors.last!))
+}
+#endif
 
 runAllTests()
 

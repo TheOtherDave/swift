@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 #
 # ==-- jobstats - support for reading the contents of stats dirs --==#
 #
@@ -19,24 +19,19 @@ import datetime
 import itertools
 import json
 import os
+import platform
 import random
 import re
 
 
-class JobStats(object):
-    """Object holding the stats of a single job run during a compilation,
-    corresponding to a single JSON file produced by a single job process
-    passed -stats-output-dir."""
+class JobData(object):
 
-    def __init__(self, jobkind, jobid, module, start_usec, dur_usec,
-                 jobargs, stats):
+    def __init__(self, jobkind, jobid, module, jobargs):
         self.jobkind = jobkind
         self.jobid = jobid
         self.module = module
-        self.start_usec = start_usec
-        self.dur_usec = dur_usec
         self.jobargs = jobargs
-        self.stats = stats
+        (self.input, self.triple, self.out, self.opt) = jobargs[0:4]
 
     def is_driver_job(self):
         """Return true iff self measures a driver job"""
@@ -46,19 +41,42 @@ class JobStats(object):
         """Return true iff self measures a frontend job"""
         return self.jobkind == 'frontend'
 
+
+class JobProfs(JobData):
+    """Object denoting the profile of a single job run during a compilation,
+    corresponding to a single directory of profiles produced by a single
+    job process passed -stats-output-dir."""
+
+    def __init__(self, jobkind, jobid, module, jobargs, profiles):
+        self.profiles = profiles
+        super(JobProfs, self).__init__(jobkind, jobid, module, jobargs)
+
+
+class JobStats(JobData):
+    """Object holding the stats of a single job run during a compilation,
+    corresponding to a single JSON file produced by a single job process
+    passed -stats-output-dir."""
+
+    def __init__(self, jobkind, jobid, module, start_usec, dur_usec,
+                 jobargs, stats):
+        self.start_usec = start_usec
+        self.dur_usec = dur_usec
+        self.stats = stats
+        super(JobStats, self).__init__(jobkind, jobid, module, jobargs)
+
     def driver_jobs_ran(self):
         """Return the count of a driver job's ran sub-jobs"""
-        assert(self.is_driver_job())
+        assert self.is_driver_job()
         return self.stats.get("Driver.NumDriverJobsRun", 0)
 
     def driver_jobs_skipped(self):
         """Return the count of a driver job's skipped sub-jobs"""
-        assert(self.is_driver_job())
+        assert self.is_driver_job()
         return self.stats.get("Driver.NumDriverJobsSkipped", 0)
 
     def driver_jobs_total(self):
         """Return the total count of a driver job's ran + skipped sub-jobs"""
-        assert(self.is_driver_job())
+        assert self.is_driver_job()
         return self.driver_jobs_ran() + self.driver_jobs_skipped()
 
     def merged_with(self, other, merge_by="sum"):
@@ -72,7 +90,7 @@ class JobStats(object):
                                     else max(a, b)),
                "max": lambda a, b: max(a, b)}
         op = ops[merge_by]
-        for k, v in self.stats.items() + other.stats.items():
+        for k, v in list(self.stats.items()) + list(other.stats.items()):
             if k in merged_stats:
                 merged_stats[k] = op(v, merged_stats[k])
             else:
@@ -108,7 +126,7 @@ class JobStats(object):
     def incrementality_percentage(self):
         """Assuming the job is a driver job, return the amount of
         jobs that actually ran, as a percentage of the total number."""
-        assert(self.is_driver_job())
+        assert self.is_driver_job()
         ran = self.driver_jobs_ran()
         total = self.driver_jobs_total()
         return round((float(ran) / float(total)) * 100.0, 2)
@@ -182,13 +200,18 @@ AUXPATSTR = (r"(?P<module>[^-]+)-(?P<input>[^-]+)-(?P<triple>[^-]+)" +
 AUXPAT = re.compile(AUXPATSTR)
 
 TIMERPATSTR = (r"time\.swift-(?P<jobkind>\w+)\." + AUXPATSTR +
-               "\.(?P<timerkind>\w+)$")
+               r"\.(?P<timerkind>\w+)$")
 TIMERPAT = re.compile(TIMERPATSTR)
 
 FILEPATSTR = (r"^stats-(?P<start>\d+)-swift-(?P<kind>\w+)-" +
               AUXPATSTR +
               r"-(?P<pid>\d+)(-.*)?.json$")
 FILEPAT = re.compile(FILEPATSTR)
+
+PROFILEPATSTR = (r"^profile-(?P<start>\d+)-swift-(?P<kind>\w+)-" +
+                 AUXPATSTR +
+                 r"-(?P<pid>\d+)(-.*)?.dir$")
+PROFILEPAT = re.compile(PROFILEPATSTR)
 
 
 def match_auxpat(s):
@@ -215,6 +238,64 @@ def match_filepat(s):
         return None
 
 
+def match_profilepat(s):
+    m = PROFILEPAT.match(s)
+    if m is not None:
+        return m.groupdict()
+    else:
+        return None
+
+
+def find_profiles_in(profiledir, select_stat=[]):
+    sre = re.compile('.*' if len(select_stat) == 0 else
+                     '|'.join(select_stat))
+    profiles = None
+    for profile in os.listdir(profiledir):
+        if profile.endswith(".svg"):
+            continue
+        if sre.search(profile) is None:
+            continue
+        fullpath = os.path.join(profiledir, profile)
+        s = os.stat(fullpath)
+        if s.st_size != 0:
+            if profiles is None:
+                profiles = dict()
+            try:
+                (counter, profiletype) = os.path.splitext(profile)
+                # drop leading period from extension
+                profiletype = profiletype[1:]
+                if profiletype not in profiles:
+                    profiles[profiletype] = dict()
+                profiles[profiletype][counter] = fullpath
+            except Exception:
+                pass
+    return profiles
+
+
+def list_stats_dir_profiles(path, select_module=[], select_stat=[], **kwargs):
+    """Finds all stats-profiles in path, returning list of JobProfs objects"""
+    jobprofs = []
+    for root, dirs, files in os.walk(path):
+        for d in dirs:
+            mg = match_profilepat(d)
+            if not mg:
+                continue
+            # NB: "pid" in fpat is a random number, not unix pid.
+            jobkind = mg['kind']
+            jobid = int(mg['pid'])
+            module = mg["module"]
+            if len(select_module) != 0 and module not in select_module:
+                continue
+            jobargs = [mg["input"], mg["triple"], mg["out"], mg["opt"]]
+
+            e = JobProfs(jobkind=jobkind, jobid=jobid,
+                         module=module, jobargs=jobargs,
+                         profiles=find_profiles_in(os.path.join(root, d),
+                                                   select_stat))
+            jobprofs.append(e)
+    return jobprofs
+
+
 def load_stats_dir(path, select_module=[], select_stat=[],
                    exclude_timers=False, merge_timers=False, **kwargs):
     """Loads all stats-files found in path into a list of JobStats objects"""
@@ -235,18 +316,24 @@ def load_stats_dir(path, select_module=[], select_stat=[],
                 continue
             jobargs = [mg["input"], mg["triple"], mg["out"], mg["opt"]]
 
-            with open(os.path.join(root, f)) as fp:
+            if platform.system() == 'Windows':
+                p = str(u"\\\\?\\%s" % os.path.abspath(os.path.join(root, f)))
+            else:
+                p = os.path.join(root, f)
+
+            with open(p) as fp:
                 j = json.load(fp)
             dur_usec = 1
             stats = dict()
             for (k, v) in j.items():
                 if sre.search(k) is None:
                     continue
+                if k.startswith('time.'):
+                    v = int(1000000.0 * float(v))
                 if k.startswith('time.') and exclude_timers:
                     continue
                 tm = match_timerpat(k)
                 if tm:
-                    v = int(1000000.0 * float(v))
                     if tm['jobkind'] == jobkind and \
                        tm['timerkind'] == 'wall':
                         dur_usec = v

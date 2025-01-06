@@ -11,16 +11,17 @@
           (add-to-list 'load-path
                        (concat this-directory "utils")
                        :append)
+          (defvar swift-project-directory)
           (let ((swift-project-directory this-directory))
             (require 'swift-project-settings)))
         (set (make-local-variable 'swift-project-directory)
          this-directory)
         )
-  (tab-width . 2)
   (fill-column . 80)
   (c-file-style . "swift"))
  (c++-mode
-  (whitespace-style face lines indentation:space))
+  (whitespace-style face lines indentation:space)
+  (flycheck-clang-language-standard . "c++14"))
  (c-mode
   (whitespace-style face lines indentation:space))
  (objc-mode

@@ -1,4 +1,4 @@
-// RUN: %target-sil-opt -sil-print-debuginfo -assume-parsing-unqualified-ownership-sil -enable-sil-verify-all -O %s | %FileCheck %s
+// RUN: %target-sil-opt -sil-print-debuginfo -enable-sil-verify-all -O %s | %FileCheck %s
 
 sil_scope 1 { loc "foo.sil":3:4 parent @foo : $@convention(thin) () -> () }
 sil_scope 2 { loc "foo.sil":3:4 parent 1 }
@@ -15,3 +15,5 @@ sil @foo : $@convention(thin) () -> () {
 bb0:
   return undef : $(), scope 4 // id: %1
 }
+
+sil @bar : $@convention(thin) () -> ()

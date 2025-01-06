@@ -17,7 +17,6 @@
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILValue.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/Debug.h"
 
@@ -28,20 +27,15 @@ class ClassDecl;
 class ClassHierarchyAnalysis : public SILAnalysis {
 public:
   typedef SmallVector<ClassDecl *, 8> ClassList;
-  typedef SmallPtrSet<ClassDecl *, 32> ClassSet;
-  typedef SmallVector<NominalTypeDecl *, 8> NominalTypeList;
-  typedef llvm::DenseMap<ProtocolDecl *, NominalTypeList>
-      ProtocolImplementations;
+  typedef llvm::DenseMap<ClassDecl *, ClassList> ClassListMap;
 
   ClassHierarchyAnalysis(SILModule *Mod)
-      : SILAnalysis(AnalysisKind::ClassHierarchy), M(Mod) {
-      init(); 
-    }
+      : SILAnalysis(SILAnalysisKind::ClassHierarchy), M(Mod) {}
 
   ~ClassHierarchyAnalysis();
 
   static bool classof(const SILAnalysis *S) {
-    return S->getKind() == AnalysisKind::ClassHierarchy;
+    return S->getKind() == SILAnalysisKind::ClassHierarchy;
   }
 
   /// Invalidate all information in this analysis.
@@ -54,11 +48,11 @@ public:
   virtual void invalidate(SILFunction *F, InvalidationKind K) override { }
 
   /// Notify the analysis about a newly created function.
-  virtual void notifyAddFunction(SILFunction *F) override { }
+  virtual void notifyAddedOrModifiedFunction(SILFunction *F) override {}
 
   /// Notify the analysis about a function which will be deleted from the
   /// module.
-  virtual void notifyDeleteFunction(SILFunction *F) override { }
+  virtual void notifyWillDeleteFunction(SILFunction *F) override {}
 
   /// Notify the analysis about changed witness or vtables.
   virtual void invalidateFunctionTables() override { }
@@ -66,7 +60,8 @@ public:
   /// Returns a list of the known direct subclasses of a class \p C in
   /// the current module.
   const ClassList &getDirectSubClasses(ClassDecl *C) {
-    return DirectSubclassesCache[C];
+    populateDirectSubclassesCacheIfNecessary();
+    return (*DirectSubclassesCache)[C];
   }
 
   /// Returns a list of the known indirect subclasses of a class \p C in
@@ -80,43 +75,33 @@ public:
     return IndirectSubclassesCache[C];
   }
 
-  const NominalTypeList &getProtocolImplementations(ProtocolDecl *P) {
-    return ProtocolImplementationsCache[P];
-  }
-
   /// Returns true if the class is inherited by another class in this module.
   bool hasKnownDirectSubclasses(ClassDecl *C) {
-    return DirectSubclassesCache.count(C);
+    populateDirectSubclassesCacheIfNecessary();
+    return DirectSubclassesCache->count(C);
   }
 
   /// Returns true if the class is indirectly inherited by another class
   /// in this module.
   bool hasKnownIndirectSubclasses(ClassDecl *C) {
     return IndirectSubclassesCache.count(C) &&
-           IndirectSubclassesCache[C].size() > 0;
-  }
-
-  /// Returns true if the protocol is implemented by any class in this module.
-  bool hasKnownImplementations(ProtocolDecl *C) {
-    return ProtocolImplementationsCache.count(C);
+           !IndirectSubclassesCache[C].empty();
   }
 
 private:
-  /// Compute inheritance properties.
-  void init();
   void getIndirectSubClasses(ClassDecl *Base,
                              ClassList &IndirectSubs);
   /// The module
   SILModule *M;
 
   /// A cache that maps a class to all of its known direct subclasses.
-  llvm::DenseMap<ClassDecl*, ClassList> DirectSubclassesCache;
+  std::optional<ClassListMap> DirectSubclassesCache;
 
   /// A cache that maps a class to all of its known indirect subclasses.
-  llvm::DenseMap<ClassDecl*, ClassList> IndirectSubclassesCache;
+  ClassListMap IndirectSubclassesCache;
 
-  /// A cache that maps a protocol to all of its known implementations.
-  ProtocolImplementations ProtocolImplementationsCache;
+  /// Populates `DirectSubclassesCache` if necessary.
+  void populateDirectSubclassesCacheIfNecessary();
 };
 
 }

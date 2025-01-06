@@ -58,10 +58,9 @@
 
    ;; SIL Instructions - Allocation/Deallocation.
    `(,(regexp-opt '("alloc_stack" "alloc_ref" "alloc_ref_dynamic" "alloc_box"
-                    "alloc_value_buffer" "alloc_global"
+                    "alloc_global"
                     "dealloc_stack" "dealloc_box" "project_box" "dealloc_ref"
-                    "dealloc_partial_ref" "dealloc_value_buffer"
-                    "project_value_buffer")
+                    "dealloc_partial_ref")
                   'words) . font-lock-keyword-face)
 
    ;; SIL Instructions - Debug Information.
@@ -76,8 +75,7 @@
                   'words) . font-lock-keyword-face)
 
    ;; SIL Instructions - Borrowing
-   `(,(regexp-opt '("load_borrow" "begin_borrow" "store_borrow" "end_borrow_argument") 'words) . font-lock-keyword-face)
-   '("\\(end_borrow\\) %[[:alnum:]]+ \\(from\\)" (1 font-lock-keyword-face) (2 font-lock-keyword-face))
+   `(,(regexp-opt '("load_borrow" "begin_borrow" "store_borrow" "end_borrow") 'words) . font-lock-keyword-face)
 
    ;; SIL Instructions - Exclusivity
    `(,(regexp-opt '("begin_access" "end_access") 'words) . font-lock-keyword-face)
@@ -93,9 +91,11 @@
                     "load_unowned" "store_unowned"
                     "fix_lifetime" "mark_dependence"
                     "end_lifetime"
-                    "is_unique" "is_unique_or_pinned"
+                    "is_unique"
+                    "is_escaping_closure"
                     "copy_block"
-                    "strong_unpin" "strong_pin" "is_unique" "is_unique_or_pinned")
+                    "copy_block_without_escaping"
+                    "is_unique")
                   'words) . font-lock-keyword-face)
    ;; Literals
    `(,(regexp-opt '("function_ref"
@@ -118,18 +118,19 @@
    `(,(regexp-opt '("retain_value" "release_value_addr" "release_value"
                     "release_value_addr" "tuple" "tuple_extract"
                     "tuple_element_addr" "struct" "struct_extract"
-                    "struct_element_addr" "ref_element_addr"
+                    "struct_element_addr" "ref_element_addr" "ref_tail_addr"
                     "autorelease_value" "copy_value" "destroy_value"
                     "unmanaged_retain_value" "unmanaged_release_value"
                     "unmanaged_autorelease_value"
-                    "copy_unowned_value"
-                    "destructure_struct" "destructure_tuple")
+                    "strong_copy_unowned_value" "strong_copy_unmanaged_value"
+                    "destructure_struct" "destructure_tuple" "move_value"
+                    "explicit_copy_value")
                   'words) . font-lock-keyword-face)
    ;; Enums. *NOTE* We do not include enum itself here since enum is a
    ;; swift declaration as well handled at the top.
    `(,(regexp-opt '("init_enum_data_addr" "unchecked_enum_data"
                     "unchecked_take_enum_data_addr" "inject_enum_addr"
-                    "select_enum" "select_value" "select_enum_addr")
+                    "select_enum" "select_enum_addr")
                   'words) . font-lock-keyword-face)
    ;; Protocol and Protocol Composition Types
    `(,(regexp-opt '("init_existential_addr" "deinit_existential_addr"
@@ -149,11 +150,11 @@
                     "unchecked_ref_cast"
                     "unchecked_trivial_bit_cast"
                     "unchecked_bitwise_cast"
+                    "unchecked_value_cast"
                     "ref_to_raw_pointer" "raw_pointer_to_ref"
                     "unowned_to_ref" "ref_to_unowned"
-                    "convert_function"
+                    "convert_function" "convert_escape_to_noescape"
                     "ref_to_unmanaged" "unmanaged_to_ref"
-                    "thin_function_to_pointer" "pointer_to_thin_function"
                     "ref_to_bridge_object"
                     "bridge_object_to_word" "bridge_object_to_ref"
                     "thin_to_thick_function"
@@ -184,6 +185,18 @@
                   'words) . font-lock-keyword-face)
    ;; Debug Info
    `(,(regexp-opt '("loc" "scope" "parent" "inlined_at")
+                  'words) . font-lock-keyword-face)
+   ;; noimplicit copy
+   `(,(regexp-opt '("moveonlywrapper_to_copyable" "moveonlywrapper_to_copyable_addr"
+                    "copyable_to_moveonlywrapper" "copyable_to_moveonlywrapper_addr"
+                    "moveonlywrapper_to_copyable_box")
+                  'words) . font-lock-keyword-face)
+   ;; pack
+   `(,(regexp-opt '("pack_length" "open_pack_element" "pack_element_get" "pack_element_set"
+                    "alloc_pack" "alloc_pack_metadata"
+                    "tuple_pack_element_addr" "tuple_pack_extract"
+                    "dynamic_pack_index" "pack_pack_index" "scalar_pack_index"
+                    "dealloc_pack" "dealloc_pack_metadata")
                   'words) . font-lock-keyword-face)
    ;; SIL Value
    '("\\b[%][A-Za-z_0-9]+\\([#][0-9]+\\)?\\b" . font-lock-variable-name-face)
@@ -257,6 +270,7 @@
 ;; *NOTE* viewcfg must be in the $PATH and .dot files should be associated with
 ;; the graphviz app.
 (defvar sil-mode-viewcfg-program-name "viewcfg")
+(defvar sil-mode-viewcfg-renderer "dot")
 (defvar sil-mode-viewcfg-buffer-name "*viewcfg*")
 
 (defcustom sil-mode-viewcfg-command-default "viewcfg"
@@ -272,15 +286,20 @@
 
 (defun sil-mode-display-function-cfg()
   (interactive)
-  ;; First we need to find the previous '{' and then the next '}'
+  ;; First we need to find the previous '{' and then the next '}'.
   (save-mark-and-excursion
-   (let ((brace-start (search-backward "{"))
-         (brace-end (search-forward "}"))
-         (process-connection-type nil))
-     (let ((p (start-process sil-mode-viewcfg-program-name
-                             sil-mode-viewcfg-buffer-name
-                             sil-mode-viewcfg-command)))
-       (process-send-region p brace-start brace-end)
+    (let ((brace-start (re-search-backward "{\s*$"))
+          (brace-end (re-search-forward "^} // end sil function '" nil t))
+          (process-connection-type nil))
+      ;; See if we failed to find } // end sil function. If we did, search again
+      ;; for ^} itself and see if we find anything.
+      (if (null brace-end)
+          (setq brace-end (re-search-forward "^}")))
+      (let ((p (start-process sil-mode-viewcfg-program-name
+                              sil-mode-viewcfg-buffer-name
+                              sil-mode-viewcfg-command
+                              (concat "--renderer=" sil-mode-viewcfg-renderer))))
+        (process-send-region p brace-start brace-end)
        (process-send-eof p)))))
 
 ;;; Top Level Entry point

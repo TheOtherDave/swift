@@ -19,6 +19,7 @@
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
 #include "swift/Index/Index.h"
+#include "swift/Index/IndexRecord.h"
 #include "swift/Serialization/SerializedModuleLoader.h"
 // This is included only for createLazyResolver(). Move to different header ?
 #include "swift/Sema/IDETypeChecking.h"
@@ -50,14 +51,9 @@ private:
     return Logger::isLoggingEnabledForLevel(Logger::Level::Warning);
   }
 
-  bool recordHash(StringRef hash, bool isKnown) override {
-    return impl.recordHash(hash, isKnown);
-  }
-
-  bool startDependency(StringRef name, StringRef path, bool isClangModule,
-                       bool isSystem, StringRef hash) override {
+  bool startDependency(StringRef name, StringRef path, bool isClangModule, bool isSystem) override {
     auto kindUID = getUIDForDependencyKind(isClangModule);
-    return impl.startDependency(kindUID, name, path, isSystem, hash);
+    return impl.startDependency(kindUID, name, path, isSystem);
   }
 
   bool finishDependency(bool isClangModule) override {
@@ -104,6 +100,21 @@ private:
     return impl.finishSourceEntity(UID);
   }
 
+  std::vector<UIdent> getDeclAttributeUIDs(const Decl *decl) {
+    std::vector<UIdent> uidAttrs =
+      SwiftLangSupport::UIDsFromDeclAttributes(decl->getAttrs());
+
+    // check if we should report an implicit @objc attribute
+    if (!decl->getAttrs().getAttribute(DeclAttrKind::ObjC)) {
+      if (auto *VD = dyn_cast<ValueDecl>(decl)) {
+        if (VD->isObjC()) {
+            uidAttrs.push_back(SwiftLangSupport::getUIDForObjCAttr());
+        }
+      }
+    }
+    return uidAttrs;
+  }
+
   template <typename F>
   bool withEntityInfo(const IndexSymbol &symbol, F func) {
     EntityInfo info;
@@ -118,14 +129,58 @@ private:
     info.Column = symbol.column;
     info.ReceiverUSR = symbol.getReceiverUSR();
     info.IsDynamic = symbol.roles & (unsigned)SymbolRole::Dynamic;
+    info.IsImplicit = symbol.roles & (unsigned)SymbolRole::Implicit;
     info.IsTestCandidate = symbol.symInfo.Properties & SymbolProperty::UnitTest;
     std::vector<UIdent> uidAttrs;
-    if (!isRef) {
-      uidAttrs =
-        SwiftLangSupport::UIDsFromDeclAttributes(symbol.decl->getAttrs());
+    if (!isRef && symbol.decl) {
+      uidAttrs = getDeclAttributeUIDs(symbol.decl);
       info.Attrs = uidAttrs;
+      if (auto *VD = dyn_cast<ValueDecl>(symbol.decl)) {
+        if (shouldOutputEffectiveAccessOfValueSymbol(symbol.symInfo)) {
+          AccessScope accessScope = VD->getFormalAccessScope();
+          UIdent AttrUID = SwiftLangSupport::getUIDForFormalAccessScope(accessScope);
+          info.EffectiveAccess = AttrUID;
+        }
+      }
     }
     return func(info);
+  }
+
+  bool shouldOutputEffectiveAccessOfValueSymbol(SymbolInfo Info) {
+    SymbolKind Kind = Info.Kind;
+    SymbolSubKind SubKind = Info.SubKind;
+    switch (SubKind) {
+      case SymbolSubKind::AccessorGetter:
+      case SymbolSubKind::AccessorSetter:
+      case SymbolSubKind::SwiftAccessorWillSet:
+      case SymbolSubKind::SwiftAccessorDidSet:
+      case SymbolSubKind::SwiftAccessorAddressor:
+      case SymbolSubKind::SwiftAccessorMutableAddressor:
+      case SymbolSubKind::SwiftGenericTypeParam:
+        return false;
+      default:
+        break;
+    }
+    switch (Kind) {
+      case SymbolKind::Enum:
+      case SymbolKind::Struct:
+      case SymbolKind::Class:
+      case SymbolKind::Protocol:
+      case SymbolKind::Constructor:
+      case SymbolKind::EnumConstant:
+      case SymbolKind::Function:
+      case SymbolKind::StaticMethod:
+      case SymbolKind::Variable:
+      case SymbolKind::InstanceMethod:
+      case SymbolKind::ClassMethod:
+      case SymbolKind::InstanceProperty:
+      case SymbolKind::ClassProperty:
+      case SymbolKind::StaticProperty:
+      case SymbolKind::TypeAlias:
+        return true;
+     default:
+        return false;
+    }
   }
 
   template <typename F>
@@ -140,9 +195,8 @@ private:
     info.IsDynamic = relation.roles & (unsigned)SymbolRole::Dynamic;
     info.IsTestCandidate = relation.symInfo.Properties & SymbolProperty::UnitTest;
     std::vector<UIdent> uidAttrs;
-    if (!isRef) {
-      uidAttrs =
-      SwiftLangSupport::UIDsFromDeclAttributes(relation.decl->getAttrs());
+    if (!isRef && relation.decl) {
+      uidAttrs = getDeclAttributeUIDs(relation.decl);
       info.Attrs = uidAttrs;
     }
     return func(info);
@@ -154,55 +208,53 @@ private:
 
 static void indexModule(llvm::MemoryBuffer *Input,
                         StringRef ModuleName,
-                        StringRef Hash,
                         IndexingConsumer &IdxConsumer,
                         CompilerInstance &CI,
                         ArrayRef<const char *> Args) {
-  trace::TracedOperation TracedOp;
-  if (trace::enabled()) {
-    trace::SwiftInvocation SwiftArgs;
-    SwiftArgs.Args.Args.assign(Args.begin(), Args.end());
-    SwiftArgs.Args.PrimaryFile = Input->getBufferIdentifier();
-    SwiftArgs.addFile(Input->getBufferIdentifier(), Input->getBuffer());
-    trace::StringPairs OpArgs;
-    OpArgs.push_back(std::make_pair("ModuleName", ModuleName));
-    OpArgs.push_back(std::make_pair("Hash", Hash));
-    TracedOp.start(trace::OperationKind::IndexModule, SwiftArgs, OpArgs);
-  }
-
   ASTContext &Ctx = CI.getASTContext();
-  std::unique_ptr<SerializedModuleLoader> Loader;
+  std::unique_ptr<ImplicitSerializedModuleLoader> Loader;
   ModuleDecl *Mod = nullptr;
   if (ModuleName == Ctx.StdlibModuleName.str()) {
-    Mod = Ctx.getModule({ {Ctx.StdlibModuleName, SourceLoc()} });
+    Mod = Ctx.getModuleByIdentifier(Ctx.StdlibModuleName);
   } else {
-    Loader = SerializedModuleLoader::create(Ctx);
+    Loader = ImplicitSerializedModuleLoader::create(Ctx);
     auto Buf = std::unique_ptr<llvm::MemoryBuffer>(
         llvm::MemoryBuffer::getMemBuffer(Input->getBuffer(),
                                          Input->getBufferIdentifier()));
 
     // FIXME: These APIs allocate memory on the ASTContext, meaning it may not
     // be freed for a long time.
-    Mod = ModuleDecl::create(Ctx.getIdentifier(ModuleName), Ctx);
-    // Indexing is not using documentation now, so don't open the module
-    // documentation file.
-    // FIXME: refactor the frontend to provide an easy way to figure out the
-    // correct filename here.
-    auto FUnit = Loader->loadAST(*Mod, None, std::move(Buf), nullptr);
+    Mod = ModuleDecl::create(Ctx.getIdentifier(ModuleName), Ctx,
+                             [&](ModuleDecl *Mod, auto addFile) {
+      // Indexing is not using documentation now, so don't open the module
+      // documentation file.
+      // FIXME: refactor the frontend to provide an easy way to figure out
+      // the correct filename here.
+      auto FUnit =
+          Loader->loadAST(*Mod, std::nullopt, /*moduleInterfacePath=*/"",
+                          /*moduleInterfaceSourcePath=*/"", std::move(Buf),
+                          nullptr, nullptr,
+                          /*isFramework=*/false);
 
-    // FIXME: Not knowing what went wrong is pretty bad. loadModule() should be
-    // more modular, rather than emitting diagnostics itself.
-    if (!FUnit) {
+      if (!FUnit) {
+        Mod->setFailedToLoad();
+        return;
+      }
+
+      addFile(FUnit);
+      Mod->setHasResolvedImports();
+    });
+
+    // FIXME: Not knowing what went wrong is pretty bad. loadModule()
+    // should be more modular, rather than emitting diagnostics itself.
+    if (Mod->failedToLoad()) {
       IdxConsumer.failed("failed to load module");
       return;
     }
   }
 
-  // Setup a typechecker for protocol conformance resolving.
-  OwnedResolver TypeResolver = createLazyResolver(Ctx);
-
   SKIndexDataConsumer IdxDataConsumer(IdxConsumer);
-  index::indexModule(Mod, Hash, IdxDataConsumer);
+  index::indexModule(Mod, IdxDataConsumer);
 }
 
 
@@ -210,31 +262,33 @@ static void indexModule(llvm::MemoryBuffer *Input,
 // IndexSource
 //===----------------------------------------------------------------------===//
 
+template <typename Str>
+static void initTraceInfoImpl(trace::SwiftInvocation &SwiftArgs,
+                              StringRef InputFile,
+                              ArrayRef<Str> Args) {
+  llvm::raw_string_ostream OS(SwiftArgs.Args.Arguments);
+  interleave(Args, [&OS](StringRef arg) { OS << arg; }, [&OS] { OS << ' '; });
+  SwiftArgs.Args.PrimaryFile = InputFile.str();
+}
+
 void trace::initTraceInfo(trace::SwiftInvocation &SwiftArgs,
                           StringRef InputFile,
                           ArrayRef<const char *> Args) {
-  SwiftArgs.Args.Args.assign(Args.begin(), Args.end());
-  SwiftArgs.Args.PrimaryFile = InputFile;
+  initTraceInfoImpl(SwiftArgs, InputFile, Args);
 }
 
-void trace::initTraceFiles(trace::SwiftInvocation &SwiftArgs,
-                           swift::CompilerInstance &CI) {
-  auto &SM = CI.getSourceMgr();
-  auto Ids = CI.getInputBufferIDs();
-  std::for_each(Ids.begin(), Ids.end(),
-                [&] (unsigned Id) {
-                  auto Buf = SM.getLLVMSourceMgr().getMemoryBuffer(Id);
-                  SwiftArgs.addFile(Buf->getBufferIdentifier(),
-                                    Buf->getBuffer());
-                });
+void trace::initTraceInfo(trace::SwiftInvocation &SwiftArgs,
+                          StringRef InputFile,
+                          ArrayRef<std::string> Args) {
+  initTraceInfoImpl(SwiftArgs, InputFile, Args);
 }
 
 void SwiftLangSupport::indexSource(StringRef InputFile,
                                    IndexingConsumer &IdxConsumer,
-                                   ArrayRef<const char *> OrigArgs,
-                                   StringRef Hash) {
+                                   ArrayRef<const char *> OrigArgs) {
   std::string Error;
-  auto InputBuf = ASTMgr->getMemoryBuffer(InputFile, Error);
+  auto InputBuf =
+      ASTMgr->getMemoryBuffer(InputFile, llvm::vfs::getRealFileSystem(), Error);
   if (!InputBuf) {
     IdxConsumer.failed(Error);
     return;
@@ -253,21 +307,33 @@ void SwiftLangSupport::indexSource(StringRef InputFile,
   // response, and it can be expensive to do typo-correction when there are many
   // errors, which is common in indexing.
   SmallVector<const char *, 16> Args(OrigArgs.begin(), OrigArgs.end());
+  Args.push_back("-Xfrontend");
   Args.push_back("-disable-typo-correction");
 
   CompilerInvocation Invocation;
-  bool Failed = getASTManager().initCompilerInvocation(Invocation, Args,
-                                                       CI.getDiags(),
-                    /*PrimaryFile=*/IsModuleIndexing ? StringRef() : InputFile,
-                                                       Error);
+  bool Failed = true;
+  if (IsModuleIndexing) {
+    Failed = getASTManager()->initCompilerInvocationNoInputs(
+        Invocation, Args, FrontendOptions::ActionType::Typecheck, CI.getDiags(),
+        Error);
+  } else {
+    Failed = getASTManager()->initCompilerInvocation(
+        Invocation, Args, FrontendOptions::ActionType::Typecheck, CI.getDiags(),
+        InputFile, Error);
+  }
   if (Failed) {
     IdxConsumer.failed(Error);
     return;
   }
 
   if (IsModuleIndexing) {
-    if (CI.setup(Invocation))
+    std::string InstanceSetupError;
+    if (CI.setup(Invocation, InstanceSetupError)) {
+      IdxConsumer.failed(InstanceSetupError);
       return;
+    }
+    // Indexing needs IDE requests
+    registerIDERequestFunctions(CI.getASTContext().evaluator);
     bool IsClangModule = (FileExt == ".pcm");
     if (IsClangModule) {
       IdxConsumer.failed("Clang module files are not supported");
@@ -275,24 +341,27 @@ void SwiftLangSupport::indexSource(StringRef InputFile,
     }
 
     indexModule(InputBuf.get(), llvm::sys::path::stem(Filename),
-                Hash, IdxConsumer, CI, Args);
+                IdxConsumer, CI, Args);
     return;
   }
 
-  if (!Invocation.getFrontendOptions().Inputs.haveInputFilenames()) {
+  if (!Invocation.getFrontendOptions().InputsAndOutputs.hasInputs()) {
     IdxConsumer.failed("no input filenames specified");
     return;
   }
 
-  if (CI.setup(Invocation))
+  std::string InstanceSetupError;
+  if (CI.setup(Invocation, InstanceSetupError)) {
+    IdxConsumer.failed(InstanceSetupError);
     return;
-
-  trace::TracedOperation TracedOp;
-  if (trace::enabled()) {
+  }
+  // Indexing needs IDE requests
+  registerIDERequestFunctions(CI.getASTContext().evaluator);
+  trace::TracedOperation TracedOp(trace::OperationKind::IndexSource);
+  if (TracedOp.enabled()) {
     trace::SwiftInvocation SwiftArgs;
     trace::initTraceInfo(SwiftArgs, InputFile, Args);
-    trace::initTraceFiles(SwiftArgs, CI);
-    TracedOp.start(trace::OperationKind::IndexSource, SwiftArgs);
+    TracedOp.start(SwiftArgs);
   }
 
   CI.performSema();
@@ -303,10 +372,84 @@ void SwiftLangSupport::indexSource(StringRef InputFile,
     IdxConsumer.failed("no primary source file found");
     return;
   }
-
-  // Setup a typechecker for protocol conformance resolving.
-  OwnedResolver TypeResolver = createLazyResolver(CI.getASTContext());
-
+  
   SKIndexDataConsumer IdxDataConsumer(IdxConsumer);
-  index::indexSourceFile(CI.getPrimarySourceFile(), Hash, IdxDataConsumer);
+  index::indexSourceFile(CI.getPrimarySourceFile(), IdxDataConsumer);
+}
+
+static void emitIndexDataForSourceFile(SourceFile &PrimarySourceFile,
+                                       IndexStoreOptions IndexOpts,
+                                       const CompilerInstance &Instance) {
+  const auto &Invocation = Instance.getInvocation();
+//  FIXME: Compiler arguments should be the default for setting options, but this is currently broken (see PR #69076)
+//  const auto &Opts = Invocation.getFrontendOptions();
+
+  bool isDebugCompilation;
+  switch (Invocation.getSILOptions().OptMode) {
+    case OptimizationMode::NotSet:
+    case OptimizationMode::NoOptimization:
+      isDebugCompilation = true;
+      break;
+    case OptimizationMode::ForSpeed:
+    case OptimizationMode::ForSize:
+      isDebugCompilation = false;
+      break;
+  }
+
+  (void) index::indexAndRecord(&PrimarySourceFile,
+                               IndexOpts.IndexUnitOutputPath,
+                               IndexOpts.IndexStorePath,
+                               !IndexOpts.IgnoreClangModules,
+                               IndexOpts.IncludeSystemModules,
+                               IndexOpts.IgnoreStdlib,
+                               IndexOpts.IncludeLocals,
+                               isDebugCompilation,
+                               IndexOpts.DisableImplicitModules,
+                               Invocation.getTargetTriple(),
+                               *Instance.getDependencyTracker(),
+                               Invocation.getIRGenOptions().FilePrefixMap);
+}
+
+void SwiftLangSupport::indexToStore(
+    StringRef PrimaryFilePath, ArrayRef<const char *> Args,
+    IndexStoreOptions Opts,
+    SourceKitCancellationToken CancellationToken,
+    IndexToStoreReceiver Receiver) {
+  std::string Error;
+  SwiftInvocationRef Invok =
+      ASTMgr->getTypecheckInvocation(Args, PrimaryFilePath, Error);
+  if (!Invok) {
+    LOG_WARN_FUNC("failed to create an ASTInvocation: " << Error);
+    Receiver(RequestResult<IndexStoreInfo>::fromError(Error));
+    return;
+  }
+
+  struct IndexStoreASTConsumer : public SwiftASTConsumer {
+    IndexToStoreReceiver Receiver;
+    IndexStoreOptions Opts;
+
+    IndexStoreASTConsumer(IndexToStoreReceiver Receiver, IndexStoreOptions Opts)
+        : Receiver(std::move(Receiver)), Opts(std::move(Opts)) {}
+
+    void handlePrimaryAST(ASTUnitRef AstUnit) override {
+      auto &SF = AstUnit->getPrimarySourceFile();
+      auto &CI = AstUnit->getCompilerInstance();
+      emitIndexDataForSourceFile(SF, Opts, CI);
+      Receiver(RequestResult<IndexStoreInfo>::fromResult(IndexStoreInfo{}));
+    }
+
+    void cancelled() override {
+      Receiver(RequestResult<IndexStoreInfo>::cancelled());
+    }
+
+    void failed(StringRef Error) override {
+      Receiver(RequestResult<IndexStoreInfo>::fromError(Error));
+    }
+  };
+
+  auto ASTConsumer = std::make_shared<IndexStoreASTConsumer>(std::move(Receiver), std::move(Opts));
+  getASTManager()->processASTAsync(Invok, ASTConsumer,
+                                   /*OncePerASTToken=*/nullptr,
+                                   CancellationToken,
+                                   llvm::vfs::getRealFileSystem());
 }

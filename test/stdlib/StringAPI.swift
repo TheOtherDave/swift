@@ -1,5 +1,11 @@
 // RUN: %target-run-simple-swift
 // REQUIRES: executable_test
+// REQUIRES: reflection
+
+// These tests verify fixes in >5.9 Swift, and will
+// fail if run against earlier standard library versions.
+// UNSUPPORTED: use_os_stdlib
+// UNSUPPORTED: back_deployment_runtime
 
 //
 // Tests for the non-Foundation API of String
@@ -92,7 +98,7 @@ let tests = [
   ComparisonTest(.eq, "\u{212b}", "A\u{30a}"),
   ComparisonTest(.eq, "\u{212b}", "\u{c5}"),
   ComparisonTest(.eq, "A\u{30a}", "\u{c5}"),
-  ComparisonTest(.lt, "A\u{30a}", "a"),
+  ComparisonTest(.gt, "A\u{30a}", "a"),
   ComparisonTest(.lt, "A", "A\u{30a}"),
 
   // U+2126 OHM SIGN
@@ -135,6 +141,9 @@ let tests = [
   ComparisonTest(.eq, "\u{0301}", "\u{0341}"),
   ComparisonTest(.lt, "\u{0301}", "\u{0954}"),
   ComparisonTest(.lt, "\u{0341}", "\u{0954}"),
+
+  // (U+212A KELVIN SIGN) normalizes to ASCII "K"
+  ComparisonTest(.eq, "K", "\u{212A}"),
 ]
 
 func checkStringComparison(
@@ -153,6 +162,28 @@ func checkStringComparison(
   expectEqual(expected.isGE(), lhs >= rhs, stackTrace: stackTrace)
   expectEqual(expected.isGT(), lhs > rhs, stackTrace: stackTrace)
   checkComparable(expected, lhs, rhs, stackTrace: stackTrace.withCurrentLoc())
+  
+  // Substring / Substring
+  // Matching slices of != Strings may still be ==, but not vice versa
+  if expected.isEQ() {
+    for i in 0 ..< Swift.min(lhs.count, rhs.count) {
+      let lhsSub = lhs.dropFirst(i)
+      let rhsSub = rhs.dropFirst(i)
+      
+      expectEqual(expected.isEQ(), lhsSub == rhsSub, stackTrace: stackTrace)
+      expectEqual(expected.isNE(), lhsSub != rhsSub, stackTrace: stackTrace)
+      checkHashable(
+        expectedEqual: expected.isEQ(),
+        lhs, rhs, stackTrace: stackTrace.withCurrentLoc())
+      
+      expectEqual(expected.isLT(), lhsSub < rhsSub, stackTrace: stackTrace)
+      expectEqual(expected.isLE(), lhsSub <= rhsSub, stackTrace: stackTrace)
+      expectEqual(expected.isGE(), lhsSub >= rhsSub, stackTrace: stackTrace)
+      expectEqual(expected.isGT(), lhsSub > rhsSub, stackTrace: stackTrace)
+      checkComparable(
+        expected, lhsSub, rhsSub, stackTrace: stackTrace.withCurrentLoc())
+    }
+  }
 
 #if _runtime(_ObjC)
   // NSString / NSString
@@ -176,25 +207,7 @@ func checkStringComparison(
 
 // Mark the test cases that are expected to fail in checkStringComparison
 
-let comparisonTests = tests.map {
-  (test: ComparisonTest) -> ComparisonTest in
-  switch (test.expectedUnicodeCollation, test.lhs, test.rhs) {
-  case (.gt, "t", "Tt"), (.lt, "A\u{30a}", "a"):
-    return test.replacingPredicate(.nativeRuntime(
-      "Comparison reversed between ICU and CFString, https://bugs.swift.org/browse/SR-530"))
-
-  case (.gt, "\u{0}", ""), (.lt, "\u{0}", "\u{0}\u{0}"):
-    return test.replacingPredicate(.nativeRuntime(
-      "Null-related issue: https://bugs.swift.org/browse/SR-630"))
-
-  case (.lt, "\u{0301}", "\u{0954}"), (.lt, "\u{0341}", "\u{0954}"):
-    return test.replacingPredicate(.nativeRuntime(
-      "Compares as equal with ICU"))
-
-  default:
-    return test
-  }
-}
+let comparisonTests = tests
 
 for test in comparisonTests {
   StringTests.test("String.{Equatable,Hashable,Comparable}: line \(test.loc.line)")
@@ -285,33 +298,7 @@ StringTests.test("LosslessStringConvertible") {
   checkLosslessStringConvertible(comparisonTests.map { $0.rhs })
 }
 
-// Mark the test cases that are expected to fail in checkHasPrefixHasSuffix
-
-let substringTests = tests.map {
-  (test: ComparisonTest) -> ComparisonTest in
-  switch (test.expectedUnicodeCollation, test.lhs, test.rhs) {
-  case (.eq, "\u{0}", "\u{0}"):
-    return test.replacingPredicate(.objCRuntime(
-      "https://bugs.swift.org/browse/SR-332"))
-
-  case (.gt, "\r\n", "\n"):
-    return test.replacingPredicate(.objCRuntime(
-      "blocked on rdar://problem/19036555"))
-
-  case (.eq, "\u{0301}", "\u{0341}"):
-    return test.replacingPredicate(.objCRuntime(
-      "https://bugs.swift.org/browse/SR-243"))
-
-  case (.lt, "\u{1F1E7}", "\u{1F1E7}\u{1F1E7}"):
-    return test.replacingPredicate(.objCRuntime(
-      "https://bugs.swift.org/browse/SR-367"))
-
-  default:
-    return test
-  }
-}
-
-for test in substringTests {
+for test in tests {
   StringTests.test("hasPrefix,hasSuffix: line \(test.loc.line)")
     .skip(.nativeRuntime(
         "String.has{Prefix,Suffix} defined when _runtime(_ObjC)"))
@@ -345,6 +332,7 @@ StringTests.test("SameTypeComparisons") {
   expectFalse(xs != xs)
 }
 
+#if !os(WASI)
 StringTests.test("CompareStringsWithUnpairedSurrogates")
   .xfail(
     .always("<rdar://problem/18029104> Strings referring to underlying " +
@@ -360,6 +348,7 @@ StringTests.test("CompareStringsWithUnpairedSurrogates")
     ]
   )
 }
+#endif
 
 StringTests.test("[String].joined() -> String") {
   let s = ["hello", "world"].joined()
@@ -367,8 +356,10 @@ StringTests.test("[String].joined() -> String") {
 }
 
 StringTests.test("UnicodeScalarView.Iterator.Lifetime") {
-  // Tests that String.UnicodeScalarView.Iterator is maintaining the lifetime of
-  // an underlying String buffer. https://bugs.swift.org/browse/SR-5401
+  // https://github.com/apple/swift/issues/47975
+  //
+  // Tests that 'String.UnicodeScalarView.Iterator' is maintaining the lifetime
+  // of an underlying 'String' buffer.
   //
   // WARNING: it is very easy to write this test so it produces false negatives
   // (i.e. passes even when the code is broken).  The array, for example, seems
@@ -415,7 +406,7 @@ StringTests.test("Regression/corelibs-foundation") {
     }
     //If we come here, then the range has created unpaired surrogates on either end.
     //An unpaired surrogate is replaced by OXFFFD - the Unicode Replacement Character.
-    //The CRLF ("\r\n") sequence is also treated like a surrogate pair, but its constinuent
+    //The CRLF ("\r\n") sequence is also treated like a surrogate pair, but its constituent
     //characters "\r" and "\n" can exist outside the pair!
 
     let replacementCharacter = String(describing: UnicodeScalar(0xFFFD)!)
@@ -496,184 +487,50 @@ StringTests.test("Regression/corelibs-foundation") {
   expectEqual(substring(of: s5, with: NSFakeRange(1,6)), "\ncats�")
 }
 
-var CStringTests = TestSuite("CStringTests")
-
-func getNullUTF8() -> UnsafeMutablePointer<UInt8>? {
-  return nil
+StringTests.test("Regression/radar-87371813") {
+  let s1 = "what♕/".dropFirst(5)
+  let s2 = "/"[...]
+  let s3 = "/⚅".dropLast()
+  expectEqual(s1, s2)
+  expectEqual(s1, s3)
+  expectEqual(s1, s3)
+  expectEqual(s1.hashValue, s2.hashValue)
+  expectEqual(s2.hashValue, s3.hashValue)
 }
 
-func getASCIIUTF8() -> (UnsafeMutablePointer<UInt8>, dealloc: () -> ()) {
-  let up = UnsafeMutablePointer<UInt8>.allocate(capacity: 100)
-  up[0] = 0x61
-  up[1] = 0x62
-  up[2] = 0
-  return (up, { up.deallocate() })
+StringTests.test("_isIdentical(to:)") {
+  let a = "Hello"
+  let b = "Hello"
+  expectTrue(a._isIdentical(to: a))
+  expectTrue(b._isIdentical(to: b))
+  expectTrue(a._isIdentical(to: b)) // Both small ASCII strings
+  expectTrue(b._isIdentical(to: a))
+
+  let c = "Cafe\u{301}"
+  let d = "Cafe\u{301}"
+  let e = "Café"
+  expectTrue(c._isIdentical(to: d))
+  expectTrue(d._isIdentical(to: c))
+  expectFalse(c._isIdentical(to: e))
+  expectFalse(d._isIdentical(to: e))
+
+  let f = String(repeating: "foo", count: 1000)
+  let g = String(repeating: "foo", count: 1000)
+  expectEqual(f, g)
+  expectFalse(f._isIdentical(to: g)) // Two large, distinct native strings
+  expectTrue(f._isIdentical(to: f))
+  expectTrue(g._isIdentical(to: g))
 }
 
-func getNonASCIIUTF8() -> (UnsafeMutablePointer<UInt8>, dealloc: () -> ()) {
-  let up = UnsafeMutablePointer<UInt8>.allocate(capacity: 100)
-  up[0] = 0xd0
-  up[1] = 0xb0
-  up[2] = 0xd0
-  up[3] = 0xb1
-  up[4] = 0
-  return (UnsafeMutablePointer(up), { up.deallocate() })
-}
+StringTests.test("hasPrefix/hasSuffix vs Character boundaries") {
+  // https://github.com/apple/swift/issues/67427
+  let s1 = "\r\n"
+  let s2 = "\r\n" + "cafe" + "\r\n"
 
-func getIllFormedUTF8String1(
-) -> (UnsafeMutablePointer<UInt8>, dealloc: () -> ()) {
-  let up = UnsafeMutablePointer<UInt8>.allocate(capacity: 100)
-  up[0] = 0x41
-  up[1] = 0xed
-  up[2] = 0xa0
-  up[3] = 0x80
-  up[4] = 0x41
-  up[5] = 0
-  return (UnsafeMutablePointer(up), { up.deallocate() })
-}
-
-func getIllFormedUTF8String2(
-) -> (UnsafeMutablePointer<UInt8>, dealloc: () -> ()) {
-  let up = UnsafeMutablePointer<UInt8>.allocate(capacity: 100)
-  up[0] = 0x41
-  up[0] = 0x41
-  up[1] = 0xed
-  up[2] = 0xa0
-  up[3] = 0x81
-  up[4] = 0x41
-  up[5] = 0
-  return (UnsafeMutablePointer(up), { up.deallocate() })
-}
-
-func asCCharArray(_ a: [UInt8]) -> [CChar] {
-  return a.map { CChar(bitPattern: $0) }
-}
-
-func getUTF8Length(_ cString: UnsafePointer<UInt8>) -> Int {
-  var length = 0
-  while cString[length] != 0 {
-    length += 1
-  }
-  return length
-}
-
-func bindAsCChar(_ utf8: UnsafePointer<UInt8>) -> UnsafePointer<CChar> {
-  return UnsafeRawPointer(utf8).bindMemory(to: CChar.self,
-    capacity: getUTF8Length(utf8))
-}
-
-func expectEqualCString(_ lhs: UnsafePointer<UInt8>,
-  _ rhs: UnsafePointer<UInt8>) {
-
-  var index = 0
-  while lhs[index] != 0 {
-    expectEqual(lhs[index], rhs[index])
-    index += 1
-  }
-  expectEqual(0, rhs[index])
-}
-
-func expectEqualCString(_ lhs: UnsafePointer<UInt8>,
-  _ rhs: ContiguousArray<UInt8>) {
-  rhs.withUnsafeBufferPointer {
-    expectEqualCString(lhs, $0.baseAddress!)
-  }
-}
-
-func expectEqualCString(_ lhs: UnsafePointer<UInt8>,
-  _ rhs: ContiguousArray<CChar>) {
-  rhs.withUnsafeBufferPointer {
-    $0.baseAddress!.withMemoryRebound(
-      to: UInt8.self, capacity: rhs.count) {
-      expectEqualCString(lhs, $0)
-    }
-  }
-}
-
-CStringTests.test("String.init(validatingUTF8:)") {
-  do {
-    let (s, dealloc) = getASCIIUTF8()
-    expectOptionalEqual("ab", String(validatingUTF8: bindAsCChar(s)))
-    dealloc()
-  }
-  do {
-    let (s, dealloc) = getNonASCIIUTF8()
-    expectOptionalEqual("аб", String(validatingUTF8: bindAsCChar(s)))
-    dealloc()
-  }
-  do {
-    let (s, dealloc) = getIllFormedUTF8String1()
-    expectNil(String(validatingUTF8: bindAsCChar(s)))
-    dealloc()
-  }
-}
-
-CStringTests.test("String(cString:)") {
-  do {
-    let (s, dealloc) = getASCIIUTF8()
-    let result = String(cString: s)
-    expectEqual("ab", result)
-    let su = bindAsCChar(s)
-    expectEqual("ab", String(cString: su))
-    dealloc()
-  }
-  do {
-    let (s, dealloc) = getNonASCIIUTF8()
-    let result = String(cString: s)
-    expectEqual("аб", result)
-    let su = bindAsCChar(s)
-    expectEqual("аб", String(cString: su))
-    dealloc()
-  }
-  do {
-    let (s, dealloc) = getIllFormedUTF8String1()
-    let result = String(cString: s)
-    expectEqual("\u{41}\u{fffd}\u{fffd}\u{fffd}\u{41}", result)
-    let su = bindAsCChar(s)
-    expectEqual("\u{41}\u{fffd}\u{fffd}\u{fffd}\u{41}", String(cString: su))
-    dealloc()
-  }
-}
-
-CStringTests.test("String.decodeCString") {
-  do {
-    let s = getNullUTF8()
-    let result = String.decodeCString(s, as: UTF8.self)
-    expectNil(result)
-  }
-  do { // repairing
-    let (s, dealloc) = getIllFormedUTF8String1()
-    if let (result, repairsMade) = String.decodeCString(
-      s, as: UTF8.self, repairingInvalidCodeUnits: true) {
-      expectOptionalEqual("\u{41}\u{fffd}\u{fffd}\u{fffd}\u{41}", result)
-      expectTrue(repairsMade)
-    } else {
-      expectUnreachable("Expected .some()")
-    }
-    dealloc()
-  }
-  do { // non repairing
-    let (s, dealloc) = getIllFormedUTF8String1()
-    let result = String.decodeCString(
-      s, as: UTF8.self, repairingInvalidCodeUnits: false)
-    expectNil(result)
-    dealloc()
-  }
-}
-
-CStringTests.test("String.utf8CString") {
-  do {
-    let (cstr, dealloc) = getASCIIUTF8()
-    let str = String(cString: cstr)
-    expectEqualCString(cstr, str.utf8CString)
-    dealloc()
-  }
-  do {
-    let (cstr, dealloc) = getNonASCIIUTF8()
-    let str = String(cString: cstr)
-    expectEqualCString(cstr, str.utf8CString)
-    dealloc()
-  }
+  expectFalse(s1.hasPrefix("\r"))
+  expectFalse(s1.hasSuffix("\n"))
+  expectFalse(s2.hasPrefix("\r"))
+  expectFalse(s2.hasSuffix("\n"))
 }
 
 runAllTests()

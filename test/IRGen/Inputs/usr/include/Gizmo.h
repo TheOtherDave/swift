@@ -45,6 +45,7 @@ typedef long NSInteger;
 - (void) setFrame: (struct NSRect) rect;
 - (void) frob;
 - (void) test: (struct Fob) fob;
+- (void) perform: (void (^)(NS_CONSUMED Gizmo*)) block;
 + (void) runce;
 @end
 
@@ -69,6 +70,8 @@ static inline int zeroRedeclared(void) { return innerZero(); }
 
 static int staticButNotInline(void) { return innerZero(); }
 
+static inline void ackbar(void) { __builtin_trap(); }
+
 @interface NSView : NSObject
 - (struct NSRect) convertRectFromBase: (struct NSRect) r;
 @end
@@ -91,6 +94,12 @@ NSString *NSStringFromRect(struct NSRect r);
 - (void)runce;
 - (void)funge;
 - (void)foo;
+@end
+
+@protocol NSFungingAndRuncing <NSRuncing, NSFunging>
+@end
+
+@protocol NSDoubleInheritedFunging <NSFungingAndRuncing, NSFunging>
 @end
 
 typedef NS_ENUM(unsigned short, NSRuncingOptions) {
@@ -123,11 +132,19 @@ typedef NS_ENUM(unsigned, NeverActuallyMentionedByName) {
 - (NeverActuallyMentionedByName)getValue;
 @end
 
+#if defined(_WIN32)
+enum RawEnumInGizmo : unsigned {
+  InGizmoOne=0x7FFFFFFF,
+  InGizmoTwo,
+  InGizmoThree
+};
+#else
 enum RawEnumInGizmo {
   InGizmoOne=0x7FFFFFFF,
   InGizmoTwo,
   InGizmoThree
 };
+#endif
 
 struct StructOfNSStrings {
   __unsafe_unretained NSString *a;
@@ -143,4 +160,50 @@ struct StructOfNSStrings useStructOfNSStringsInObjC(struct StructOfNSStrings);
 
 __attribute__((swift_name("OuterType.InnerType")))
 @interface OuterTypeInnerType : NSObject<NSRuncing>
+@end
+
+@protocol P
+- (oneway void)stuff;
+@end
+
+@interface ObjcGenericClass<__covariant SectionType>
+@end
+
+@interface FungingArray <Element: id<NSFunging>> : NSObject
+@end
+
+__attribute__((objc_non_runtime_protocol))
+@protocol NonRuntimeP
+@end
+
+@protocol RuntimeP<NonRuntimeP>
+@end
+
+@protocol P1
+@end
+@protocol P2
+@end
+@protocol P3
+@end
+
+__attribute__((objc_non_runtime_protocol))
+@protocol AnotherNonRuntimeP<P1, P2, P3>
+@end
+
+__attribute__((objc_non_runtime_protocol))
+@protocol AnotherNonRuntime2P<P1, P2>
+@end
+
+__attribute__((objc_non_runtime_protocol))
+@protocol OtherNonRuntimeP <AnotherNonRuntimeP, AnotherNonRuntime2P>
+@end
+
+@protocol Runtime2P<NonRuntimeP, OtherNonRuntimeP, P3>
+@end
+
+
+@protocol DeclarationOnly;
+
+@protocol DeclarationOnlyUser<DeclarationOnly>
+- (void) printIt;
 @end

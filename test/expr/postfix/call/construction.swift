@@ -21,12 +21,39 @@ enum E {
 }
 
 class C {
-  init(i: Int) { } // expected-note{{selected non-required initializer 'init(i:)'}}
+  init(i: Int) { } // expected-note 4{{selected non-required initializer 'init(i:)'}}
 
   required init(d: Double) { }
 
   class Inner {
     init(i: Int) { }
+  }
+
+  static func makeCBad() -> C {
+    return self.init(i: 0)
+    // expected-error@-1 {{constructing an object of class type 'C' with a metatype value must use a 'required' initializer}}
+  }
+
+  static func makeCGood() -> C {
+    return self.init(d: 0)
+  }
+
+  static func makeSelfBad() -> Self {
+    return self.init(i: 0)
+    // expected-error@-1 {{constructing an object of class type 'Self' with a metatype value must use a 'required' initializer}}
+  }
+
+  static func makeSelfGood() -> Self {
+    return self.init(d: 0)
+  }
+
+  static func makeSelfImplicitBaseBad() -> Self {
+    return .init(i: 0)
+    // expected-error@-1 {{constructing an object of class type 'Self' with a metatype value must use a 'required' initializer}}
+  }
+
+  static func makeSelfImplicitBaseGood() -> Self {
+    return .init(d: 0)
   }
 }
 
@@ -86,11 +113,11 @@ protocol P2 {
 
 func constructExistentialValue(_ pm: P.Type) {
   _ = pm.init()
-  _ = P() // expected-error{{protocol type 'P' cannot be instantiated}}
+  _ = P() // expected-error{{type 'any P' cannot be instantiated}}
 }
 
 typealias P1_and_P2 = P & P2
 func constructExistentialCompositionValue(_ pm: (P & P2).Type) {
   _ = pm.init(int: 5)
-  _ = P1_and_P2(int: 5) // expected-error{{protocol type 'P1_and_P2' (aka 'P & P2') cannot be instantiated}}
+  _ = P1_and_P2(int: 5) // expected-error{{type 'any P1_and_P2' (aka 'any P & P2') cannot be instantiated}}
 }

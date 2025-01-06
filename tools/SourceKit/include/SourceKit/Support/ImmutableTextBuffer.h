@@ -66,7 +66,7 @@ private:
   ThreadSafeRefCntPtr<ImmutableTextUpdate> Next;
 
   friend class EditableTextBuffer;
-  virtual void anchor();
+  virtual void anchor() override;
 };
 
 class ImmutableTextBuffer : public ImmutableTextUpdate {
@@ -138,6 +138,8 @@ public:
 
   ImmutableTextBufferRef getBuffer() const;
 
+  size_t getSize() const;
+
   bool isFromSameBuffer(ImmutableTextSnapshotRef Other) const {
     return Other->EditableBuf.get() == EditableBuf.get();
   }
@@ -169,6 +171,10 @@ public:
     return getSnapshot()->getBuffer();
   }
 
+  size_t getSize() const {
+    return getSnapshot()->getSize();
+  }
+
   ImmutableTextSnapshotRef insert(unsigned ByteOffset, StringRef Text);
   ImmutableTextSnapshotRef erase(unsigned ByteOffset, unsigned Length);
   ImmutableTextSnapshotRef replace(unsigned ByteOffset, unsigned Length,
@@ -178,6 +184,7 @@ private:
   ImmutableTextSnapshotRef addAtomicUpdate(ImmutableTextUpdateRef NewUpd);
   ImmutableTextBufferRef getBufferForSnapshot(
       const ImmutableTextSnapshot &Snap);
+  size_t getSizeForSnapshot(const ImmutableTextSnapshot &Snap) const;
   void refresh();
   friend class ImmutableTextSnapshot;
 };

@@ -36,15 +36,15 @@ func typoAssoc4<T : P2>(_: T) where T.Assocp2.assoc : P3 {}
 
 // <rdar://problem/19620340>
 
-func typoFunc1<T : P1>(x: TypoType) { // expected-error{{use of undeclared type 'TypoType'}}
+func typoFunc1<T : P1>(x: TypoType) { // expected-error{{cannot find type 'TypoType' in scope}}
   let _: (T.Assoc) -> () = { let _ = $0 }
 }
 
-func typoFunc2<T : P1>(x: TypoType, y: T) { // expected-error{{use of undeclared type 'TypoType'}}
+func typoFunc2<T : P1>(x: TypoType, y: T) { // expected-error{{cannot find type 'TypoType' in scope}}
   let _: (T.Assoc) -> () = { let _ = $0 }
 }
 
-func typoFunc3<T : P1>(x: TypoType, y: (T.Assoc) -> ()) { // expected-error{{use of undeclared type 'TypoType'}}
+func typoFunc3<T : P1>(x: TypoType, y: (T.Assoc) -> ()) { // expected-error{{cannot find type 'TypoType' in scope}}
 }
 
 // rdar://problem/29261689
@@ -62,6 +62,8 @@ protocol Pattern {
 
   // FIXME: This works for all of the wrong reasons, but it is correct that
   // it works.
+  // CHECK-GENERIC-LABEL: .matched(atStartOf:)@
+  // CHECK-GENERIC-NEXT: Generic signature: <Self, C where Self : Pattern, C : Sequence, C : Indexable, Self.[Pattern]Element == C.[Sequence]Element, C.[Sequence]Element == C.[_Indexable1]Slice.[Sequence]Element, C.[_Indexable1]Slice : Sequence>
   func matched<C: Indexable>(atStartOf c: C)
   where Element_<C> == Element
   , Element_<C.Slice> == Element
@@ -79,4 +81,4 @@ class D {
   typealias BElement = Int // expected-note{{did you mean 'BElement'?}}
 }
 
-func typoSuperclass2<T : D>(_: T, _: T.Element) { } // expected-error{{'Element' is not a member type of 'T'}}
+func typoSuperclass2<T : D>(_: T, _: T.Element) { } // expected-error{{'Element' is not a member type of type 'T'}}

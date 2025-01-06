@@ -17,7 +17,10 @@
 
 // REQUIRES: objc_interop
 
-// CHECK-LABEL: #if __has_feature(modules)
+// CHECK-LABEL: #if __has_feature(objc_modules)
+// CHECK-NEXT: #if __has_warning
+// CHECK-NEXT: #pragma clang diagnostic
+// CHECK-NEXT: #endif
 // CHECK-NEXT: @import Foundation;
 // CHECK-NEXT: #endif
 
@@ -32,7 +35,7 @@
 import Foundation
 
 public class Dummy: NSNumber {
-  public func getProto() -> CustomProto? {
+  @objc public func getProto() -> CustomProto? {
     return nil
   }
 }

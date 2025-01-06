@@ -1,4 +1,4 @@
-import Foundation
+@_exported import Foundation
 
 protocol __PrivProto {
 }
@@ -41,36 +41,36 @@ class __PrivFooSub : Foo {
 }
 func __privTest()
 struct S0 {
-  var __privValue: Int32
   init()
   init(__privValue: Int32)
+  var __privValue: Int32
 }
 struct __PrivS1 {
-  var value: Int32
   init()
   init(value: Int32)
+  var value: Int32
 }
 struct __PrivS2 {
-  var value: Int32
   init()
   init(value: Int32)
+  var value: Int32
 }
 var __PrivAnonymousA: Int { get }
-struct E0 : Equatable, RawRepresentable {
+struct E0 : Hashable, Equatable, RawRepresentable {
   init(_ rawValue: UInt32)
   init(rawValue: UInt32)
   var rawValue: UInt32
   typealias RawValue = UInt32
 }
 var __E0PrivA: E0 { get }
-struct __PrivE1 : Equatable, RawRepresentable {
+struct __PrivE1 : Hashable, Equatable, RawRepresentable {
   init(_ rawValue: UInt32)
   init(rawValue: UInt32)
   var rawValue: UInt32
   typealias RawValue = UInt32
 }
 var __PrivE1A: __PrivE1 { get }
-struct __PrivE2 : Equatable, RawRepresentable {
+struct __PrivE2 : Hashable, Equatable, RawRepresentable {
   init(_ rawValue: UInt32)
   init(rawValue: UInt32)
   var rawValue: UInt32

@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2021 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -21,8 +21,9 @@ import TestsUtils
 let sequenceCount = 4096
 let suffixCount = 1024
 let sumCount = suffixCount * (2 * sequenceCount - suffixCount - 1) / 2
+let array: [Int] = Array(0..<sequenceCount)
 
-public let Suffix = [
+public let benchmarks = [
   BenchmarkInfo(
     name: "SuffixCountableRange",
     runFunction: run_SuffixCountableRange,
@@ -50,7 +51,8 @@ public let Suffix = [
   BenchmarkInfo(
     name: "SuffixArray",
     runFunction: run_SuffixArray,
-    tags: [.validation, .api, .Array]),
+    tags: [.validation, .api, .Array],
+    setUpFunction: { blackHole(array) }),
   BenchmarkInfo(
     name: "SuffixCountableRangeLazy",
     runFunction: run_SuffixCountableRangeLazy,
@@ -78,160 +80,165 @@ public let Suffix = [
   BenchmarkInfo(
     name: "SuffixArrayLazy",
     runFunction: run_SuffixArrayLazy,
-    tags: [.validation, .api]),
+    tags: [.validation, .api, .Array],
+    setUpFunction: { blackHole(array) }),
 ]
 
 @inline(never)
-public func run_SuffixCountableRange(_ N: Int) {
+public func run_SuffixCountableRange(_ n: Int) {
   let s = 0..<sequenceCount
-  for _ in 1...20*N {
+  for _ in 1...20*n {
     var result = 0
     for element in s.suffix(suffixCount) {
       result += element
     }
-    CheckResults(result == sumCount)
+    check(result == sumCount)
   }
 }
 @inline(never)
-public func run_SuffixSequence(_ N: Int) {
+public func run_SuffixSequence(_ n: Int) {
   let s = sequence(first: 0) { $0 < sequenceCount - 1 ? $0 &+ 1 : nil }
-  for _ in 1...20*N {
+  for _ in 1...20*n {
     var result = 0
     for element in s.suffix(suffixCount) {
       result += element
     }
-    CheckResults(result == sumCount)
+    check(result == sumCount)
   }
 }
 @inline(never)
-public func run_SuffixAnySequence(_ N: Int) {
+public func run_SuffixAnySequence(_ n: Int) {
   let s = AnySequence(sequence(first: 0) { $0 < sequenceCount - 1 ? $0 &+ 1 : nil })
-  for _ in 1...20*N {
+  for _ in 1...20*n {
     var result = 0
     for element in s.suffix(suffixCount) {
       result += element
     }
-    CheckResults(result == sumCount)
+    check(result == sumCount)
   }
 }
 @inline(never)
-public func run_SuffixAnySeqCntRange(_ N: Int) {
+public func run_SuffixAnySeqCntRange(_ n: Int) {
   let s = AnySequence(0..<sequenceCount)
-  for _ in 1...20*N {
+  for _ in 1...20*n {
     var result = 0
     for element in s.suffix(suffixCount) {
       result += element
     }
-    CheckResults(result == sumCount)
+    check(result == sumCount)
   }
 }
 @inline(never)
-public func run_SuffixAnySeqCRangeIter(_ N: Int) {
+public func run_SuffixAnySeqCRangeIter(_ n: Int) {
   let s = AnySequence((0..<sequenceCount).makeIterator())
-  for _ in 1...20*N {
+  for _ in 1...20*n {
     var result = 0
     for element in s.suffix(suffixCount) {
       result += element
     }
-    CheckResults(result == sumCount)
+    check(result == sumCount)
   }
 }
 @inline(never)
-public func run_SuffixAnyCollection(_ N: Int) {
+public func run_SuffixAnyCollection(_ n: Int) {
   let s = AnyCollection(0..<sequenceCount)
-  for _ in 1...20*N {
+  for _ in 1...20*n {
     var result = 0
     for element in s.suffix(suffixCount) {
       result += element
     }
-    CheckResults(result == sumCount)
+    check(result == sumCount)
   }
 }
 @inline(never)
-public func run_SuffixArray(_ N: Int) {
-  let s = Array(0..<sequenceCount)
-  for _ in 1...20*N {
+public func run_SuffixArray(_ n: Int) {
+  let s = array
+  for _ in 1...20*n {
     var result = 0
     for element in s.suffix(suffixCount) {
       result += element
     }
-    CheckResults(result == sumCount)
+    check(result == sumCount)
   }
 }
 @inline(never)
-public func run_SuffixCountableRangeLazy(_ N: Int) {
+public func run_SuffixCountableRangeLazy(_ n: Int) {
   let s = (0..<sequenceCount).lazy
-  for _ in 1...20*N {
+  for _ in 1...20*n {
     var result = 0
     for element in s.suffix(suffixCount) {
       result += element
     }
-    CheckResults(result == sumCount)
+    check(result == sumCount)
   }
 }
 @inline(never)
-public func run_SuffixSequenceLazy(_ N: Int) {
+public func run_SuffixSequenceLazy(_ n: Int) {
   let s = (sequence(first: 0) { $0 < sequenceCount - 1 ? $0 &+ 1 : nil }).lazy
-  for _ in 1...20*N {
+  for _ in 1...20*n {
     var result = 0
     for element in s.suffix(suffixCount) {
       result += element
     }
-    CheckResults(result == sumCount)
+    check(result == sumCount)
   }
 }
 @inline(never)
-public func run_SuffixAnySequenceLazy(_ N: Int) {
+public func run_SuffixAnySequenceLazy(_ n: Int) {
   let s = (AnySequence(sequence(first: 0) { $0 < sequenceCount - 1 ? $0 &+ 1 : nil })).lazy
-  for _ in 1...20*N {
+  for _ in 1...20*n {
     var result = 0
     for element in s.suffix(suffixCount) {
       result += element
     }
-    CheckResults(result == sumCount)
+    check(result == sumCount)
   }
 }
 @inline(never)
-public func run_SuffixAnySeqCntRangeLazy(_ N: Int) {
+public func run_SuffixAnySeqCntRangeLazy(_ n: Int) {
   let s = (AnySequence(0..<sequenceCount)).lazy
-  for _ in 1...20*N {
+  for _ in 1...20*n {
     var result = 0
     for element in s.suffix(suffixCount) {
       result += element
     }
-    CheckResults(result == sumCount)
+    check(result == sumCount)
   }
 }
 @inline(never)
-public func run_SuffixAnySeqCRangeIterLazy(_ N: Int) {
+public func run_SuffixAnySeqCRangeIterLazy(_ n: Int) {
   let s = (AnySequence((0..<sequenceCount).makeIterator())).lazy
-  for _ in 1...20*N {
+  for _ in 1...20*n {
     var result = 0
     for element in s.suffix(suffixCount) {
       result += element
     }
-    CheckResults(result == sumCount)
+    check(result == sumCount)
   }
 }
 @inline(never)
-public func run_SuffixAnyCollectionLazy(_ N: Int) {
+public func run_SuffixAnyCollectionLazy(_ n: Int) {
   let s = (AnyCollection(0..<sequenceCount)).lazy
-  for _ in 1...20*N {
+  for _ in 1...20*n {
     var result = 0
     for element in s.suffix(suffixCount) {
       result += element
     }
-    CheckResults(result == sumCount)
+    check(result == sumCount)
   }
 }
 @inline(never)
-public func run_SuffixArrayLazy(_ N: Int) {
-  let s = (Array(0..<sequenceCount)).lazy
-  for _ in 1...20*N {
+public func run_SuffixArrayLazy(_ n: Int) {
+  let s = (array).lazy
+  for _ in 1...20*n {
     var result = 0
     for element in s.suffix(suffixCount) {
       result += element
     }
-    CheckResults(result == sumCount)
+    check(result == sumCount)
   }
 }
+
+// Local Variables:
+// eval: (read-only-mode 1)
+// End:

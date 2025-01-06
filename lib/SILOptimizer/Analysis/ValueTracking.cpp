@@ -12,25 +12,25 @@
 
 #define DEBUG_TYPE "sil-value-tracking"
 #include "swift/SILOptimizer/Analysis/ValueTracking.h"
-#include "swift/SILOptimizer/Analysis/SimplifyInstruction.h"
+#include "swift/SIL/InstructionUtils.h"
+#include "swift/SIL/NodeBits.h"
+#include "swift/SIL/PatternMatch.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILValue.h"
-#include "swift/SIL/InstructionUtils.h"
-#include "swift/SILOptimizer/Utils/Local.h"
-#include "swift/SIL/PatternMatch.h"
+#include "swift/SILOptimizer/Analysis/SimplifyInstruction.h"
+#include "swift/SILOptimizer/Utils/InstOptUtils.h"
 #include "llvm/Support/Debug.h"
 using namespace swift;
 using namespace swift::PatternMatch;
 
-bool swift::isNotAliasingArgument(SILValue V,
-                                  InoutAliasingAssumption isInoutAliasing) {
+bool swift::isExclusiveArgument(SILValue V) {
   auto *Arg = dyn_cast<SILFunctionArgument>(V);
   if (!Arg)
     return false;
 
   SILArgumentConvention Conv = Arg->getArgumentConvention();
-  return Conv.isNotAliasedIndirectParameter(isInoutAliasing);
+  return Conv.isExclusiveIndirectParameter();
 }
 
 /// Check if the parameter \V is based on a local object, e.g. it is an
@@ -38,27 +38,26 @@ bool swift::isNotAliasingArgument(SILValue V,
 /// Returns a found local object. If a local object was not found, returns an
 /// empty SILValue.
 static bool isLocalObject(SILValue Obj) {
+  // Check for SILUndef.
+  if (!Obj->getFunction())
+    return false;
+
   // Set of values to be checked for their locality.
   SmallVector<SILValue, 8> WorkList;
   // Set of processed values.
-  llvm::SmallPtrSet<SILValue, 8> Processed;
+  ValueSet Processed(Obj->getFunction());
   WorkList.push_back(Obj);
 
   while (!WorkList.empty()) {
     auto V = WorkList.pop_back_val();
-    if (!V)
+    if (!V || isa<SILUndef>(V))
       return false;
-    if (Processed.count(V))
+    if (!Processed.insert(V))
       continue;
-    Processed.insert(V);
     // It should be a local object.
     V = getUnderlyingObject(V);
     if (isa<AllocationInst>(V))
       continue;
-    if (auto I = dyn_cast<StrongPinInst>(V)) {
-      WorkList.push_back(I->getOperand());
-      continue;
-    }
     if (isa<StructInst>(V) || isa<TupleInst>(V) || isa<EnumInst>(V)) {
       // A compound value is local, if all of its components are local.
       for (auto &Op : cast<SingleValueInstruction>(V)->getAllOperands()) {
@@ -67,11 +66,11 @@ static bool isLocalObject(SILValue Obj) {
       continue;
     }
 
-    if (auto *Arg = dyn_cast<SILPHIArgument>(V)) {
+    if (auto *Arg = dyn_cast<SILPhiArgument>(V)) {
       // A BB argument is local if all of its
       // incoming values are local.
       SmallVector<SILValue, 4> IncomingValues;
-      if (Arg->getIncomingValues(IncomingValues)) {
+      if (Arg->getSingleTerminatorOperands(IncomingValues)) {
         for (auto InValue : IncomingValues) {
           WorkList.push_back(InValue);
         }
@@ -85,10 +84,8 @@ static bool isLocalObject(SILValue Obj) {
   return true;
 }
 
-bool swift::pointsToLocalObject(SILValue V,
-                                InoutAliasingAssumption isInoutAliasing) {
-  V = getUnderlyingObject(V);
-  return isLocalObject(V) || isNotAliasingArgument(V, isInoutAliasing);
+bool swift::pointsToLocalObject(SILValue V) {
+  return isLocalObject(getUnderlyingObject(V));
 }
 
 /// Check if the value \p Value is known to be zero, non-zero or unknown.
@@ -143,7 +140,7 @@ IsZeroKind swift::isZeroValue(SILValue Value) {
   if (auto *T = dyn_cast<TupleExtractInst>(Value)) {
     // Make sure we are extracting the number value and not
     // the overflow flag.
-    if (T->getFieldNo() != 0)
+    if (T->getFieldIndex() != 0)
       return IsZeroKind::Unknown;
 
     auto *BI = dyn_cast<BuiltinInst>(T->getOperand());
@@ -164,7 +161,7 @@ IsZeroKind swift::isZeroValue(SILValue Value) {
 
 /// Check if the sign bit of the value \p V is known to be:
 /// set (true), not set (false) or unknown (None).
-Optional<bool> swift::computeSignBit(SILValue V) {
+std::optional<bool> swift::computeSignBit(SILValue V) {
   SILValue Value = V;
   while (true) {
     ValueBase *Def = Value;
@@ -204,7 +201,7 @@ Optional<bool> swift::computeSignBit(SILValue V) {
         // We don't know either's sign bit so we can't
         // say anything about the result.
         if (!Left && !Right) {
-          return None;
+          return std::nullopt;
         }
 
         // Now we know that we were able to determine the sign bit
@@ -218,14 +215,14 @@ Optional<bool> swift::computeSignBit(SILValue V) {
         // the Left. If Right is still not None, then get both values
         // and AND them together.
         if (Right) {
-          return Left.getValue() && Right.getValue();
+          return Left.value() && Right.value();
         }
 
         // Now we know that Right is None and Left has a value. If
         // Left's value is true, then we return None as the final
         // sign bit depends on the unknown Right value.
-        if (Left.getValue()) {
-          return None;
+        if (Left.value()) {
+          return std::nullopt;
         }
 
         // Otherwise, Left must be false and false AND'd with anything
@@ -241,7 +238,7 @@ Optional<bool> swift::computeSignBit(SILValue V) {
         // We don't know either's sign bit so we can't
         // say anything about the result.
         if (!Left && !Right) {
-          return None;
+          return std::nullopt;
         }
 
         // Now we know that we were able to determine the sign bit
@@ -255,14 +252,14 @@ Optional<bool> swift::computeSignBit(SILValue V) {
         // the Left. If Right is still not None, then get both values
         // and OR them together.
         if (Right) {
-          return Left.getValue() || Right.getValue();
+          return Left.value() || Right.value();
         }
 
         // Now we know that Right is None and Left has a value. If
         // Left's value is false, then we return None as the final
         // sign bit depends on the unknown Right value.
-        if (!Left.getValue()) {
-          return None;
+        if (!Left.value()) {
+          return std::nullopt;
         }
 
         // Otherwise, Left must be true and true OR'd with anything
@@ -279,13 +276,13 @@ Optional<bool> swift::computeSignBit(SILValue V) {
         // anything about the sign of the final result since
         // XOR does not short-circuit.
         if (!Left || !Right) {
-          return None;
+          return std::nullopt;
         }
 
         // Now we know that both Left and Right must have a value.
         // For the sign of the final result to be set, only one
         // of Left or Right should be true.
-        return Left.getValue() != Right.getValue();
+        return Left.value() != Right.value();
       }
       case BuiltinValueKind::LShr: {
         // If count is provably >= 1, then top bit is not set.
@@ -299,25 +296,6 @@ Optional<bool> swift::computeSignBit(SILValue V) {
         Value = BI->getArguments()[0];
         continue;
       }
-
-      // Source and target type sizes are the same.
-      // S->U conversion can only succeed if
-      // the sign bit of its operand is 0, i.e. it is >= 0.
-      // The sign bit of a result is 0 only if the sign
-      // bit of a source operand is 0.
-      case BuiltinValueKind::SUCheckedConversion:
-        Value = BI->getArguments()[0];
-        continue;
-
-      // Source and target type sizes are the same.
-      // U->S conversion can only succeed if
-      // the top bit of its operand is 0, i.e.
-      // it is representable as a signed integer >=0.
-      // The sign bit of a result is 0 only if the sign
-      // bit of a source operand is 0.
-      case BuiltinValueKind::USCheckedConversion:
-        Value = BI->getArguments()[0];
-        continue;
 
       // Sign bit of the operand is promoted.
       case BuiltinValueKind::SExt:
@@ -346,11 +324,11 @@ Optional<bool> swift::computeSignBit(SILValue V) {
         Value = BI->getArguments()[0];
         continue;
       default:
-        return None;
+        return std::nullopt;
       }
     }
 
-    return None;
+    return std::nullopt;
   }
 }
 

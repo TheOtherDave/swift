@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/Pattern.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILDeclRef.h"
 #include "swift/SIL/SILGlobalVariable.h"
 #include "swift/IRGen/Linking.h"
@@ -24,13 +25,12 @@
 #include "llvm/IR/Module.h"
 
 #include "DebugTypeInfo.h"
-#include "Explosion.h"
-#include "GenHeap.h"
 #include "GenTuple.h"
 #include "IRGenDebugInfo.h"
 #include "IRGenFunction.h"
 #include "IRGenModule.h"
 #include "FixedTypeInfo.h"
+#include "Temporary.h"
 
 using namespace swift;
 using namespace irgen;
@@ -38,15 +38,18 @@ using namespace irgen;
 /// Emit a global variable.
 void IRGenModule::emitSILGlobalVariable(SILGlobalVariable *var) {
   auto &ti = getTypeInfo(var->getLoweredType());
-  
-  // If the variable is empty in all resilience domains, don't actually emit it;
-  // just return undef.
-  if (ti.isKnownEmpty(ResilienceExpansion::Minimal)) {
+  auto expansion = getResilienceExpansionForLayout(var);
+
+  // If the variable is empty in all resilience domains that can access this
+  // variable directly, don't actually emit it; just return undef.
+  if (ti.isKnownEmpty(expansion)) {
     if (DebugInfo && var->getDecl()) {
-      auto DbgTy = DebugTypeInfo::getGlobal(var, Int8Ty, Size(0), Alignment(1));
-      DebugInfo->emitGlobalVariableDeclaration(
-          nullptr, var->getDecl()->getName().str(), "", DbgTy,
-          var->getLinkage() != SILLinkage::Public, SILLocation(var->getDecl()));
+      auto DbgTy = DebugTypeInfo::getGlobal(var, Int8Ty, *this);
+      DebugInfo->emitGlobalVariableDeclaration(nullptr, var->getDecl()->getName().str(),
+                                               "", DbgTy,
+                                               var->getLinkage() != SILLinkage::Public &&
+                                               var->getLinkage() != SILLinkage::Package,
+                                               SILLocation(var->getDecl()));
     }
     return;
   }
@@ -57,7 +60,6 @@ void IRGenModule::emitSILGlobalVariable(SILGlobalVariable *var) {
 }
 
 StackAddress FixedTypeInfo::allocateStack(IRGenFunction &IGF, SILType T,
-                                          bool isEntryBlock,
                                           const Twine &name) const {
   // If the type is known to be empty, don't actually allocate anything.
   if (isKnownEmpty(ResilienceExpansion::Maximal)) {
@@ -72,6 +74,23 @@ StackAddress FixedTypeInfo::allocateStack(IRGenFunction &IGF, SILType T,
   return { alloca };
 }
 
+StackAddress FixedTypeInfo::allocateVector(IRGenFunction &IGF, SILType T,
+                                           llvm::Value *capacity,
+                                           const Twine &name) const {
+  // If the type is known to be empty, don't actually allocate anything.
+  if (isKnownEmpty(ResilienceExpansion::Maximal)) {
+    auto addr = getUndefAddress();
+    return { addr };
+  }
+
+  StackAddress alloca =
+    IGF.emitDynamicAlloca(getStorageType(), capacity, getFixedAlignment(),
+                          /*allowTaskAlloc*/ true, name);
+  IGF.Builder.CreateLifetimeStart(alloca.getAddress(), getFixedSize());
+
+  return { alloca };
+}
+
 void FixedTypeInfo::destroyStack(IRGenFunction &IGF, StackAddress addr,
                                  SILType T, bool isOutlined) const {
   destroy(IGF, addr.getAddress(), T, isOutlined);
@@ -83,4 +102,22 @@ void FixedTypeInfo::deallocateStack(IRGenFunction &IGF, StackAddress addr,
   if (isKnownEmpty(ResilienceExpansion::Maximal))
     return;
   IGF.Builder.CreateLifetimeEnd(addr.getAddress(), getFixedSize());
+}
+
+void TemporarySet::destroyAll(IRGenFunction &IGF) const {
+  assert(!hasBeenCleared() && "destroying a set that's been cleared?");
+
+  // Deallocate all the temporaries.
+  for (auto &temporary : llvm::reverse(Stack)) {
+    temporary.destroy(IGF);
+  }
+}
+
+void Temporary::destroy(IRGenFunction &IGF) const {
+  auto &ti = IGF.getTypeInfo(Type);
+  if (Type.isSensitive()) {
+    llvm::Value *size = ti.getSize(IGF, Type);
+    IGF.emitClearSensitive(Addr.getAddress(), size);
+  }
+  ti.deallocateStack(IGF, Addr, Type);
 }

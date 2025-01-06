@@ -29,14 +29,16 @@ func foo6(a : A) {
 
 func foo7(b : [B]) {}
 func foo8(a : [A]) {
-  foo7(b : a) // expected-error {{cannot convert value of type '[A]' to expected argument type '[B]'}} {{13-13= as! [B]}}
+  // TODO(diagnostics): Since `A` and `B` are related it would make sense to suggest forced downcast.
+  foo7(b : a) // expected-error {{cannot convert value of type '[A]' to expected argument type '[B]'}}
+  // expected-note@-1 {{arguments to generic parameter 'Element' ('A' and 'B') are expected to be equal}}
 }
 
 protocol P1 {}
 struct S1 : P1 {}
 func foo9(s : S1) {}
 func foo10(p : P1) {
-  foo9(s : p) // expected-error {{cannot convert value of type 'P1' to expected argument type 'S1'}} {{13-13= as! S1}}
+  foo9(s : p) // expected-error {{cannot convert value of type 'any P1' to expected argument type 'S1'}} {{13-13= as! S1}}
 }
 
 func foo11(a : [AnyHashable]) {}
@@ -70,3 +72,18 @@ _ = p =*= &o
 
 func rdar25963182(_ bytes: [UInt8] = nil) {}
 // expected-error@-1 {{nil default argument value cannot be converted to type}}
+
+// https://github.com/apple/swift/issues/55702
+do {
+  struct S {}
+
+  func returnVoid(_ x: Int) {}
+  func returnInt(_ x: Int) -> Int {}
+  func returnS(_ x: Int) -> S {}
+
+  let arr: [Int]
+
+  for x in arr where returnVoid(x) {} // expected-error {{cannot convert value of type '()' to expected condition type 'Bool'}}
+  for x in arr where returnInt(x) {} // expected-error {{type 'Int' cannot be used as a boolean; test for '!= 0' instead}} {{22-22=(}} {{34-34= != 0)}}
+  for x in arr where returnS(x) {} // expected-error {{cannot convert value of type 'S' to expected condition type 'Bool'}}
+}

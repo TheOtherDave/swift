@@ -4,17 +4,15 @@
 // RUN: c-index-test core -print-record %t/idx1 | %FileCheck %s
 // RUN: c-index-test core -print-record %t/idx2 | %FileCheck %s
 
-// XFAIL: linux
-
 // CHECK: record-sourcefile.swift
 // CHECK: ------------
 // CHECK: struct/Swift | S1 | s:4file2S1V | <no-cgname> | Def,Ref,RelCont -
-// CHECK: instance-method/acc-get/Swift | getter:property | s:4file2S1V8propertySivg | <no-cgname> | Def,Ref,Call,Impl,RelChild,RelRec,RelCall,RelAcc,RelCont - 
+// CHECK: instance-method/acc-get/Swift | getter:property | s:4file2S1V8propertySivg | <no-cgname> | Def,Ref,Call,Impl,RelChild,RelCall,RelAcc,RelCont -
 // CHECK: instance-property/Swift | property | [[property_USR:s:4file2S1V8propertySivp]] | <no-cgname> | Def,Ref,Read,RelChild,RelCont -
-// CHECK: static-method/acc-get/Swift | getter:staticProperty | s:4file2S1V14staticPropertySivg | <no-cgname> | Def,Ref,Call,Impl,RelChild,RelRec,RelCall,RelAcc,RelCont -
+// CHECK: static-method/acc-get/Swift | getter:staticProperty | s:4file2S1V14staticPropertySivgZ | <no-cgname> | Def,Ref,Call,Impl,RelChild,RelCall,RelAcc,RelCont -
 // CHECK: static-property/Swift | staticProperty | s:{{.*}} | <no-cgname> | Def,Ref,Read,RelChild,RelCont -
 // CHECK: instance-property/Swift | computedPropertyGetSet | s:{{.*}} | <no-cgname> | Def,RelChild -
-// CHECK: struct/Swift | Int | s:Si | <no-cgname> | Ref -
+// CHECK: struct/Swift | Int | s:Si | <no-cgname> | Ref,RelCont -
 // CHECK: instance-method/acc-get/Swift | getter:computedPropertyGetSet | s:4file2S1V22computedPropertyGetSetSivg | <no-cgname> | Def,RelChild,RelAcc -
 // CHECK: instance-method/acc-set/Swift | setter:computedPropertyGetSet | s:4file2S1V22computedPropertyGetSetSivs | <no-cgname> | Def,RelChild,RelAcc -
 // CHECK: instance-property/Swift | computedPropertyWillDid | s:{{.*}} | <no-cgname> | Def,RelChild -
@@ -32,7 +30,7 @@
 // CHECK: type-alias/Swift | TA | s:{{.*}} | <no-cgname> | Def,RelChild -
 // CHECK: class/Swift | C1 | s:{{.*}} | <no-cgname> | Def,Ref,RelBase,RelCont -
 // CHECK: instance-method/Swift | method() | s:{{.*}} | <no-cgname> | Def,Ref,Call,Dyn,RelChild,RelRec,RelCall,RelCont -
-// CHECK: class/Swift | C2 | s:{{.*}} | <no-cgname> | Def -
+// CHECK: class/Swift | C2 | s:{{.*}} | <no-cgname> | Def,Ref - RelChild,RelBase
 // CHECK: instance-method/Swift | method() | s:{{.*}} | <no-cgname> | Def,Dyn,RelChild,RelOver -
 // CHECK: function/Swift | takeC1(x:) | s:{{.*}} | <no-cgname> | Def -
 // CHECK: instance-method(test)/Swift | testFoo() | s:{{.*}} | <no-cgname> | Def,Dyn,RelChild -
@@ -49,7 +47,7 @@ struct S1 {
 
 // CHECK: [[@LINE+3]]:7 | instance-property/Swift | [[computedPropertyGetSet_USR:s:.*]] | Def,RelChild | rel: 1
 // CHECK-NEXT: RelChild | [[S1_USR]]
-// CHECK: [[@LINE+1]]:31 | struct/Swift | s:Si | Ref | rel: 0
+// CHECK: [[@LINE+1]]:31 | struct/Swift | s:Si | Ref,RelCont | rel: 1
   var computedPropertyGetSet: Int {
 // CHECK: [[@LINE+2]]:5 | instance-method/acc-get/Swift | s:{{.*}} | Def,RelChild,RelAcc | rel: 1
 // CHECK-NEXT: RelChild,RelAcc | [[computedPropertyGetSet_USR]]
@@ -85,9 +83,8 @@ struct S1 {
 // CHECK-NEXT: RelChild | [[S1_USR]]
   func method() {
     _ = self
-// CHECK: [[@LINE+4]]:9 | instance-method/acc-get/Swift | s:{{.*}} | Ref,Call,Impl,RelRec,RelCall,RelCont | rel: 2
+// CHECK: [[@LINE+3]]:9 | instance-method/acc-get/Swift | s:{{.*}} | Ref,Call,Impl,RelCall,RelCont | rel: 1
 // CHECK-NEXT: RelCall,RelCont | [[method_USR]]
-// CHECK-NEXT: RelRec | [[S1_USR]]
 // CHECK: [[@LINE+1]]:9 | instance-property/Swift | s:{{.*}} | Ref,Read,RelCont | rel: 1
     _ = property
   }
@@ -95,10 +92,9 @@ struct S1 {
 // CHECK: [[@LINE+2]]:15 | static-method/Swift | [[staticMethod_USR:s:.*]] | Def,RelChild | rel: 1
 // CHECK-NEXT: RelChild | [[S1_USR]]
   static func staticMethod() {
-// CHECK: [[@LINE+5]]:9 | struct/Swift | s:{{.*}} | Ref,RelCont | rel: 1
-// CHECK: [[@LINE+4]]:12 | static-method/acc-get/Swift | s:{{.*}} | Ref,Call,Impl,RelRec,RelCall,RelCont | rel: 2
+// CHECK: [[@LINE+4]]:9 | struct/Swift | s:{{.*}} | Ref,RelCont | rel: 1
+// CHECK: [[@LINE+3]]:12 | static-method/acc-get/Swift | s:{{.*}} | Ref,Call,Impl,RelCall,RelCont | rel: 1
 // CHECK-NEXT: RelCall,RelCont | [[staticMethod_USR]]
-// CHECK-NEXT: RelRec | [[S1_USR]]
 // CHECK: [[@LINE+1]]:12 | static-property/Swift | s:{{.*}} | Ref,Read,RelCont | rel: 1
     _ = S1.staticProperty
   }
@@ -153,3 +149,6 @@ class MyTestCase: XCTestCase {
 // CHECK-NEXT: RelChild | s:4file10MyTestCaseC
   func testFoo() { test1() }
 }
+
+// CHECK: [[@LINE+1]]:11 | class/Swift | s:4file2C2C | Ref | rel: 0
+extension C2 {}

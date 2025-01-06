@@ -37,9 +37,9 @@ static int Errors;
 /*
   Summary of Swift definitions from SwiftObjectNSObject.swift:
 
-  class SwiftObject <NSObject> { ... }
+  class Swift._SwiftObject <NSObject> { ... }
 
-  class C : SwiftObject {
+  class C : Swift._SwiftObject {
   @objc func cInstanceMethod()
   @objc class func cClassMethod()
   }
@@ -51,29 +51,86 @@ static int Errors;
 */
 
 // Add methods to class SwiftObject that can be called by performSelector: et al
-    @interface SwiftObject /* trust me, I know what I'm doing */ @end
-      @implementation SwiftObject (MethodsToPerform)
-      -(id) perform0 {
-        return self;
-    }
 
--(id) perform1:(id)one {
+static const char *SwiftObjectDemangledName;
+
+static id Perform0(id self, SEL sel) {
+    return self;
+}
+
+static id Perform1(id self, SEL sel, id one) {
   expectTrue ([one isEqual:@1]);
   return self;
 }
 
--(id) perform2:(id)one :(id)two {
+static id Perform2(id self, SEL sel, id one, id two) {
   expectTrue ([one isEqual:@1]);
   expectTrue ([two isEqual:@2]);
   return self;
 }
-@end
+
+static __attribute__((constructor))
+void HackSwiftObject()
+{
+    SwiftObjectDemangledName = "Swift._SwiftObject";
+    Class cls = objc_getClass(SwiftObjectDemangledName);
+
+    class_addMethod(cls, @selector(perform0), (IMP)Perform0, "@@:");
+    class_addMethod(cls, @selector(perform1:), (IMP)Perform1, "@@:@");
+    class_addMethod(cls, @selector(perform2::), (IMP)Perform2, "@@:@@");
+}
+
+void TestSwiftObjectNSObjectAssertNoErrors(void)
+{
+  printf("\nTotal: %d error%s\n",
+         Errors, Errors == 1 ? "" : "s");
+  if (Errors > 0) {
+    exit(1);
+  }
+}
+
+int CheckSwiftObjectNSObjectEquals(id e1, id e2)
+{
+  return [e1 isEqual:e2];
+}
+
+void TestSwiftObjectNSObjectEquals(id e1, id e2)
+{
+  printf("NSObjectProtocol.isEqual: Expect %s == %s\n",
+	 [[e1 description] UTF8String],
+	 [[e2 description] UTF8String]);
+  expectTrue([e1 isEqual:e2]);
+  expectTrue([e2 isEqual:e1]);
+}
+
+void TestSwiftObjectNSObjectNotEquals(id e1, id e2)
+{
+  printf("NSObjectProtocol.isEqual: Expect %s != %s\n",
+	 [[e1 description] UTF8String],
+	 [[e2 description] UTF8String]);
+  expectFalse([e1 isEqual:e2]);
+  expectFalse([e2 isEqual:e1]);
+}
+
+void TestSwiftObjectNSObjectHashValue(id e, NSUInteger hashValue)
+{
+  printf("NSObjectProtocol.hash: Expect [%s hashValue] == %lu\n",
+	 [[e description] UTF8String],
+	 (unsigned long)hashValue);
+  expectTrue([e hash] == hashValue);
+}
+
+void TestSwiftObjectNSObjectDefaultHashValue(id e)
+{
+  NSUInteger hashValue = (NSUInteger)e;
+  TestSwiftObjectNSObjectHashValue(e, hashValue);
+}
 
 void TestSwiftObjectNSObject(id c, id d)
 {
   printf("TestSwiftObjectNSObject\n");
 
-  Class S = objc_getClass("SwiftObject");
+  Class S = objc_getClass(SwiftObjectDemangledName);
   Class C = objc_getClass("SwiftObjectNSObject.C");
   Class D = objc_getClass("SwiftObjectNSObject.D");
 
@@ -148,12 +205,10 @@ void TestSwiftObjectNSObject(id c, id d)
   expectFalse([C_meta isEqual:D_meta]);
   expectFalse([S_meta isEqual:C_meta]);
 
-
   printf("NSObjectProtocol.hash\n");
 
   expectTrue ([d hash] + [c hash] + [D hash] + [C hash] + [S hash] +
               [D_meta hash] + [C_meta hash] + [S_meta hash] != 0);
-
 
   printf("NSObjectProtocol.self\n");
 
@@ -401,10 +456,9 @@ void TestSwiftObjectNSObject(id c, id d)
   expectTrue ([[c description] isEqual:@"SwiftObjectNSObject.C"]);
   expectTrue ([[D description] isEqual:@"SwiftObjectNSObject.D"]);
   expectTrue ([[C description] isEqual:@"SwiftObjectNSObject.C"]);
-  expectTrue ([[S description] isEqual:@"SwiftObject"]);
   expectTrue ([[D_meta description] isEqual:@"SwiftObjectNSObject.D"]);
   expectTrue ([[C_meta description] isEqual:@"SwiftObjectNSObject.C"]);
-  expectTrue ([[S_meta description] isEqual:@"SwiftObject"]);
+  expectTrue ([[S_meta description] isEqual:@(SwiftObjectDemangledName)]);
 
   // NSLog() calls -description and also some private methods.
   // This output is checked by FileCheck in SwiftObjectNSObject.swift.
@@ -419,10 +473,9 @@ void TestSwiftObjectNSObject(id c, id d)
   expectTrue ([[c debugDescription] isEqual:@"SwiftObjectNSObject.C"]);
   expectTrue ([[D debugDescription] isEqual:@"SwiftObjectNSObject.D"]);
   expectTrue ([[C debugDescription] isEqual:@"SwiftObjectNSObject.C"]);
-  expectTrue ([[S debugDescription] isEqual:@"SwiftObject"]);
   expectTrue ([[D_meta debugDescription] isEqual:@"SwiftObjectNSObject.D"]);
   expectTrue ([[C_meta debugDescription] isEqual:@"SwiftObjectNSObject.C"]);
-  expectTrue ([[S_meta debugDescription] isEqual:@"SwiftObject"]);
+  expectTrue ([[S_meta debugDescription] isEqual:@(SwiftObjectDemangledName)]);
 
 
   printf("NSObjectProtocol.performSelector\n");
@@ -789,9 +842,4 @@ void TestSwiftObjectNSObject(id c, id d)
   expectTrue ([S_meta instanceMethodForSelector:@selector(DESSLOK)] == fwd);
   expectTrue ([C_meta instanceMethodForSelector:@selector(DESSLOK)] == fwd);
   expectTrue ([D_meta instanceMethodForSelector:@selector(DESSLOK)] == fwd);
-
-
-  printf("TestSwiftObjectNSObject: %d error%s\n",
-         Errors, Errors == 1 ? "" : "s");
-  exit(Errors ? 1 : 0);
 }

@@ -11,16 +11,18 @@
 //===----------------------------------------------------------------------===//
 
 #include "CodeCompletionOrganizer.h"
-#include "SourceKit/Support/FuzzyStringMatcher.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Module.h"
 #include "swift/Frontend/Frontend.h"
+#include "swift/IDE/CodeCompletionResultPrinter.h"
+#include "swift/IDE/FuzzyStringMatcher.h"
+#include "swift/IDE/ImportDepth.h"
+#include "swift/Markup/XMLUtils.h"
 #include "clang/Basic/CharInfo.h"
 #include "clang/Basic/Module.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/ilist.h"
 #include "llvm/ADT/ilist_node.h"
-#include <deque>
 
 using namespace SourceKit;
 using namespace CodeCompletion;
@@ -53,20 +55,6 @@ struct Result : public Item {
     return item->getKind() == ItemKind::Result;
   }
 };
-class ImportDepth {
-  llvm::StringMap<uint8_t> depths;
-
-public:
-  ImportDepth() = default;
-  ImportDepth(ASTContext &context, CompilerInvocation &invocation);
-
-  Optional<uint8_t> lookup(StringRef module) {
-    auto I = depths.find(module);
-    if (I == depths.end())
-      return None;
-    return I->getValue();
-  }
-};
 } // end anonymous namespace
 
 struct CodeCompletion::Group : public Item {
@@ -84,14 +72,14 @@ struct CodeCompletion::Group : public Item {
 std::vector<Completion *> SourceKit::CodeCompletion::extendCompletions(
     ArrayRef<SwiftResult *> swiftResults, CompletionSink &sink,
     SwiftCompletionInfo &info, const NameToPopularityMap *nameToPopularity,
-    const Options &options, Completion *prefix,
-    Optional<SemanticContextKind> overrideContext,
-    Optional<SemanticContextKind> overrideOperatorContext) {
+    const Options &options, Completion *prefix, bool clearFlair) {
 
   ImportDepth depth;
-  if (info.swiftASTContext) {
+  if (info.compilerInstance) {
     // Build import depth map.
-    depth = ImportDepth(*info.swiftASTContext, *info.invocation);
+    depth = ImportDepth(
+        info.compilerInstance->getASTContext(),
+        info.compilerInstance->getInvocation().getFrontendOptions());
   }
 
   if (info.completionContext)
@@ -103,18 +91,9 @@ std::vector<Completion *> SourceKit::CodeCompletion::extendCompletions(
     if (result->getSemanticContext() == SemanticContextKind::OtherModule) {
       builder.setModuleImportDepth(depth.lookup(result->getModuleName()));
 
-      if (info.completionContext->HasExpectedTypeRelation &&
-          result->getKind() == Completion::Declaration) {
-        // FIXME: because other-module results are cached, they will not be
-        // given a type-relation of invalid.  As a hack, we look at the text of
-        // the result type and look for 'Void'.
-        for (auto &chunk : result->getCompletionString()->getChunks()) {
-          using ChunkKind = ide::CodeCompletionString::Chunk::ChunkKind;
-          if (chunk.is(ChunkKind::TypeAnnotation) && chunk.hasText() &&
-              chunk.getText() == "Void") {
-            builder.setNotRecommended(Completion::TypeMismatch);
-          }
-        }
+      if (info.completionContext->typeContextKind ==
+              TypeContextKind::Required &&
+          result->getKind() == CodeCompletionResultKind::Declaration) {
       }
     }
 
@@ -123,10 +102,9 @@ std::vector<Completion *> SourceKit::CodeCompletion::extendCompletions(
       builder.setSemanticContext(prefix->getSemanticContext());
     }
 
-    if (overrideOperatorContext && result->isOperator()) {
-      builder.setSemanticContext(*overrideOperatorContext);
-    } else if (overrideContext) {
-      builder.setSemanticContext(*overrideContext);
+    if (clearFlair) {
+      builder.setFlair(CodeCompletionFlair());
+      builder.setSemanticContext(SemanticContextKind::None);
     }
 
     // If this result is not from the current module, try to get a popularity
@@ -142,8 +120,6 @@ std::vector<Completion *> SourceKit::CodeCompletion::extendCompletions(
   return results;
 }
 
-static StringRef copyString(llvm::BumpPtrAllocator &allocator, StringRef str);
-
 bool SourceKit::CodeCompletion::addCustomCompletions(
     CompletionSink &sink, std::vector<Completion *> &completions,
     ArrayRef<CustomCompletionInfo> customCompletions,
@@ -151,16 +127,24 @@ bool SourceKit::CodeCompletion::addCustomCompletions(
 
   auto addCompletion = [&](CustomCompletionInfo customCompletion) {
     using Chunk = CodeCompletionString::Chunk;
-    auto nameCopy = copyString(sink.allocator, customCompletion.Name);
+    auto nameCopy = StringRef(customCompletion.Name).copy(sink.allocator);
     auto chunk = Chunk::createWithText(Chunk::ChunkKind::Text, 0, nameCopy);
     auto *completionString =
         CodeCompletionString::create(sink.allocator, chunk);
-    CodeCompletion::SwiftResult swiftResult(
-        CodeCompletion::SwiftResult::ResultKind::Pattern,
-        SemanticContextKind::ExpressionSpecific,
-        /*NumBytesToErase=*/0, completionString);
+    auto *contextFreeResult =
+        ContextFreeCodeCompletionResult::createPatternOrBuiltInOperatorResult(
+            sink.swiftSink, CodeCompletionResultKind::Pattern, completionString,
+            CodeCompletionOperatorKind::None,
+            /*BriefDocComment=*/"", CodeCompletionResultType::unknown(),
+            ContextFreeNotRecommendedReason::None,
+            CodeCompletionDiagnosticSeverity::None, /*DiagnosticMessage=*/"");
+    auto *swiftResult = new (sink.allocator) CodeCompletion::SwiftResult(
+        *contextFreeResult, SemanticContextKind::Local,
+        CodeCompletionFlairBit::ExpressionSpecific,
+        /*NumBytesToErase=*/0, CodeCompletionResultTypeRelation::Unrelated,
+        ContextualNotRecommendedReason::None);
 
-    CompletionBuilder builder(sink, swiftResult);
+    CompletionBuilder builder(sink, *swiftResult);
     builder.setCustomKind(customCompletion.Kind);
     completions.push_back(builder.finish());
   };
@@ -176,9 +160,9 @@ bool SourceKit::CodeCompletion::addCustomCompletions(
       }
       break;
     case CompletionKind::PostfixExprBeginning:
-    case CompletionKind::AssignmentRHS:
     case CompletionKind::CallArg:
     case CompletionKind::ReturnStmtExpr:
+    case CompletionKind::YieldStmtExpr:
       if (custom.Contexts.contains(CustomCompletionInfo::Expr)) {
         changed = true;
         addCompletion(custom);
@@ -190,6 +174,10 @@ bool SourceKit::CodeCompletion::addCustomCompletions(
         addCompletion(custom);
       }
       break;
+    case CompletionKind::TypePossibleFunctionParamBeginning:
+    case CompletionKind::TypeDeclResultBeginning:
+    case CompletionKind::TypeBeginning:
+    case CompletionKind::TypeSimpleOrComposition:
     case CompletionKind::TypeSimpleBeginning:
       if (custom.Contexts.contains(CustomCompletionInfo::Type)) {
         changed = true;
@@ -211,13 +199,13 @@ bool SourceKit::CodeCompletion::addCustomCompletions(
 class CodeCompletionOrganizer::Impl {
   std::unique_ptr<Group> rootGroup;
   CompletionKind completionKind;
-  bool completionHasExpectedTypes;
+  TypeContextKind typeContextKind;
 
   void groupStemsRecursive(Group *group, bool recurseIntoNewGroups,
                            StringRef(getStem)(StringRef));
 
 public:
-  Impl(CompletionKind kind, bool hasExpectedTypes);
+  Impl(CompletionKind kind, TypeContextKind typeContextKind);
 
   void addCompletionsWithFilter(ArrayRef<Completion *> completions,
                                 StringRef filterText, Options options,
@@ -274,8 +262,8 @@ public:
 
 CodeCompletionOrganizer::CodeCompletionOrganizer(const Options &options,
                                                  CompletionKind kind,
-                                                 bool hasExpectedTypes)
-    : impl(*new Impl(kind, hasExpectedTypes)), options(options) {}
+                                                 TypeContextKind typeContextKind)
+    : impl(*new Impl(kind, typeContextKind)), options(options) {}
 CodeCompletionOrganizer::~CodeCompletionOrganizer() { delete &impl; }
 
 void CodeCompletionOrganizer::preSortCompletions(
@@ -287,7 +275,7 @@ void CodeCompletionOrganizer::preSortCompletions(
                        [](Completion *const *a, Completion *const *b) {
 
      // Sort first by filter name (case-sensitive).
-     if (int primary = (*a)->getName().compare((*b)->getName()))
+     if (int primary = (*a)->getFilterName().compare((*b)->getFilterName()))
        return primary;
 
      // Next, sort by full description text.
@@ -316,90 +304,20 @@ CodeCompletionViewRef CodeCompletionOrganizer::takeResultsView() {
 }
 
 //===----------------------------------------------------------------------===//
-// ImportDepth
-//===----------------------------------------------------------------------===//
-
-ImportDepth::ImportDepth(ASTContext &context, CompilerInvocation &invocation) {
-  llvm::DenseSet<ModuleDecl *> seen;
-  std::deque<std::pair<ModuleDecl *, uint8_t>> worklist;
-
-  StringRef mainModule = invocation.getModuleName();
-  auto *main = context.getLoadedModule(context.getIdentifier(mainModule));
-  assert(main && "missing main module");
-  worklist.emplace_back(main, uint8_t(0));
-
-  // Imports from -import-name such as Playground auxiliary sources are treated
-  // specially by applying import depth 0.
-  llvm::StringSet<> auxImports;
-  for (StringRef moduleName :
-       invocation.getFrontendOptions().ImplicitImportModuleNames)
-    auxImports.insert(moduleName);
-
-  // Private imports from this module.
-  // FIXME: only the private imports from the current source file.
-  SmallVector<ModuleDecl::ImportedModule, 16> mainImports;
-  main->getImportedModules(mainImports, ModuleDecl::ImportFilter::Private);
-  for (auto &import : mainImports) {
-    uint8_t depth = 1;
-    if (auxImports.count(import.second->getName().str()))
-      depth = 0;
-    worklist.emplace_back(import.second, depth);
-  }
-
-  // Fill depths with BFS over module imports.
-  while (!worklist.empty()) {
-    ModuleDecl *module;
-    uint8_t depth;
-    std::tie(module, depth) = worklist.front();
-    worklist.pop_front();
-
-    if (!seen.insert(module).second)
-      continue;
-
-    // Insert new module:depth mapping.
-    const clang::Module *CM = module->findUnderlyingClangModule();
-    if (CM) {
-      depths[CM->getFullModuleName()] = depth;
-    } else {
-      depths[module->getName().str()] = depth;
-    }
-
-    // Add imports to the worklist.
-    SmallVector<ModuleDecl::ImportedModule, 16> imports;
-    module->getImportedModules(imports);
-    for (auto &import : imports) {
-      uint8_t next = std::max(depth, uint8_t(depth + 1)); // unsigned wrap
-
-      // Implicitly imported sub-modules get the same depth as their parent.
-      if (const clang::Module *CMI = import.second->findUnderlyingClangModule())
-        if (CM && CMI->isSubModuleOf(CM))
-          next = depth;
-      worklist.emplace_back(import.second, next);
-    }
-  }
-}
-
-//===----------------------------------------------------------------------===//
 // CodeCompletionOrganizer::Impl utilities
 //===----------------------------------------------------------------------===//
 
-static StringRef copyString(llvm::BumpPtrAllocator &allocator, StringRef str) {
-  char *newStr = allocator.Allocate<char>(str.size());
-  std::copy(str.begin(), str.end(), newStr);
-  return StringRef(newStr, str.size());
-}
-
 static std::unique_ptr<Group> make_group(StringRef name) {
-  auto g = llvm::make_unique<Group>();
-  g->name = name;
-  g->description = name;
+  auto g = std::make_unique<Group>();
+  g->name = name.str();
+  g->description = name.str();
   return g;
 }
 
 static std::unique_ptr<Result> make_result(Completion *result) {
-  auto r = llvm::make_unique<Result>(result);
-  r->name = result->getName();
-  r->description = result->getDescription();
+  auto r = std::make_unique<Result>(result);
+  r->name = result->getFilterName().str();
+  r->description = result->getDescription().str();
   return r;
 }
 
@@ -408,8 +326,8 @@ static std::unique_ptr<Result> make_result(Completion *result) {
 // CodeCompletionOrganizer::Impl implementation
 //===----------------------------------------------------------------------===//
 
-CodeCompletionOrganizer::Impl::Impl(CompletionKind kind, bool hasExpectedTypes)
-    : completionKind(kind), completionHasExpectedTypes(hasExpectedTypes) {
+CodeCompletionOrganizer::Impl::Impl(CompletionKind kind, TypeContextKind typeContextKind)
+    : completionKind(kind), typeContextKind(typeContextKind) {
   assert(!rootGroup && "initialized twice");
   rootGroup = make_group("");
 }
@@ -417,6 +335,7 @@ CodeCompletionOrganizer::Impl::Impl(CompletionKind kind, bool hasExpectedTypes)
 static bool matchesExpectedStyle(Completion *completion, NameStyle style) {
   switch (completion->getAssociatedDeclKind()) {
   case CodeCompletionDeclKind::Class:
+  case CodeCompletionDeclKind::Actor:
   case CodeCompletionDeclKind::Struct:
   case CodeCompletionDeclKind::Enum:
   case CodeCompletionDeclKind::Protocol:
@@ -460,14 +379,14 @@ bool FilterRules::hideFilterName(StringRef name) const {
   return hideAll;
 }
 
-bool FilterRules::hideCompletion(Completion *completion) const {
-  return hideCompletion(completion, completion->getName(),
-                        completion->getDescription(),
-                        completion->getCustomKind());
+bool FilterRules::hideCompletion(const Completion &completion) const {
+  return hideCompletion(completion.getSwiftResult(), completion.getFilterName(),
+                        completion.getDescription(),
+                        completion.getCustomKind());
 }
 
-bool FilterRules::hideCompletion(SwiftResult *completion, StringRef filterName,
-                                 StringRef description,
+bool FilterRules::hideCompletion(const SwiftResult &completion,
+                                 StringRef filterName, StringRef description,
                                  void *customKind) const {
 
   if (!description.empty()) {
@@ -482,19 +401,19 @@ bool FilterRules::hideCompletion(SwiftResult *completion, StringRef filterName,
       return I->getValue();
   }
 
-  switch (completion->getKind()) {
-  case Completion::BuiltinOperator:
-  case Completion::Declaration:
+  switch (completion.getKind()) {
+  case CodeCompletionResultKind::BuiltinOperator:
+  case CodeCompletionResultKind::Declaration:
     break;
-  case Completion::Keyword: {
-    auto I = hideKeyword.find(completion->getKeywordKind());
+  case CodeCompletionResultKind::Keyword: {
+    auto I = hideKeyword.find(completion.getKeywordKind());
     if (I != hideKeyword.end())
       return I->second;
     if (hideAllKeywords)
       return true;
     break;
   }
-  case Completion::Pattern: {
+  case CodeCompletionResultKind::Pattern: {
     if (customKind) {
       // FIXME: individual custom completions
       if (hideCustomCompletions)
@@ -502,8 +421,8 @@ bool FilterRules::hideCompletion(SwiftResult *completion, StringRef filterName,
     }
     break;
   }
-  case Completion::Literal: {
-    auto I = hideValueLiteral.find(completion->getLiteralKind());
+  case CodeCompletionResultKind::Literal: {
+    auto I = hideValueLiteral.find(completion.getLiteralKind());
     if (I != hideValueLiteral.end())
       return I->second;
     if (hideAllValueLiterals)
@@ -512,9 +431,9 @@ bool FilterRules::hideCompletion(SwiftResult *completion, StringRef filterName,
   }
   }
 
-  if (!completion->getModuleName().empty()) {
+  if (!completion.getModuleName().empty()) {
     // FIXME: try each submodule chain starting from the most specific.
-    auto M = hideModule.find(completion->getModuleName());
+    auto M = hideModule.find(completion.getModuleName());
     if (M != hideModule.end())
       return M->getValue();
   }
@@ -533,23 +452,31 @@ void CodeCompletionOrganizer::Impl::addCompletionsWithFilter(
   if (filterText.empty()) {
     bool hideLowPriority =
         options.hideLowPriority &&
+        completionKind != CompletionKind::TypePossibleFunctionParamBeginning &&
+        completionKind != CompletionKind::TypeDeclResultBeginning &&
+        completionKind != CompletionKind::TypeBeginning &&
+        completionKind != CompletionKind::TypeSimpleOrComposition &&
         completionKind != CompletionKind::TypeSimpleBeginning &&
         completionKind != CompletionKind::PostfixExpr;
     for (Completion *completion : completions) {
-      if (rules.hideCompletion(completion))
+      if (rules.hideCompletion(*completion))
         continue;
 
-      if (options.hideLowPriority && completion->isNotRecommended())
+      if (options.hideLowPriority &&
+          (completion->isNotRecommended() ||
+           completion->getExpectedTypeRelation() ==
+               CodeCompletionResultTypeRelation::Invalid))
         continue;
 
-      NameStyle style(completion->getName());
+      NameStyle style(completion->getFilterName());
       bool hideUnderscore = options.hideUnderscores && style.leadingUnderscores;
       if (hideUnderscore && options.reallyHideAllUnderscores)
         continue;
 
-      bool hideByNameStyle = options.hideByNameStyle &&
-                             completion->getKind() == Completion::Declaration &&
-                             !matchesExpectedStyle(completion, style);
+      bool hideByNameStyle =
+          options.hideByNameStyle &&
+          completion->getKind() == CodeCompletionResultKind::Declaration &&
+          !matchesExpectedStyle(completion, style);
 
       hideByNameStyle |= hideUnderscore;
 
@@ -565,13 +492,14 @@ void CodeCompletionOrganizer::Impl::addCompletionsWithFilter(
           if (*depth == 0) // Treat as if it's "thismodule"
             break;
         }
-        if (completion->getExpectedTypeRelation() >= Completion::Convertible ||
-            (completion->getKind() == Completion::Literal &&
+        if (completion->getExpectedTypeRelation() >=
+                CodeCompletionResultTypeRelation::Convertible ||
+            (completion->getKind() == CodeCompletionResultKind::Literal &&
              completionKind != CompletionKind::StmtOrExpr &&
-             !completionHasExpectedTypes))
+             typeContextKind < TypeContextKind::Required))
           break;
 
-        if (completion->getKind() == Completion::Keyword &&
+        if (completion->getKind() == CodeCompletionResultKind::Keyword &&
             completionKind == CompletionKind::StmtOrExpr &&
             isHighPriorityKeyword(completion->getKeywordKind()))
           break;
@@ -592,14 +520,15 @@ void CodeCompletionOrganizer::Impl::addCompletionsWithFilter(
   FuzzyStringMatcher pattern(filterText);
   pattern.normalize = true;
   for (Completion *completion : completions) {
-    if (rules.hideCompletion(completion))
+    if (rules.hideCompletion(*completion))
       continue;
 
     // Hide literals other than the ones that are also keywords if they don't
     // match the expected types.
-    if (completion->getKind() == Completion::Literal &&
-        completionHasExpectedTypes &&
-        completion->getExpectedTypeRelation() < Completion::Convertible &&
+    if (completion->getKind() == CodeCompletionResultKind::Literal &&
+        typeContextKind == TypeContextKind::Required &&
+        completion->getExpectedTypeRelation() <
+            CodeCompletionResultTypeRelation::Convertible &&
         completion->getLiteralKind() !=
             CodeCompletionLiteralKind::BooleanLiteral &&
         completion->getLiteralKind() != CodeCompletionLiteralKind::NilLiteral)
@@ -607,22 +536,23 @@ void CodeCompletionOrganizer::Impl::addCompletionsWithFilter(
 
     bool match = false;
     if (options.fuzzyMatching && filterText.size() >= options.minFuzzyLength) {
-      match = pattern.matchesCandidate(completion->getName());
+      match = pattern.matchesCandidate(completion->getFilterName());
     } else {
-      match = completion->getName().startswith_lower(filterText);
+      match = completion->getFilterName().starts_with_insensitive(filterText);
     }
 
-    bool isExactMatch = match && completion->getName().equals_lower(filterText);
+    bool isExactMatch =
+        match && completion->getFilterName().equals_insensitive(filterText);
 
     if (isExactMatch) {
       if (!exactMatch) { // first match
         exactMatch = completion;
-      } else if (completion->getName() != exactMatch->getName()) {
-        if (completion->getName() == filterText && // first case-sensitive match
-            exactMatch->getName() != filterText)
+      } else if (completion->getFilterName() != exactMatch->getFilterName()) {
+        if (completion->getFilterName() == filterText && // first case-sensitive match
+            exactMatch->getFilterName() != filterText)
           exactMatch = completion;
-        else if (pattern.scoreCandidate(completion->getName()) > // better match
-                 pattern.scoreCandidate(exactMatch->getName()))
+        else if (pattern.scoreCandidate(completion->getFilterName()) > // better match
+                 pattern.scoreCandidate(exactMatch->getFilterName()))
           exactMatch = completion;
       }
 
@@ -635,7 +565,7 @@ void CodeCompletionOrganizer::Impl::addCompletionsWithFilter(
     if (match) {
       auto wrapper = make_result(completion);
       if (options.fuzzyMatching) {
-        wrapper->matchScore = pattern.scoreCandidate(completion->getName());
+        wrapper->matchScore = pattern.scoreCandidate(completion->getFilterName());
       }
       wrapper->isExactMatch = isExactMatch;
 
@@ -648,7 +578,6 @@ static double getSemanticContextScore(bool useImportDepth,
                                       Completion *completion) {
   double order = -1.0;
   switch (completion->getSemanticContext()) {
-  case SemanticContextKind::ExpressionSpecific: order = 0; break;
   case SemanticContextKind::Local: order = 1; break;
   case SemanticContextKind::CurrentNominal: order = 2; break;
   case SemanticContextKind::Super: order = 3; break;
@@ -667,7 +596,8 @@ static double getSemanticContextScore(bool useImportDepth,
     break;
   }
   case SemanticContextKind::None: {
-    order = completion->getKind() == Completion::Keyword ? 5.5 : 8.0;
+    order =
+        completion->getKind() == CodeCompletionResultKind::Keyword ? 5.5 : 8.0;
     break;
   }
   }
@@ -693,12 +623,12 @@ static double combinedScore(const Options &options, double matchScore,
 
 static int compareResultName(Item &a, Item &b) {
   // Sort first by filter name (case-insensitive).
-  if (int primary = StringRef(a.name).compare_lower(b.name))
+  if (int primary = StringRef(a.name).compare_insensitive(b.name))
     return primary;
 
   // Next, sort by full description text.
   return a.description.compare(b.description);
-};
+}
 
 namespace {
 enum class ResultBucket {
@@ -714,7 +644,7 @@ enum class ResultBucket {
 };
 } // end anonymous namespace
 
-static ResultBucket getResultBucket(Item &item, bool hasExpectedTypes,
+static ResultBucket getResultBucket(Item &item, bool hasRequiredTypes,
                                     bool skipMetaGroups = false) {
   if (item.isExactMatch && !skipMetaGroups)
     return ResultBucket::ExactMatch;
@@ -726,38 +656,57 @@ static ResultBucket getResultBucket(Item &item, bool hasExpectedTypes,
   if (completion->isNotRecommended() && !skipMetaGroups)
     return ResultBucket::NotRecommended;
 
-  if (completion->getSemanticContext() ==
-          SemanticContextKind::ExpressionSpecific &&
-      !skipMetaGroups)
-    return ResultBucket::ExpressionSpecific;
+  if (!skipMetaGroups) {
+    auto flair = completion->getFlair();
+    if (flair.contains(CodeCompletionFlairBit::ExpressionSpecific) ||
+        flair.contains(CodeCompletionFlairBit::SuperChain) ||
+        flair.contains(CodeCompletionFlairBit::ArgumentLabels))
+      return ResultBucket::ExpressionSpecific;
+  }
 
   if (completion->isOperator())
     return ResultBucket::Operator;
 
-  bool matchesType =
-      completion->getExpectedTypeRelation() >= Completion::Convertible;
-
   switch (completion->getKind()) {
-  case Completion::Literal:
-    if (matchesType) {
+  case CodeCompletionResultKind::Literal:
+    if (completion->getExpectedTypeRelation() >=
+        CodeCompletionResultTypeRelation::Convertible) {
       return ResultBucket::LiteralTypeMatch;
-    } else if (!hasExpectedTypes) {
+    } else if (!hasRequiredTypes) {
       return ResultBucket::Literal;
     } else {
       // When we have type context, we still show literals that are keywords,
       // but we treat them as keywords instead of literals for prioritization.
       return ResultBucket::Normal;
     }
-  case Completion::Keyword:
+  case CodeCompletionResultKind::Keyword:
     return isHighPriorityKeyword(completion->getKeywordKind())
                ? ResultBucket::HighPriorityKeyword
                : ResultBucket::Normal;
-  case Completion::Pattern:
-  case Completion::Declaration:
-    return matchesType ? ResultBucket::NormalTypeMatch : ResultBucket::Normal;
-  case Completion::BuiltinOperator:
+  case CodeCompletionResultKind::Pattern:
+  case CodeCompletionResultKind::Declaration:
+    switch (completion->getExpectedTypeRelation()) {
+    case swift::ide::CodeCompletionResultTypeRelation::Convertible:
+      return ResultBucket::NormalTypeMatch;
+    case swift::ide::CodeCompletionResultTypeRelation::NotApplicable:
+    case swift::ide::CodeCompletionResultTypeRelation::Unknown:
+    case swift::ide::CodeCompletionResultTypeRelation::Unrelated:
+      return ResultBucket::Normal;
+    case swift::ide::CodeCompletionResultTypeRelation::Invalid:
+      if (!skipMetaGroups)
+        return ResultBucket::NotRecommended;
+      return ResultBucket::Normal;
+    }
+  case CodeCompletionResultKind::BuiltinOperator:
     llvm_unreachable("operators should be handled above");
   }
+}
+
+template <class T, size_t N>
+static size_t getIndex(const T (&array)[N], T element) {
+  auto I = std::find(array, &array[N], element);
+  assert(I != &array[N]);
+  return std::distance(array, I);
 }
 
 static int compareHighPriorityKeywords(Item &a_, Item &b_) {
@@ -770,16 +719,9 @@ static int compareHighPriorityKeywords(Item &a_, Item &b_) {
     CodeCompletionKeywordKind::kw_return,
     CodeCompletionKeywordKind::kw_func,
   };
-  auto size = sizeof(order) / sizeof(order[0]);
 
-  auto getIndex = [=](Item &item) {
-     auto I = std::find(order, &order[size], cast<Result>(item).value->getKeywordKind());
-    assert(I != &order[size]);
-    return std::distance(order, I);
-  };
-
-  auto a = getIndex(a_);
-  auto b = getIndex(b_);
+  auto a = getIndex(order, cast<Result>(a_).value->getKeywordKind());
+  auto b = getIndex(order, cast<Result>(b_).value->getKeywordKind());
   return a < b ? -1 : (b < a ? 1 : 0);
 }
 
@@ -795,23 +737,16 @@ static int compareLiterals(Item &a_, Item &b_) {
     CodeCompletionLiteralKind::Tuple,
     CodeCompletionLiteralKind::NilLiteral,
   };
-  auto size = sizeof(order) / sizeof(order[0]);
 
-  auto getIndex = [=](Item &item) {
-    auto I = std::find(order, &order[size], cast<Result>(item).value->getLiteralKind());
-    assert(I != &order[size]);
-    return std::distance(order, I);
-  };
-
-  auto a = getIndex(a_);
-  auto b = getIndex(b_);
+  auto a = getIndex(order, cast<Result>(a_).value->getLiteralKind());
+  auto b = getIndex(order, cast<Result>(b_).value->getLiteralKind());
 
   if (a != b)
     return a < b ? -1 : 1;
 
   // Sort true before false instead of alphabetically.
   if (cast<Result>(a_).value->getLiteralKind() == CodeCompletionLiteralKind::BooleanLiteral)
-    return a_.name > b_.name;
+    return b_.name.compare(a_.name);
 
   return 0;
 }
@@ -875,17 +810,9 @@ static int compareOperators(Item &a_, Item &b_) {
       CCOK::NotEqEq, // !==
       CCOK::TildeEq, // ~=
   };
-  auto size = sizeof(order) / sizeof(order[0]);
 
-  auto getIndex = [=](Item &item) {
-    auto I = std::find(order, &order[size],
-                       cast<Result>(item).value->getOperatorKind());
-    assert(I != &order[size]);
-    return std::distance(order, I);
-  };
-
-  auto a = getIndex(a_);
-  auto b = getIndex(b_);
+  auto a = getIndex(order, cast<Result>(a_).value->getOperatorKind());
+  auto b = getIndex(order, cast<Result>(b_).value->getOperatorKind());
   return a < b ? -1 : (b < a ? 1 : 0);
 }
 
@@ -899,26 +826,27 @@ static bool isTopNonLiteralResult(Item &item, ResultBucket literalBucket) {
     return completion->getSemanticContext() <=
            SemanticContextKind::CurrentNominal;
   case ResultBucket::LiteralTypeMatch:
-    return completion->getExpectedTypeRelation() >= Completion::Convertible;
+    return completion->getExpectedTypeRelation() >=
+           CodeCompletionResultTypeRelation::Convertible;
   default:
     llvm_unreachable("invalid literal bucket");
   }
 }
 
 static void sortTopN(const Options &options, Group *group,
-                     bool hasExpectedTypes) {
+                     bool hasRequiredTypes) {
 
   auto &contents = group->contents;
   if (contents.empty() || options.showTopNonLiteralResults == 0)
     return;
 
-  auto best = getResultBucket(*contents[0], hasExpectedTypes);
+  auto best = getResultBucket(*contents[0], hasRequiredTypes);
   if (best == ResultBucket::LiteralTypeMatch || best == ResultBucket::Literal) {
 
     unsigned beginNewIndex = 0;
     unsigned endNewIndex = 0;
     for (unsigned i = 1; i < contents.size(); ++i) {
-      auto bucket = getResultBucket(*contents[i], hasExpectedTypes);
+      auto bucket = getResultBucket(*contents[i], hasRequiredTypes);
       if (bucket < best) {
         // This algorithm assumes we don't have both literal and
         // literal-type-match at the start of the list.
@@ -963,13 +891,13 @@ static void sortTopN(const Options &options, Group *group,
 }
 
 static void sortRecursive(const Options &options, Group *group,
-                          bool hasExpectedTypes) {
+                          bool hasRequiredTypes) {
   // Sort all of the subgroups first, and fill in the bucket for each result.
   auto &contents = group->contents;
   double best = -1.0;
   for (auto &item : contents) {
     if (auto *g = dyn_cast<Group>(item.get())) {
-      sortRecursive(options, g, hasExpectedTypes);
+      sortRecursive(options, g, hasRequiredTypes);
     } else {
       Result *r = cast<Result>(item.get());
       item->finalScore = combinedScore(options, item->matchScore, r->value);
@@ -995,8 +923,8 @@ static void sortRecursive(const Options &options, Group *group,
     Item &a = *a_;
     Item &b = *b_;
 
-    auto bucketA = getResultBucket(a, hasExpectedTypes);
-    auto bucketB = getResultBucket(b, hasExpectedTypes);
+    auto bucketA = getResultBucket(a, hasRequiredTypes);
+    auto bucketB = getResultBucket(b, hasRequiredTypes);
     if (bucketA < bucketB)
       return false;
     else if (bucketB < bucketA)
@@ -1007,8 +935,8 @@ static void sortRecursive(const Options &options, Group *group,
     if (bucketA == ResultBucket::ExactMatch ||
         bucketA == ResultBucket::ExpressionSpecific ||
         bucketA == ResultBucket::NotRecommended) {
-      bucketA = getResultBucket(a, hasExpectedTypes, /*skipMetaGroups*/ true);
-      bucketB = getResultBucket(b, hasExpectedTypes, /*skipMetaGroups*/ true);
+      bucketA = getResultBucket(a, hasRequiredTypes, /*skipMetaGroups*/ true);
+      bucketB = getResultBucket(b, hasRequiredTypes, /*skipMetaGroups*/ true);
       if (bucketA < bucketB)
         return false;
       else if (bucketB < bucketA)
@@ -1043,9 +971,10 @@ static void sortRecursive(const Options &options, Group *group,
 }
 
 void CodeCompletionOrganizer::Impl::sort(Options options) {
-  sortRecursive(options, rootGroup.get(), completionHasExpectedTypes);
+  bool hasRequiredTypes = typeContextKind == TypeContextKind::Required;
+  sortRecursive(options, rootGroup.get(), hasRequiredTypes);
   if (options.showTopNonLiteralResults != 0)
-    sortTopN(options, rootGroup.get(), completionHasExpectedTypes);
+    sortTopN(options, rootGroup.get(), hasRequiredTypes);
 }
 
 void CodeCompletionOrganizer::Impl::groupStemsRecursive(
@@ -1174,105 +1103,12 @@ bool LimitedResultView::walk(CodeCompletionView::Walker &walker) const {
 // CompletionBuilder
 //===----------------------------------------------------------------------===//
 
-void CompletionBuilder::getFilterName(CodeCompletionString *str,
-                                      raw_ostream &OS) {
-  using ChunkKind = CodeCompletionString::Chunk::ChunkKind;
-
-  // FIXME: we need a more uniform way to handle operator completions.
-  if (str->getChunks().size() == 1 && str->getChunks()[0].is(ChunkKind::Dot)) {
-    OS << ".";
-    return;
-  } else if (str->getChunks().size() == 2 &&
-             str->getChunks()[0].is(ChunkKind::QuestionMark) &&
-             str->getChunks()[1].is(ChunkKind::Dot)) {
-    OS << "?.";
-    return;
-  }
-
-  auto FirstTextChunk = str->getFirstTextChunkIndex();
-  if (FirstTextChunk.hasValue()) {
-    for (auto C : str->getChunks().slice(*FirstTextChunk)) {
-
-      if (C.is(ChunkKind::BraceStmtWithCursor))
-        break; // Don't include brace-stmt in filter name.
-
-      if (C.is(ChunkKind::Equal)) {
-        OS << C.getText();
-        break;
-      }
-
-      bool shouldPrint = !C.isAnnotation();
-      switch (C.getKind()) {
-      case ChunkKind::TypeAnnotation:
-      case ChunkKind::CallParameterInternalName:
-      case ChunkKind::CallParameterClosureType:
-      case ChunkKind::CallParameterType:
-      case ChunkKind::DeclAttrParamColon:
-      case ChunkKind::Comma:
-      case ChunkKind::Whitespace:
-      case ChunkKind::Ellipsis:
-      case ChunkKind::Ampersand:
-        continue;
-      case ChunkKind::CallParameterColon:
-        // Since we don't add the type, also don't add the space after ':'.
-        if (shouldPrint)
-          OS << ":";
-        continue;
-      default:
-        break;
-      }
-
-      if (C.hasText() && shouldPrint)
-        OS << C.getText();
-    }
-  }
-}
-
-void CompletionBuilder::getDescription(SwiftResult *result, raw_ostream &OS,
-                                       bool leadingPunctuation) {
-  auto str = result->getCompletionString();
-  bool isOperator = result->isOperator();
-
-  auto FirstTextChunk = str->getFirstTextChunkIndex(leadingPunctuation);
-  int TextSize = 0;
-  if (FirstTextChunk.hasValue()) {
-    for (auto C : str->getChunks().slice(*FirstTextChunk)) {
-      using ChunkKind = CodeCompletionString::Chunk::ChunkKind;
-
-      // FIXME: we need a more uniform way to handle operator completions.
-      if (C.is(ChunkKind::Equal))
-        isOperator = true;
-
-      if (C.is(ChunkKind::TypeAnnotation) ||
-          C.is(ChunkKind::CallParameterClosureType) ||
-          C.is(ChunkKind::Whitespace))
-        continue;
-      if (isOperator && C.is(ChunkKind::CallParameterType))
-        continue;
-      if (C.hasText()) {
-        TextSize += C.getText().size();
-        OS << C.getText();
-      }
-    }
-  }
-  assert((TextSize > 0) &&
-         "code completion result should have non-empty description!");
-}
-
-CompletionBuilder::CompletionBuilder(CompletionSink &sink, SwiftResult &base)
-    : sink(sink), current(base) {
-  isNotRecommended = current.isNotRecommended();
-  notRecommendedReason = current.getNotRecommendedReason();
-  semanticContext = current.getSemanticContext();
-  completionString =
-      const_cast<CodeCompletionString *>(current.getCompletionString());
-
-  // FIXME: this works around the fact we're producing invalid completion
-  // strings for our inner "." result.
-  if (current.getCompletionString()->getFirstTextChunkIndex().hasValue()) {
-    llvm::raw_svector_ostream OSS(originalName);
-    getFilterName(current.getCompletionString(), OSS);
-  }
+CompletionBuilder::CompletionBuilder(CompletionSink &sink,
+                                     const SwiftResult &base)
+    : sink(sink), base(base) {
+  semanticContext = base.getSemanticContext();
+  flair = base.getFlair();
+  completionString = nullptr;
 }
 
 void CompletionBuilder::setPrefix(CodeCompletionString *prefix) {
@@ -1291,47 +1127,58 @@ void CompletionBuilder::setPrefix(CodeCompletionString *prefix) {
     chunks.push_back(chunk);
   }
 
-  auto existing = current.getCompletionString()->getChunks();
+  auto existing = base.getCompletionString()->getChunks();
   chunks.insert(chunks.end(), existing.begin(), existing.end());
   completionString = CodeCompletionString::create(sink.allocator, chunks);
 }
 
 Completion *CompletionBuilder::finish() {
-  SwiftResult base = current;
+  const SwiftResult *newBase = &this->base;
   llvm::SmallString<64> nameStorage;
-  StringRef name = getOriginalName();
   if (modified) {
     // We've modified the original result, so build a new one.
     auto opKind = CodeCompletionOperatorKind::None;
-    if (current.isOperator())
-      opKind = current.getOperatorKind();
+    if (base.isOperator())
+      opKind = base.getOperatorKind();
 
-    if (current.getKind() == SwiftResult::Declaration) {
-      base = SwiftResult(
-          semanticContext, current.getNumBytesToErase(), completionString,
-          current.getAssociatedDeclKind(), current.getModuleName(),
-          isNotRecommended, notRecommendedReason, current.getBriefDocComment(),
-          current.getAssociatedUSRs(), current.getDeclKeywords(), opKind);
-    } else {
-      base = SwiftResult(current.getKind(), semanticContext,
-                         current.getNumBytesToErase(), completionString,
-                         current.getExpectedTypeRelation(), opKind);
+    const ContextFreeCodeCompletionResult &contextFreeBase =
+        base.getContextFreeResult();
+
+    auto *newCompletionString = contextFreeBase.getCompletionString();
+    auto newFilterName = contextFreeBase.getFilterName();
+    if (completionString) {
+      newCompletionString = completionString;
+      newFilterName =
+          getCodeCompletionResultFilterName(completionString, sink.allocator);
     }
 
-    llvm::raw_svector_ostream OSS(nameStorage);
-    getFilterName(base.getCompletionString(), OSS);
-    name = OSS.str();
+    ContextFreeCodeCompletionResult *contextFreeResult =
+        new (sink.allocator) ContextFreeCodeCompletionResult(
+            contextFreeBase.getKind(),
+            contextFreeBase.getOpaqueAssociatedKind(), opKind,
+            contextFreeBase.getMacroRoles(), contextFreeBase.isSystem(),
+            contextFreeBase.hasAsyncAlternative(),
+            newCompletionString, contextFreeBase.getModuleName(),
+            contextFreeBase.getBriefDocComment(),
+            contextFreeBase.getAssociatedUSRs(),
+            contextFreeBase.getResultType(),
+            contextFreeBase.getNotRecommendedReason(),
+            contextFreeBase.getDiagnosticSeverity(),
+            contextFreeBase.getDiagnosticMessage(), newFilterName,
+            contextFreeBase.getNameForDiagnostics());
+    newBase = base.withContextFreeResultSemanticContextAndFlair(
+        *contextFreeResult, semanticContext, flair, sink.swiftSink);
   }
 
   llvm::SmallString<64> description;
   {
     llvm::raw_svector_ostream OSS(description);
-    getDescription(&base, OSS, /*leadingPunctuation*/ true);
+    ide::printCodeCompletionResultDescription(*newBase, OSS,
+                                              /*leadingPunctuation=*/true);
   }
 
   auto *result = new (sink.allocator)
-      Completion(std::move(base), copyString(sink.allocator, name),
-                 copyString(sink.allocator, description));
+      Completion(*newBase, description.str().copy(sink.allocator));
   result->moduleImportDepth = moduleImportDepth;
   result->popularityFactor = popularityFactor;
   result->opaqueCustomKind = customKind;

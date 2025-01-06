@@ -4,7 +4,7 @@ struct G<T> {}
 
 extension G {
   struct H<U> {
-    func usesBoth<T, U>(t: T, u: U) -> (T, U) {}
+    func usesBoth<T1, U1>(t: T1, u: U1) -> (T1, U1) {}
   }
 }
 
@@ -13,9 +13,9 @@ extension { // expected-error {{expected type name in extension declaration}}
     func foo(t: T) {}
   }
 
-  class M : S {} // expected-error {{use of undeclared type 'S'}}
+  class M : S {}
 
-  protocol P { // expected-error {{protocol 'P' cannot be nested inside another declaration}}
+  protocol P {
     associatedtype A
   }
 }

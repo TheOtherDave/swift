@@ -12,111 +12,180 @@
 //
 // This file defines the SubstitutionMap class.
 //
-// This is a data structure type describing the mapping of abstract types to
-// replacement types, together with associated conformances to use for deriving
-// nested types.
-//
-// Depending on how the SubstitutionMap is constructed, the abstract types are
-// either archetypes or interface types. Care must be exercised to only look up
-// one or the other.
-//
-// SubstitutionMaps are constructed by calling the getSubstitutionMap() method
-// on a GenericSignature or GenericEnvironment.
-//
 //===----------------------------------------------------------------------===//
 
 #ifndef SWIFT_AST_SUBSTITUTION_MAP_H
 #define SWIFT_AST_SUBSTITUTION_MAP_H
 
+#include "swift/AST/GenericSignature.h"
 #include "swift/AST/ProtocolConformanceRef.h"
 #include "swift/AST/Type.h"
+#include "swift/AST/TypeExpansionContext.h"
+#include "swift/Basic/Debug.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/Optional.h"
-#include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/DenseMapInfo.h"
+#include <optional>
+
+namespace llvm {
+  class FoldingSetNodeID;
+}
 
 namespace swift {
 
-class GenericSignature;
 class GenericEnvironment;
+class GenericParamList;
+class RecursiveTypeProperties;
 class SubstitutableType;
 typedef CanTypeWrapper<GenericTypeParamType> CanGenericTypeParamType;
 
 template<class Type> class CanTypeWrapper;
 typedef CanTypeWrapper<SubstitutableType> CanSubstitutableType;
 
-enum class CombineSubstitutionMaps {
-  AtDepth,
-  AtIndex
-};
-
+/// SubstitutionMap is a data structure type that describes the mapping of
+/// abstract types to replacement types, together with associated conformances
+/// to use for deriving nested types and conformances.
+///
+/// Substitution maps are primarily used when performing substitutions into
+/// any entity that can reference type parameters, e.g., types (via
+/// Type::subst()) and conformances (via ProtocolConformanceRef::subst()).
+///
+/// SubstitutionMaps are constructed by calling the an overload of the static
+/// method \c SubstitutionMap::get(). However, most substitution maps are
+/// computed using higher-level entry points such as
+/// TypeBase::getContextSubstitutionMap().
+///
+/// Substitution maps are ASTContext-allocated and are uniqued on construction,
+/// so they can be used as fields in AST nodes.
 class SubstitutionMap {
-  /// The generic signature for which we are performing substitutions.
-  GenericSignature *genericSig;
+public:
+  /// Stored data for a substitution map, which uses tail allocation for the
+  /// replacement types and conformances.
+  class Storage;
 
-  /// The replacement types for the generic type parameters.
-  std::unique_ptr<Type[]> replacementTypes;
-
-  // FIXME: Switch to a more efficient representation that corresponds to
-  // the conformance requirements in the GenericSignature.
-  llvm::DenseMap<TypeBase *, SmallVector<ProtocolConformanceRef, 1>>
-    conformanceMap;
-
-  /// Retrieve the array of replacement types, which line up with the
-  /// generic parameters.
+private:
+  /// The storage needed to describe the set of substitutions.
   ///
-  /// Note that the types may be null, for cases where the generic parameter
-  /// is concrete but hasn't been queried yet.
-  ArrayRef<Type> getReplacementTypes() const;
+  /// When null, this substitution map is empty, having neither a generic
+  /// signature nor any replacement types/conformances.
+  Storage *storage = nullptr;
 
-  MutableArrayRef<Type> getReplacementTypes();
+  /// Form a substitution map for the given generic signature with the
+  /// specified replacement types and conformances.
+  SubstitutionMap(GenericSignature genericSig,
+                  ArrayRef<Type> replacementTypes,
+                  ArrayRef<ProtocolConformanceRef> conformances);
+
+  explicit SubstitutionMap(Storage *storage) : storage(storage) { }
 
 public:
-  SubstitutionMap()
-    : SubstitutionMap(static_cast<GenericSignature *>(nullptr)) { }
+  /// Build an empty substitution map.
+  SubstitutionMap() { }
 
-  SubstitutionMap(GenericSignature *genericSig);
+  /// The primitive constructor.
+  static SubstitutionMap get(GenericSignature genericSig,
+                             ArrayRef<Type> replacementTypes,
+                             ArrayRef<ProtocolConformanceRef> conformances) {
+    return SubstitutionMap(genericSig, replacementTypes, conformances);
+  }
 
-  SubstitutionMap(GenericEnvironment *genericEnv);
+  /// Translate a substitution map from one generic signature to another
+  /// "compatible" one. Think carefully before using this.
+  static SubstitutionMap get(GenericSignature genericSig,
+                             SubstitutionMap substitutions);
 
-  SubstitutionMap(SubstitutionMap &&other) = default;
-  SubstitutionMap &operator=(SubstitutionMap &&other) = default;
+  /// General form that takes two callbacks.
+  static SubstitutionMap get(GenericSignature genericSig,
+                             TypeSubstitutionFn subs,
+                             LookupConformanceFn lookupConformance);
 
-  SubstitutionMap(const SubstitutionMap &other);
+  /// Takes an array of replacement types already in the correct form, together
+  /// with a conformance lookup callback.
+  static SubstitutionMap get(GenericSignature genericSig,
+                             ArrayRef<Type> replacementTypes,
+                             LookupConformanceFn lookupConformance);
 
-  SubstitutionMap &operator=(const SubstitutionMap &other);
+  /// Build a substitution map from the substitutions represented by
+  /// the given in-flight substitution.
+  ///
+  /// This function should generally only be used by the substitution
+  /// subsystem.
+  static SubstitutionMap get(GenericSignature genericSig,
+                             ArrayRef<Type> replacementTypes,
+                             InFlightSubstitution &IFS);
 
-  ~SubstitutionMap();
+  /// Build a substitution map from the substitutions represented by
+  /// the given in-flight substitution.
+  ///
+  /// This function should generally only be used by the substitution
+  /// subsystem.
+  static SubstitutionMap get(GenericSignature genericSig,
+                             InFlightSubstitution &IFS);
 
   /// Retrieve the generic signature describing the environment in which
   /// substitutions occur.
-  GenericSignature *getGenericSignature() const { return genericSig; }
+  GenericSignature getGenericSignature() const;
 
-  Optional<ProtocolConformanceRef>
-  lookupConformance(CanType type, ProtocolDecl *proto) const;
+  /// Retrieve the array of protocol conformances, which line up with the
+  /// requirements of the generic signature.
+  ArrayRef<ProtocolConformanceRef> getConformances() const;
+
+  /// Look up a conformance for the given type to the given protocol.
+  ProtocolConformanceRef lookupConformance(CanType type,
+                                           ProtocolDecl *proto) const;
 
   /// Whether the substitution map is empty.
-  bool empty() const { return getGenericSignature() == nullptr; }
+  bool empty() const;
 
-  /// Query whether any replacement types in the map contain archetypes.
-  bool hasArchetypes() const;
+  /// Whether the substitution has any substitutable parameters, i.e.,
+  /// it is non-empty and at least one of the type parameters can be
+  /// substituted (i.e., is not mapped to a concrete type).
+  bool hasAnySubstitutableParams() const;
+  
+  /// True if this substitution map is an identity mapping.
+  bool isIdentity() const;
 
-  /// Query whether any replacement types in the map contain an opened
-  /// existential.
-  bool hasOpenedExistential() const;
+  /// Whether the substitution map is non-empty.
+  explicit operator bool() const { return !empty(); }
 
-  /// Query whether any replacement type sin the map contain dynamic Self.
-  bool hasDynamicSelf() const;
+  /// Retrieve the array of replacement types, which line up with the
+  /// generic parameters.
+  ArrayRef<Type> getReplacementTypes() const;
+
+  /// Retrieve the array of replacement types for the innermost generic
+  /// parameters.
+  ArrayRef<Type> getInnermostReplacementTypes() const;
+
+  RecursiveTypeProperties getRecursiveProperties() const;
+
+  /// Whether the replacement types are all canonical.
+  bool isCanonical() const;
+
+  /// Return the canonical form of this substitution map.
+  SubstitutionMap getCanonical(bool canonicalizeSignature = true) const;
 
   /// Apply a substitution to all replacement types in the map. Does not
   /// change keys.
-  SubstitutionMap subst(const SubstitutionMap &subMap) const;
+  SubstitutionMap subst(SubstitutionMap subMap,
+                        SubstOptions options = std::nullopt) const;
 
   /// Apply a substitution to all replacement types in the map. Does not
   /// change keys.
   SubstitutionMap subst(TypeSubstitutionFn subs,
-                        LookupConformanceFn conformances) const;
+                        LookupConformanceFn conformances,
+                        SubstOptions options = std::nullopt) const;
+
+  /// Apply an in-flight substitution to all replacement types in the map.
+  /// Does not change keys.
+  ///
+  /// This should generally not be used outside of the substitution
+  /// subsystem.
+  SubstitutionMap subst(InFlightSubstitution &subs) const;
+
+  /// Apply type expansion lowering to all types in the substitution map. Opaque
+  /// archetypes will be lowered to their underlying types if the type expansion
+  /// context allows.
+  SubstitutionMap mapIntoTypeExpansionContext(
+      TypeExpansionContext context) const;
 
   /// Create a substitution map for a protocol conformance.
   static SubstitutionMap
@@ -130,45 +199,59 @@ public:
   /// written in terms of the generic signature of 'baseDecl'.
   static SubstitutionMap
   getOverrideSubstitutions(const ValueDecl *baseDecl,
-                           const ValueDecl *derivedDecl,
-                           Optional<SubstitutionMap> derivedSubs);
+                           const ValueDecl *derivedDecl);
 
   /// Variant of the above for when we have the generic signatures but not
   /// the decls for 'derived' and 'base'.
   static SubstitutionMap
-  getOverrideSubstitutions(const ClassDecl *baseClass,
-                           const ClassDecl *derivedClass,
-                           GenericSignature *baseSig,
-                           GenericSignature *derivedSig,
-                           Optional<SubstitutionMap> derivedSubs);
+  getOverrideSubstitutions(const NominalTypeDecl *baseNominal,
+                           const NominalTypeDecl *derivedNominal,
+                           GenericSignature baseSig,
+                           const GenericParamList *derivedParams);
 
-  /// Combine two substitution maps as follows.
-  ///
-  /// The result is written in terms of the generic parameters of 'genericSig'.
-  ///
-  /// Generic parameters with a depth or index less than 'firstDepthOrIndex'
-  /// come from 'firstSubMap'.
-  ///
-  /// Generic parameters with a depth greater than 'firstDepthOrIndex' come
-  /// from 'secondSubMap', but are looked up starting with a depth or index of
-  /// 'secondDepthOrIndex'.
-  ///
-  /// The 'how' parameter determines if we're looking at the depth or index.
-  static SubstitutionMap
-  combineSubstitutionMaps(const SubstitutionMap &firstSubMap,
-                          const SubstitutionMap &secondSubMap,
-                          CombineSubstitutionMaps how,
-                          unsigned baseDepthOrIndex,
-                          unsigned origDepthOrIndex,
-                          GenericSignature *genericSig);
+  /// Swap archetypes in the substitution map's replacement types with their
+  /// interface types.
+  SubstitutionMap mapReplacementTypesOutOfContext() const;
 
-  /// Verify that this substitution map is valid.
-  void verify() const;
+  /// Verify that the conformances stored in this substitution map match the
+  /// replacement types provided.
+  void verify(bool allowInvalid=true) const;
 
+  /// Whether to dump the full substitution map, or just a minimal useful subset
+  /// (on a single line).
+  enum class DumpStyle { Minimal, Full };
   /// Dump the contents of this substitution map for debugging purposes.
-  void dump(llvm::raw_ostream &out) const;
+  void dump(llvm::raw_ostream &out, DumpStyle style = DumpStyle::Full,
+            unsigned indent = 0) const;
 
-  LLVM_ATTRIBUTE_DEPRECATED(void dump() const, "only for use in the debugger");
+  SWIFT_DEBUG_DUMP;
+
+  /// Profile the substitution map, for use with LLVM's FoldingSet.
+  void profile(llvm::FoldingSetNodeID &id) const;
+
+  const void *getOpaqueValue() const { return storage; }
+
+  static SubstitutionMap getFromOpaqueValue(const void *ptr) {
+    return SubstitutionMap(const_cast<Storage *>((const Storage *)ptr));
+  }
+
+  static SubstitutionMap getEmptyKey() {
+    return SubstitutionMap(
+             (Storage *)llvm::DenseMapInfo<void*>::getEmptyKey());
+  }
+
+  static SubstitutionMap getTombstoneKey() {
+    return SubstitutionMap(
+               (Storage *)llvm::DenseMapInfo<void*>::getTombstoneKey());
+  }
+
+  friend bool operator ==(SubstitutionMap lhs, SubstitutionMap rhs) {
+    return lhs.storage == rhs.storage;
+  }
+
+  friend bool operator !=(SubstitutionMap lhs, SubstitutionMap rhs) {
+    return lhs.storage != rhs.storage;
+  }
 
 private:
   friend class GenericSignature;
@@ -179,16 +262,124 @@ private:
   /// Note that this only finds replacements for maps that are directly
   /// stored inside the map. In most cases, you should call Type::subst()
   /// instead, since that will resolve member types also.
-  Type lookupSubstitution(CanSubstitutableType type) const;
+  Type lookupSubstitution(GenericTypeParamType *type) const;
+};
 
-  // You should not need to call these directly to build SubstitutionMaps;
-  // instead, use GenericSignature::getSubstitutionMap() or
-  // GenericEnvironment::getSubstitutionMap().
+inline llvm::raw_ostream &operator<<(llvm::raw_ostream &OS,
+                                     const SubstitutionMap &subs) {
+  subs.dump(OS);
+  return OS;
+}
 
-  void addSubstitution(CanGenericTypeParamType type, Type replacement);
-  void addConformance(CanType type, ProtocolConformanceRef conformance);
+/// A function object suitable for use as a \c TypeSubstitutionFn that
+/// queries an array of replacement types.
+struct QueryReplacementTypeArray {
+  GenericSignature sig;
+  ArrayRef<Type> types;
+
+  Type operator()(SubstitutableType *type) const;
+};
+
+/// A function object suitable for use as a \c TypeSubstitutionFn that
+/// queries an underlying \c SubstitutionMap.
+struct QuerySubstitutionMap {
+  SubstitutionMap subMap;
+
+  Type operator()(SubstitutableType *type) const;
+};
+
+/// Functor class suitable for use as a \c LookupConformanceFn to look up a
+/// conformance in a \c SubstitutionMap.
+class LookUpConformanceInSubstitutionMap {
+  SubstitutionMap Subs;
+public:
+  explicit LookUpConformanceInSubstitutionMap(SubstitutionMap Subs)
+    : Subs(Subs) {}
+
+  ProtocolConformanceRef operator()(CanType dependentType,
+                                    Type conformingReplacementType,
+                                    ProtocolDecl *conformedProtocol) const;
+};
+
+struct OverrideSubsInfo {
+  ASTContext &Ctx;
+  unsigned BaseDepth;
+  unsigned OrigDepth;
+  SubstitutionMap BaseSubMap;
+  const GenericParamList *DerivedParams;
+
+  OverrideSubsInfo(const NominalTypeDecl *baseNominal,
+                   const NominalTypeDecl *derivedNominal,
+                   GenericSignature baseSig,
+                   const GenericParamList *derivedParams);
+};
+
+struct QueryOverrideSubs {
+  OverrideSubsInfo info;
+
+  explicit QueryOverrideSubs(const OverrideSubsInfo &info)
+    : info(info) {}
+
+  Type operator()(SubstitutableType *type) const;
+};
+
+struct LookUpConformanceInOverrideSubs {
+  OverrideSubsInfo info;
+
+  explicit LookUpConformanceInOverrideSubs(const OverrideSubsInfo &info)
+    : info(info) {}
+
+  ProtocolConformanceRef operator()(CanType type,
+                                    Type substType,
+                                    ProtocolDecl *proto) const;
+};
+
+// Substitute the outer generic parameters from a substitution map, ignoring
+/// inner generic parameters with a given depth.
+struct OuterSubstitutions {
+  SubstitutionMap subs;
+  unsigned depth;
+
+  bool isUnsubstitutedTypeParameter(Type type) const;
+  Type operator()(SubstitutableType *type) const;
+  ProtocolConformanceRef operator()(CanType dependentType,
+                                    Type conformingReplacementType,
+                                    ProtocolDecl *conformedProtocol) const;
 };
 
 } // end namespace swift
+
+namespace llvm {
+  template <>
+  struct PointerLikeTypeTraits<swift::SubstitutionMap> {
+    static void *getAsVoidPointer(swift::SubstitutionMap map) {
+      return const_cast<void *>(map.getOpaqueValue());
+    }
+    static swift::SubstitutionMap getFromVoidPointer(const void *ptr) {
+      return swift::SubstitutionMap::getFromOpaqueValue(ptr);
+    }
+
+    /// Note: Assuming storage is at least 4-byte aligned.
+    enum { NumLowBitsAvailable = 2 };
+  };
+
+  // Substitution maps hash just like pointers.
+  template<> struct DenseMapInfo<swift::SubstitutionMap> {
+    static swift::SubstitutionMap getEmptyKey() {
+      return swift::SubstitutionMap::getEmptyKey();
+    }
+    static swift::SubstitutionMap getTombstoneKey() {
+      return swift::SubstitutionMap::getTombstoneKey();
+    }
+    static unsigned getHashValue(swift::SubstitutionMap map) {
+      return DenseMapInfo<void*>::getHashValue(map.getOpaqueValue());
+    }
+    static bool isEqual(swift::SubstitutionMap lhs,
+                        swift::SubstitutionMap rhs) {
+      return lhs.getOpaqueValue() == rhs.getOpaqueValue();
+    }
+  };
+
+}
 
 #endif

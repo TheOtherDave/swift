@@ -20,12 +20,14 @@
 
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/OptionSet.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/Support/Allocator.h"
 #include <iterator>
+#include <optional>
 #include <string>
 
 namespace swift {
@@ -37,16 +39,10 @@ namespace swift {
   /// Determine whether the given string can be the name of a member.
   bool canBeMemberName(StringRef identifier);
 
-  /// Describes the kind of preposition a word is.
-  enum PrepositionKind {
-    PK_None = 0,
-    PK_Directional,
-    PK_Nondirectional
-  };
-
-  /// Determine what kind of preposition the given word is, if any,
-  /// ignoring case.
-  PrepositionKind getPrepositionKind(StringRef word);
+  /// Returns true if the given word is one of Swift's known prepositions.
+  ///
+  /// This can be faster than getPartOfSpeech(StringRef).
+  bool isPreposition(StringRef word);
 
   /// Describes the part of speech of a particular word.
   enum class PartOfSpeech {
@@ -59,12 +55,18 @@ namespace swift {
   /// Determine the part of speech for the given word.
   PartOfSpeech getPartOfSpeech(StringRef word);
 
+  /// Copy \p string to \p Allocator and return it as a null terminated C
+  /// string.
+  const char *copyCString(StringRef string, llvm::BumpPtrAllocator &Allocator);
+
   /// Scratch space used for returning a set of StringRefs.
   class StringScratchSpace {
     llvm::BumpPtrAllocator Allocator;
 
   public:
-    StringRef copyString(StringRef string);
+    StringRef copyString(StringRef string) { return string.copy(Allocator); }
+
+    llvm::BumpPtrAllocator &getAllocator() { return Allocator; }
   };
 
   namespace camel_case {
@@ -100,11 +102,11 @@ namespace swift {
       };
 
     public:
-      typedef StringRef value_type;
-      typedef StringRef reference;
-      typedef ArrowProxy pointer;
-      typedef int difference_type;
-      typedef std::bidirectional_iterator_tag iterator_category;
+      using value_type = StringRef;
+      using reference = StringRef;
+      using pointer = ArrowProxy;
+      using difference_type = int;
+      using iterator_category = std::bidirectional_iterator_tag;
 
       WordIterator(StringRef string, unsigned position)
         : String(string), Position(position) 
@@ -209,11 +211,11 @@ namespace swift {
       StringRef String;
 
     public:
-      typedef WordIterator iterator;
-      typedef WordIterator const_iterator;
-      typedef std::reverse_iterator<WordIterator> reverse_iterator;
-      typedef std::reverse_iterator<WordIterator> const_reverse_iterator;
-      
+      using iterator = WordIterator;
+      using const_iterator = WordIterator;
+      using reverse_iterator = std::reverse_iterator<WordIterator>;
+      using const_reverse_iterator = std::reverse_iterator<WordIterator>;
+
       explicit Words(StringRef string) : String(string) { }
 
       bool empty() const { return String.empty(); }
@@ -223,6 +225,8 @@ namespace swift {
 
       reverse_iterator rbegin() const { return reverse_iterator(end()); }
       reverse_iterator rend() const { return reverse_iterator(begin()); }
+
+      bool hasWordStartingAt(unsigned targetPosition) const;
     };
 
     /// Retrieve the camelCase words in the given string.
@@ -235,6 +239,10 @@ namespace swift {
     /// Check whether the first word starts with the second word, ignoring the
     /// case of the first letter.
     bool startsWithIgnoreFirstCase(StringRef word1, StringRef word2);
+
+    /// Check whether the first word ends with the second word, ignoring the
+    /// case of the first word (handles initialisms).
+    bool hasWordSuffix(StringRef haystack, StringRef needle);
 
     /// Lowercase the first word within the given camelCase string.
     ///
@@ -314,29 +322,6 @@ namespace swift {
     size_t findWord(StringRef string, StringRef word);
   } // end namespace camel_case
 
-/// Describes the role that a particular name has within a
-/// signature, which can affect how we omit needless words.
-enum class NameRole {
-  /// The base name of a function or method.
-  BaseName,
-
-  /// The base name of a method where the omission type name is the
-  /// 'self' type.
-  BaseNameSelf,
-
-  /// The first parameter of a function or method.
-  FirstParameter,
-
-  // Subsequent parameters in a function or method.
-  SubsequentParameter,
-
-  // The name of a property.
-  Property,
-
-  // A partial name; used internally.
-  Partial,
-};
-
 /// Flags used by \c OmissionTypeName to describe the input type.
 enum class OmissionTypeFlags {
   /// Whether the parameter with this type has a default argument.
@@ -350,7 +335,7 @@ enum class OmissionTypeFlags {
 };
 
 /// Options that described omitted types.
-typedef OptionSet<OmissionTypeFlags> OmissionTypeOptions;
+using OmissionTypeOptions = OptionSet<OmissionTypeFlags>;
 
 /// Describes the name of a type as is used for omitting needless
 /// words.
@@ -366,16 +351,14 @@ struct OmissionTypeName {
 
   /// Construct a type name.
   OmissionTypeName(StringRef name = StringRef(),
-                   OmissionTypeOptions options = None,
+                   OmissionTypeOptions options = std::nullopt,
                    StringRef collectionElement = StringRef())
-    : Name(name), CollectionElement(collectionElement),
-      Options(options) { }
+      : Name(name), CollectionElement(collectionElement), Options(options) {}
 
   /// Construct a type name.
-  OmissionTypeName(const char * name, OmissionTypeOptions options = None,
+  OmissionTypeName(const char *name, OmissionTypeOptions options = std::nullopt,
                    StringRef collectionElement = StringRef())
-    : Name(name), CollectionElement(collectionElement),
-      Options(options) { }
+      : Name(name), CollectionElement(collectionElement), Options(options) {}
 
   /// Produce a new type name for omission with a default argument.
   OmissionTypeName withDefaultArgument(bool defaultArgument = true) {
@@ -430,11 +413,13 @@ StringRef matchLeadingTypeName(StringRef name, OmissionTypeName typeName);
 /// Describes a set of names with an inheritance relationship.
 class InheritedNameSet {
   const InheritedNameSet *Parent;
-  llvm::StringSet<> Names;
+  llvm::StringSet<llvm::BumpPtrAllocator &> Names;
 
 public:
   /// Construct a new inherited name set with the given parent.
-  explicit InheritedNameSet(const InheritedNameSet *parent) : Parent(parent) { }
+  InheritedNameSet(const InheritedNameSet *parent,
+                   llvm::BumpPtrAllocator &allocator)
+      : Parent(parent), Names(allocator) { }
 
   // Add a new name to the set.
   void add(StringRef name);
@@ -468,20 +453,86 @@ public:
 ///
 /// \param allPropertyNames The set of property names in the enclosing context.
 ///
+/// \param completionHandlerIndex For an 'async' function, the index of the
+/// completion handler in argNames.
+///
 /// \param scratch Scratch space that will be used for modifications beyond
 /// just chopping names.
 ///
 /// \returns true if any words were omitted, false otherwise.
-bool omitNeedlessWords(StringRef &baseName,
-                       MutableArrayRef<StringRef> argNames,
-                       StringRef firstParamName,
-                       OmissionTypeName resultType,
+bool omitNeedlessWords(StringRef &baseName, MutableArrayRef<StringRef> argNames,
+                       StringRef firstParamName, OmissionTypeName resultType,
                        OmissionTypeName contextType,
-                       ArrayRef<OmissionTypeName> paramTypes,
-                       bool returnsSelf,
+                       ArrayRef<OmissionTypeName> paramTypes, bool returnsSelf,
                        bool isProperty,
                        const InheritedNameSet *allPropertyNames,
+                       std::optional<unsigned> completionHandlerIndex,
+                       std::optional<StringRef> completionHandlerName,
                        StringScratchSpace &scratch);
+
+/// If the name has a completion-handler suffix, strip off that suffix.
+std::optional<StringRef> stripWithCompletionHandlerSuffix(StringRef name);
+
+/// Represents a string that can be efficiently retrieved either as a StringRef
+/// or as a null-terminated C string.
+class NullTerminatedStringRef {
+  StringRef Ref;
+
+public:
+  /// Create a \c NullTerminatedStringRef from a null-terminated C string with
+  /// size \p Size (excluding the null character).
+  NullTerminatedStringRef(const char *Data, size_t Size) : Ref(Data, Size) {
+    assert(Data != nullptr && Data[Size] == '\0' &&
+           "Data should be null-terminated");
+  }
+
+  /// Create an empty null-terminated string. \c data() is not a \c nullptr.
+  constexpr NullTerminatedStringRef() : Ref("") {}
+
+  /// Create an null terminated string with a C string.
+  constexpr NullTerminatedStringRef(const char *Data) : Ref(Data) {}
+
+  /// Create a null-terminated string, copying \p Str into \p A .
+  template <typename Allocator>
+  NullTerminatedStringRef(llvm::Twine Str, Allocator &A) : Ref("") {
+    if (Str.isTriviallyEmpty())
+      return;
+    if (Str.isSingleStringLiteral()) {
+      Ref = Str.getSingleStringRef();
+      return;
+    }
+    llvm::SmallString<0> stash;
+    auto _ref = Str.toStringRef(stash);
+
+    size_t size = _ref.size();
+    if (size == 0)
+      return;
+    char *memory = static_cast<char *>(A.Allocate(size + 1, alignof(char)));
+    memcpy(memory, _ref.data(), size);
+    memory[size] = '\0';
+    Ref = {memory, size};
+  }
+
+  /// Returns the string as a `StringRef`. The `StringRef` does not include the
+  /// null character.
+  operator StringRef() const { return Ref; }
+
+  /// Returns the string as a null-terminated C string.
+  const char *data() const { return Ref.data(); }
+
+  /// The size of the string, excluding the null character.
+  size_t size() const { return Ref.size(); }
+
+  bool empty() const { return Ref.empty(); }
+  int compare(NullTerminatedStringRef RHS) const { return Ref.compare(RHS); }
+};
+
+/// A variant of write_escaped that does not escape Unicode characters - useful for generating JSON,
+/// where escaped Unicode characters lead to malformed/invalid JSON.
+void writeEscaped(llvm::StringRef Str, llvm::raw_ostream &OS);
+
+/// Whether the path components of `path` begin with those from `prefix`.
+bool pathStartsWith(StringRef prefix, StringRef path);
 
 } // end namespace swift
 

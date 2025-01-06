@@ -84,7 +84,7 @@ function(fix_imported_targets_for_xcode imported_targets)
     endif()
 
     # First check that we actually imported the configuration that LLVM said
-    # that we did. This is just a sanity check.
+    # that we did. This is just a soundness check.
     check_imported_target_has_imported_configuration(${target} ${LLVM_BUILD_TYPE_UPPER})
 
     # Then loop through all of the imported properties and translate.
@@ -100,8 +100,8 @@ macro(swift_common_xcode_cxx_config)
   # Force usage of Clang.
   set(CMAKE_XCODE_ATTRIBUTE_GCC_VERSION "com.apple.compilers.llvm.clang.1_0"
       CACHE STRING "Xcode Compiler")
-  # Use C++'11.
-  set(CMAKE_XCODE_ATTRIBUTE_CLANG_CXX_LANGUAGE_STANDARD "c++11"
+  # Use C++'14.
+  set(CMAKE_XCODE_ATTRIBUTE_CLANG_CXX_LANGUAGE_STANDARD "c++14"
       CACHE STRING "Xcode C++ Language Standard")
   # Use libc++.
   set(CMAKE_XCODE_ATTRIBUTE_CLANG_CXX_LIBRARY "libc++"

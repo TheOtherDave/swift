@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift %s
+// RUN: %target-typecheck-verify-swift
 
 precedencegroup BindingPrecedence {
   higherThan: DefaultPrecedence
@@ -17,7 +17,7 @@ struct M<L : P, R> {
   }
 }
 
-protocol P {
+protocol P { // expected-note {{where 'Self' = 'M<WritableKeyPath<X, Int>, Int>'}}
   associatedtype A
   associatedtype B
 
@@ -42,4 +42,4 @@ extension WritableKeyPath : P {
 struct X { var y: Int = 0 }
 var x = X()
 x ~> \X.y ≈> { a in a += 1; return 3 }
-// expected-error@-1 {{cannot convert call result type 'M<WritableKeyPath<X, Int>, _>' to expected type 'WritableKeyPath<_, _>'}}
+//expected-error@-1 {{referencing operator function '~>' on 'P' requires that 'M<WritableKeyPath<X, Int>, Int>' conform to 'P'}}

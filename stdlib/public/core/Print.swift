@@ -10,14 +10,16 @@
 //
 //===----------------------------------------------------------------------===//
 
+#if !SWIFT_STDLIB_STATIC_PRINT
+
 /// Writes the textual representations of the given items into the standard
 /// output.
 ///
 /// You can pass zero or more items to the `print(_:separator:terminator:)`
 /// function. The textual representation for each item is the same as that
-/// obtained by calling `String(item)`. The following example prints a string,
-/// a closed range of integers, and a group of floating-point values to
-/// standard output:
+/// obtained by calling `String(describing: item)`. The following example
+/// prints a string, a closed range of integers, and a group of floating-point
+/// values to standard output:
 ///
 ///     print("One two three four five")
 ///     // Prints "One two three four five"
@@ -49,7 +51,6 @@
 ///     space (`" "`).
 ///   - terminator: The string to print after all items have been printed. The
 ///     default is a newline (`"\n"`).
-@inline(never)
 public func print(
   _ items: Any...,
   separator: String = " ",
@@ -57,14 +58,12 @@ public func print(
 ) {
   if let hook = _playgroundPrintHook {
     var output = _TeeStream(left: "", right: _Stdout())
-    _print(
-      items, separator: separator, terminator: terminator, to: &output)
+    _print(items, separator: separator, terminator: terminator, to: &output)
     hook(output.left)
   }
   else {
     var output = _Stdout()
-    _print(
-      items, separator: separator, terminator: terminator, to: &output)
+    _print(items, separator: separator, terminator: terminator, to: &output)
   }
 }
 
@@ -82,7 +81,7 @@ public func print(
 ///     // Prints "One two three four five"
 ///
 ///     debugPrint(1...5)
-///     // Prints "CountableClosedRange(1...5)"
+///     // Prints "ClosedRange(1...5)"
 ///
 ///     debugPrint(1.0, 2.0, 3.0, 4.0, 5.0)
 ///     // Prints "1.0 2.0 3.0 4.0 5.0"
@@ -108,21 +107,19 @@ public func print(
 ///     space (`" "`).
 ///   - terminator: The string to print after all items have been printed. The
 ///     default is a newline (`"\n"`).
-@inline(never)
 public func debugPrint(
   _ items: Any...,
   separator: String = " ",
-  terminator: String = "\n") {
+  terminator: String = "\n"
+) {
   if let hook = _playgroundPrintHook {
     var output = _TeeStream(left: "", right: _Stdout())
-    _debugPrint(
-      items, separator: separator, terminator: terminator, to: &output)
+    _debugPrint(items, separator: separator, terminator: terminator, to: &output)
     hook(output.left)
   }
   else {
     var output = _Stdout()
-    _debugPrint(
-      items, separator: separator, terminator: terminator, to: &output)
+    _debugPrint(items, separator: separator, terminator: terminator, to: &output)
   }
 }
 
@@ -131,8 +128,8 @@ public func debugPrint(
 ///
 /// You can pass zero or more items to the `print(_:separator:terminator:to:)`
 /// function. The textual representation for each item is the same as that
-/// obtained by calling `String(item)`. The following example prints a closed
-/// range of integers to a string:
+/// obtained by calling `String(describing: item)`. The following example
+/// prints a closed range of integers to a string:
 ///
 ///     var range = "My range: "
 ///     print(1...5, to: &range)
@@ -163,9 +160,7 @@ public func debugPrint(
 ///     default is a newline (`"\n"`).
 ///   - output: An output stream to receive the text representation of each
 ///     item.
-@_inlineable // FIXME(sil-serialize-all)
-@inline(__always)
-public func print<Target : TextOutputStream>(
+public func print<Target: TextOutputStream>(
   _ items: Any...,
   separator: String = " ",
   terminator: String = "\n",
@@ -185,7 +180,7 @@ public func print<Target : TextOutputStream>(
 ///
 ///     var range = "My range: "
 ///     debugPrint(1...5, to: &range)
-///     // range == "My range: CountableClosedRange(1...5)\n"
+///     // range == "My range: ClosedRange(1...5)\n"
 ///
 /// To print the items separated by something other than a space, pass a string
 /// as `separator`.
@@ -212,21 +207,16 @@ public func print<Target : TextOutputStream>(
 ///     default is a newline (`"\n"`).
 ///   - output: An output stream to receive the text representation of each
 ///     item.
-@_inlineable // FIXME(sil-serialize-all)
-@inline(__always)
-public func debugPrint<Target : TextOutputStream>(
+public func debugPrint<Target: TextOutputStream>(
   _ items: Any...,
   separator: String = " ",
   terminator: String = "\n",
   to output: inout Target
 ) {
-  _debugPrint(
-    items, separator: separator, terminator: terminator, to: &output)
+  _debugPrint(items, separator: separator, terminator: terminator, to: &output)
 }
 
-@_versioned
-@inline(never)
-internal func _print<Target : TextOutputStream>(
+internal func _print<Target: TextOutputStream>(
   _ items: [Any],
   separator: String = " ",
   terminator: String = "\n",
@@ -243,9 +233,7 @@ internal func _print<Target : TextOutputStream>(
   output.write(terminator)
 }
 
-@_versioned
-@inline(never)
-internal func _debugPrint<Target : TextOutputStream>(
+internal func _debugPrint<Target: TextOutputStream>(
   _ items: [Any],
   separator: String = " ",
   terminator: String = "\n",
@@ -261,3 +249,5 @@ internal func _debugPrint<Target : TextOutputStream>(
   }
   output.write(terminator)
 }
+
+#endif

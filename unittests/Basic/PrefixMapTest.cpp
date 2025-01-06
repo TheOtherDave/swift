@@ -40,7 +40,7 @@ struct Tester {
   // Performs an insert operation and tests that the result matches what
   // we get from the std::map.
   void insert(StringRef key, int value) {
-    auto stdmapResult = StdMap.insert({key, value});
+    auto stdmapResult = StdMap.insert({key.str(), value});
     auto premapResult = PreMap.insert(asArray(key), value);
 
     // Whether or not we modified the map should be the same in both
@@ -57,9 +57,9 @@ struct Tester {
   // Tests that the result of a findPrefix matches what we expect from
   // the std::map.
   void find(StringRef key) {
-    auto stdmapResult = StdMap.lower_bound(key);
+    auto stdmapResult = StdMap.lower_bound(key.str());
     while (stdmapResult == StdMap.end() ||
-           !key.startswith(stdmapResult->first)) {
+           !key.starts_with(stdmapResult->first)) {
       if (stdmapResult == StdMap.begin()) {
         stdmapResult = StdMap.end();
         break;
@@ -73,13 +73,13 @@ struct Tester {
     EXPECT_EQ(hasStdmapEntry, bool(premapResult.first));
     if (!hasStdmapEntry) return;
 
-    assert(key.startswith(stdmapResult->first));
+    assert(key.starts_with(stdmapResult->first));
     auto stdmapValue = stdmapResult->second;
     EXPECT_EQ(stdmapValue, *premapResult.first);
     EXPECT_EQ(key.begin() + stdmapResult->first.size(), premapResult.second);
   }
 
-  // Perform a clear operation.  Tests that that actually clears out the map.
+  // Perform a clear operation.  Tests that the operation actually clears out the map.
   void clear() {
     StdMap.clear();
     PreMap.clear();

@@ -13,6 +13,35 @@
 //  This file implements the 'program counter simulation' for Swift.
 //  Based off the PlaygroundTransform, PCMacro instruments code to call
 //  functions at times that a debugger would show the program counter move.
+//  It can be used to collect and display information about the flow of control
+//  through Swift code in "live coding" environments like Playgrounds without
+//  resorting to more heavyweight mechanisms like profiling.
+//
+//  More specifically, this transformation inserts calls to visible functions
+//  with these names and signatures (other integer types should work too):
+//
+//      func __builtin_pc_before(
+//          _ startLine: Int, _ endLine: Int,
+//          _ startColumn: Int, _ endColumn: Int,
+//          _ moduleID: Int, _ fileID: Int
+//      ) -> Void
+//      func __builtin_pc_after(
+//          _ startLine: Int, _ endLine: Int,
+//          _ startColumn: Int, _ endColumn: Int,
+//          _ moduleID: Int, _ fileID: Int
+//      ) -> Void
+//
+//  The `startLine`, `endLine`, `startColumn`, and `endColumn` parameters are
+//  passed 1-based integer literals; 0 is used for invalid (i.e.
+//  compiler-generated) code. The `moduleID` and `fileID` parameters are passed
+//  the values of visible variables or constants named
+//  `__builtin_pg_module_<module name>` and
+//  `__builtin_pg_file_<file base name>`, or an integer literal 0 if suitable
+//  variables are not found.
+//
+//  The transform inserts these calls before and after each statement, as well
+//  as before and after expressions nested inside statements, such as `if` and
+//  `while` conditions and `var` and `let` initial values.
 //
 //===----------------------------------------------------------------------===//
 
@@ -25,7 +54,9 @@
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/Pattern.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
+#include "swift/Basic/Assertions.h"
 
 using namespace swift;
 using namespace swift::instrumenter_support;
@@ -38,13 +69,15 @@ namespace {
 
 class Instrumenter : InstrumenterBase {
 private:
-  ASTContext &Context;
-  DeclContext *TypeCheckDC;
   unsigned &TmpNameIndex;
+  DeclNameRef LogBeforeName;
+  DeclNameRef LogAfterName;
 
 public:
   Instrumenter(ASTContext &C, DeclContext *DC, unsigned &TmpNameIndex)
-      : Context(C), TypeCheckDC(DC), TmpNameIndex(TmpNameIndex) {}
+      : InstrumenterBase(C, DC), TmpNameIndex(TmpNameIndex),
+        LogBeforeName(C.getIdentifier("__builtin_pc_before")),
+        LogAfterName(C.getIdentifier("__builtin_pc_after")) {}
 
   Stmt *transformStmt(Stmt *S) {
     switch (S->getKind()) {
@@ -52,6 +85,8 @@ public:
       return S;
     case StmtKind::Brace:
       return transformBraceStmt(cast<BraceStmt>(S));
+    case StmtKind::Defer:
+      return transformDeferStmt(cast<DeferStmt>(S));
     case StmtKind::If:
       return transformIfStmt(cast<IfStmt>(S));
     case StmtKind::Guard:
@@ -108,10 +143,10 @@ public:
     transformStmtCondition(SC, IS->getStartLoc());
     IS->setCond(SC); // FIXME: is setting required?..
 
-    if (Stmt *TS = IS->getThenStmt()) {
-      Stmt *NTS = transformStmt(TS);
+    if (auto *TS = IS->getThenStmt()) {
+      auto *NTS = transformStmt(TS);
       if (NTS != TS) {
-        IS->setThenStmt(NTS);
+        IS->setThenStmt(cast<BraceStmt>(NTS));
       }
     }
 
@@ -153,8 +188,8 @@ public:
     transformStmtCondition(SC, GS->getStartLoc());
     GS->setCond(SC);
 
-    if (Stmt *BS = GS->getBody())
-      GS->setBody(transformStmt(BS));
+    if (BraceStmt *BS = GS->getBody())
+      GS->setBody(transformBraceStmt(BS));
     return GS;
   }
 
@@ -190,12 +225,12 @@ public:
 
       // point at the for stmt, to look nice
       SourceLoc StartLoc = FES->getStartLoc();
-      SourceLoc EndLoc = FES->getIterator()->getEndLoc();
+      SourceLoc EndLoc = FES->getParsedSequence()->getEndLoc();
       // FIXME: get the 'end' of the for stmt
-      // if (FD->getBodyResultTypeLoc().hasLocation()) {
-      //   EndLoc = FD->getBodyResultTypeLoc().getSourceRange().End;
+      // if (FD->getResultTypeRepr()) {
+      //   EndLoc = FD->getResultTypeSourceRange().End;
       // } else {
-      //   EndLoc = FD->getParameterLists().back()->getSourceRange().End;
+      //   EndLoc = FD->getParameters()->getSourceRange().End;
       // }
 
       if (StartLoc.isValid() && EndLoc.isValid()) {
@@ -272,7 +307,7 @@ public:
         DCS->setBody(NB);
       }
     }
-    for (CatchStmt *C : DCS->getCatches()) {
+    for (CaseStmt *C : DCS->getCatches()) {
       if (auto *CB = dyn_cast_or_null<BraceStmt>(C->getBody())) {
         BraceStmt *NCB = transformBraceStmt(CB);
         if (NCB != CB) {
@@ -282,30 +317,46 @@ public:
     }
     return DCS;
   }
+  
+  DeferStmt *transformDeferStmt(DeferStmt *DS) {
+    if (auto *FD = DS->getTempDecl()) {
+      // Temporarily unmark the DeferStmt's FuncDecl as implicit so it is
+      // transformed (as typically implicit Decls are skipped by the
+      // transformer).
+      auto Implicit = FD->isImplicit();
+      FD->setImplicit(false);
+      auto *D = transformDecl(FD);
+      D->setImplicit(Implicit);
+      assert(D == FD);
+    }
+    return DS;
+
+  }
 
   Decl *transformDecl(Decl *D) {
     if (D->isImplicit())
       return D;
     if (auto *FD = dyn_cast<FuncDecl>(D)) {
-      if (BraceStmt *B = FD->getBody()) {
-        BraceStmt *NB = transformBraceStmt(B);
+      if (BraceStmt *B = FD->getTypecheckedBody()) {
+        const ParameterList *PL = FD->getParameters();
+        BraceStmt *NB = transformBraceStmt(B, PL);
         // Since it would look strange going straight to the first line in a
         // function body, we throw in a before/after pointing at the function
         // decl at the start of the transformed body
         SourceLoc StartLoc = FD->getStartLoc();
         SourceLoc EndLoc = SourceLoc();
-        if (FD->getBodyResultTypeLoc().hasLocation()) {
-          EndLoc = FD->getBodyResultTypeLoc().getSourceRange().End;
+        if (FD->getResultTypeRepr()) {
+          EndLoc = FD->getResultTypeSourceRange().End;
         } else {
-          EndLoc = FD->getParameterLists().back()->getSourceRange().End;
+          EndLoc = FD->getParameters()->getSourceRange().End;
         }
 
         if (EndLoc.isValid())
           NB = prependLoggerCall(NB, {StartLoc, EndLoc});
 
         if (NB != B) {
-          FD->setBody(NB);
-          TypeChecker(Context).checkFunctionErrorHandling(FD);
+          FD->setBody(NB, AbstractFunctionDecl::BodyKind::TypeChecked);
+          TypeChecker::checkFunctionEffects(FD);
         }
       }
     } else if (auto *NTD = dyn_cast<NominalTypeDecl>(D)) {
@@ -317,7 +368,9 @@ public:
     return D;
   }
 
-  BraceStmt *transformBraceStmt(BraceStmt *BS, bool TopLevel = false) override {
+  BraceStmt *transformBraceStmt(BraceStmt *BS,
+                                const ParameterList *PL = nullptr,
+                                bool TopLevel = false) override {
     ArrayRef<ASTNode> OriginalElements = BS->getElements();
     SmallVector<swift::ASTNode, 3> Elements(OriginalElements.begin(),
                                             OriginalElements.end());
@@ -327,8 +380,8 @@ public:
       if (auto *E = Element.dyn_cast<Expr *>()) {
         E->walk(CF);
 
-        Added<Stmt *> LogBefore = buildLoggerCall(E->getSourceRange(), true);
-        Added<Stmt *> LogAfter = buildLoggerCall(E->getSourceRange(), false);
+        Added<Stmt *> LogBefore = buildLoggerCall(LogBeforeName, E->getSourceRange());
+        Added<Stmt *> LogAfter = buildLoggerCall(LogAfterName, E->getSourceRange());
 
         if (*LogBefore && *LogAfter) {
           Elements[EI] = *LogBefore;
@@ -349,12 +402,11 @@ public:
                                          : DeclNameLoc(),
                 true, // implicit
                 AccessSemantics::Ordinary, RS->getResult()->getType());
-            ReturnStmt *NRS = new (Context) ReturnStmt(SourceLoc(), DRE,
-                                                       true); // implicit
+            ReturnStmt *NRS = ReturnStmt::createImplicit(Context, DRE);
             Added<Stmt *> LogBefore =
-                buildLoggerCall(RS->getSourceRange(), true);
+                buildLoggerCall(LogBeforeName, RS->getSourceRange());
             Added<Stmt *> LogAfter =
-                buildLoggerCall(RS->getSourceRange(), false);
+                buildLoggerCall(LogAfterName, RS->getSourceRange());
             if (*LogBefore && *LogAfter) {
               Elements[EI] = *LogBefore;
               Elements.insert(Elements.begin() + (EI + 1), PV.first);
@@ -365,9 +417,9 @@ public:
             }
           } else {
             Added<Stmt *> LogBefore =
-                buildLoggerCall(RS->getSourceRange(), true);
+                buildLoggerCall(LogBeforeName, RS->getSourceRange());
             Added<Stmt *> LogAfter =
-                buildLoggerCall(RS->getSourceRange(), false);
+                buildLoggerCall(LogAfterName, RS->getSourceRange());
             if (*LogBefore && *LogAfter) {
               Elements[EI] = *LogBefore;
               Elements.insert(Elements.begin() + (EI + 1), *LogAfter);
@@ -376,8 +428,8 @@ public:
             }
           }
         } else if (auto *CS = dyn_cast<ContinueStmt>(S)) {
-          Added<Stmt *> LogBefore = buildLoggerCall(CS->getSourceRange(), true);
-          Added<Stmt *> LogAfter = buildLoggerCall(CS->getSourceRange(), false);
+          Added<Stmt *> LogBefore = buildLoggerCall(LogBeforeName, CS->getSourceRange());
+          Added<Stmt *> LogAfter = buildLoggerCall(LogAfterName, CS->getSourceRange());
           if (*LogBefore && *LogAfter) {
             Elements[EI] = *LogBefore;
             Elements.insert(Elements.begin() + (EI + 1), *LogAfter);
@@ -386,8 +438,8 @@ public:
           }
 
         } else if (auto *BS = dyn_cast<BreakStmt>(S)) {
-          Added<Stmt *> LogBefore = buildLoggerCall(BS->getSourceRange(), true);
-          Added<Stmt *> LogAfter = buildLoggerCall(BS->getSourceRange(), false);
+          Added<Stmt *> LogBefore = buildLoggerCall(LogBeforeName, BS->getSourceRange());
+          Added<Stmt *> LogAfter = buildLoggerCall(LogAfterName, BS->getSourceRange());
           if (*LogBefore && *LogAfter) {
             Elements[EI] = *LogBefore;
             Elements.insert(Elements.begin() + (EI + 1), *LogAfter);
@@ -396,8 +448,8 @@ public:
           }
 
         } else if (auto *FS = dyn_cast<FallthroughStmt>(S)) {
-          Added<Stmt *> LogBefore = buildLoggerCall(FS->getSourceRange(), true);
-          Added<Stmt *> LogAfter = buildLoggerCall(FS->getSourceRange(), false);
+          Added<Stmt *> LogBefore = buildLoggerCall(LogBeforeName, FS->getSourceRange());
+          Added<Stmt *> LogAfter = buildLoggerCall(LogAfterName, FS->getSourceRange());
           if (*LogBefore && *LogAfter) {
             Elements[EI] = *LogBefore;
             Elements.insert(Elements.begin() + (EI + 1), *LogAfter);
@@ -416,15 +468,15 @@ public:
         if (auto *PBD = dyn_cast<PatternBindingDecl>(D)) {
           // FIXME: Should iterate all var decls
           if (VarDecl *VD = PBD->getSingleVar()) {
-            if (VD->getParentInitializer()) {
+            if (VD->getParentExecutableInitializer()) {
 
               SourceRange SR = PBD->getSourceRange();
               if (!SR.isValid()) {
-                SR = PBD->getOrigInitRange(0);
+                SR = PBD->getOriginalInitRange(0);
               }
 
-              Added<Stmt *> LogBefore = buildLoggerCall(SR, true);
-              Added<Stmt *> LogAfter = buildLoggerCall(SR, false);
+              Added<Stmt *> LogBefore = buildLoggerCall(LogBeforeName, SR);
+              Added<Stmt *> LogAfter = buildLoggerCall(LogAfterName, SR);
 
               if (*LogBefore && *LogAfter) {
                 Elements[EI] = *LogBefore;
@@ -446,11 +498,9 @@ public:
 
   std::pair<PatternBindingDecl *, VarDecl *>
   buildPatternAndVariable(Expr *InitExpr) {
-    // This is 16 because "pctmp" is 5 chars, %u is at most 10 digits long plus
-    // a null terminator.
-    char NameBuf[16] = {0};
-    snprintf(NameBuf, sizeof(NameBuf), "pctmp%u", TmpNameIndex);
-    TmpNameIndex++;
+    SmallString<16> NameBuf;
+    (Twine("pctmp") + Twine(TmpNameIndex)).toVector(NameBuf);
+    ++TmpNameIndex;
 
     Expr *MaybeLoadInitExpr = nullptr;
 
@@ -462,35 +512,24 @@ public:
     }
 
     VarDecl *VD =
-        new (Context) VarDecl(/*IsStatic*/false, VarDecl::Specifier::Let,
-                              /*IsCaptureList*/false, SourceLoc(),
-                              Context.getIdentifier(NameBuf),
-                              MaybeLoadInitExpr->getType(), TypeCheckDC);
-
+        new (Context) VarDecl(/*IsStatic*/false, VarDecl::Introducer::Let,
+                              SourceLoc(), Context.getIdentifier(NameBuf),
+                              TypeCheckDC);
+    VD->setInterfaceType(MaybeLoadInitExpr->getType()->mapTypeOutOfContext());
     VD->setImplicit();
 
-    NamedPattern *NP = new (Context) NamedPattern(VD, /*implicit*/ true);
-    PatternBindingDecl *PBD = PatternBindingDecl::create(
-        Context, SourceLoc(), StaticSpellingKind::None, SourceLoc(), NP,
-        MaybeLoadInitExpr, TypeCheckDC);
-    PBD->setImplicit();
+    NamedPattern *NP = NamedPattern::createImplicit(Context, VD, VD->getTypeInContext());
+    PatternBindingDecl *PBD = PatternBindingDecl::createImplicit(
+        Context, StaticSpellingKind::None, NP, MaybeLoadInitExpr, TypeCheckDC);
 
     return std::make_pair(PBD, VD);
-  }
-
-  Added<Stmt *> buildLoggerCall(SourceRange SR, bool isBefore) {
-    if (isBefore) {
-      return buildLoggerCallWithArgs("__builtin_pc_before", SR);
-    } else {
-      return buildLoggerCallWithArgs("__builtin_pc_after", SR);
-    }
   }
 
   // Puts a pair of before/after calls at the start of the body, pointing at
   // that range.
   BraceStmt *prependLoggerCall(BraceStmt *BS, SourceRange SR) {
-    Added<Stmt *> Before = buildLoggerCall(SR, true);
-    Added<Stmt *> After = buildLoggerCall(SR, false);
+    Added<Stmt *> Before = buildLoggerCall(LogBeforeName, SR);
+    Added<Stmt *> After = buildLoggerCall(LogAfterName, SR);
 
     ArrayRef<ASTNode> OriginalElements = BS->getElements();
     SmallVector<swift::ASTNode, 3> Elements(OriginalElements.begin(),
@@ -510,59 +549,48 @@ public:
     }
 
     std::pair<unsigned, unsigned> StartLC =
-        Context.SourceMgr.getLineAndColumn(SR.Start);
+        Context.SourceMgr.getPresumedLineAndColumnForLoc(SR.Start);
 
-    std::pair<unsigned, unsigned> EndLC = Context.SourceMgr.getLineAndColumn(
-        Lexer::getLocForEndOfToken(Context.SourceMgr, SR.End));
+    std::pair<unsigned, unsigned> EndLC =
+        Context.SourceMgr.getPresumedLineAndColumnForLoc(
+            Lexer::getLocForEndOfToken(Context.SourceMgr, SR.End));
 
-    const size_t buf_size = 8;
+    Expr *StartLine = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.first, SR.Start);
+    Expr *EndLine = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.first, SR.End);
+    Expr *StartColumn = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.second, SR.Start);
+    Expr *EndColumn = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.second, SR.End);
 
-    char *start_line_buf = (char *)Context.Allocate(buf_size, 1);
-    char *end_line_buf = (char *)Context.Allocate(buf_size, 1);
-    char *start_column_buf = (char *)Context.Allocate(buf_size, 1);
-    char *end_column_buf = (char *)Context.Allocate(buf_size, 1);
+    Expr *ModuleExpr = buildIDArgumentExpr(ModuleIdentifier, SR);
+    Expr *FileExpr = buildIDArgumentExpr(FileIdentifier, SR);
 
-    ::snprintf(start_line_buf, buf_size, "%u", StartLC.first);
-    ::snprintf(start_column_buf, buf_size, "%u", StartLC.second);
-    ::snprintf(end_line_buf, buf_size, "%u", EndLC.first);
-    ::snprintf(end_column_buf, buf_size, "%u", EndLC.second);
-
-    Expr *StartLine =
-        new (Context) IntegerLiteralExpr(start_line_buf, SR.End, true);
-    Expr *EndLine =
-        new (Context) IntegerLiteralExpr(end_line_buf, SR.End, true);
-    Expr *StartColumn =
-        new (Context) IntegerLiteralExpr(start_column_buf, SR.End, true);
-    Expr *EndColumn =
-        new (Context) IntegerLiteralExpr(end_column_buf, SR.End, true);
-
-    llvm::SmallVector<Expr *, 5> ArgsWithSourceRange{};
-
-    ArgsWithSourceRange.append({StartLine, EndLine, StartColumn, EndColumn});
+    Expr *LoggerArgs[] = {
+      StartLine, EndLine, StartColumn, EndColumn, ModuleExpr, FileExpr
+    };
 
     UnresolvedDeclRefExpr *BeforeLoggerRef = new (Context)
-        UnresolvedDeclRefExpr(Context.getIdentifier("__builtin_pc_before"),
+        UnresolvedDeclRefExpr(LogBeforeName,
                               DeclRefKind::Ordinary, DeclNameLoc(SR.End));
     BeforeLoggerRef->setImplicit(true);
-    SmallVector<Identifier, 4> ArgLabels(ArgsWithSourceRange.size(),
-                                         Identifier());
+
     ApplyExpr *BeforeLoggerCall = CallExpr::createImplicit(
-        Context, BeforeLoggerRef, ArgsWithSourceRange, ArgLabels);
+        Context, BeforeLoggerRef,
+        ArgumentList::forImplicitUnlabeled(Context, LoggerArgs));
     Added<ApplyExpr *> AddedBeforeLogger(BeforeLoggerCall);
     if (!doTypeCheck(Context, TypeCheckDC, AddedBeforeLogger)) {
-      // typically due to 'use of unresolved identifier '__builtin_pc_before''
+      // typically due to 'cannot find '__builtin_pc_before' in scope'
       return E; // return E, it will be used in recovering from TC failure
     }
 
     UnresolvedDeclRefExpr *AfterLoggerRef = new (Context)
-        UnresolvedDeclRefExpr(Context.getIdentifier("__builtin_pc_after"),
+        UnresolvedDeclRefExpr(LogAfterName,
                               DeclRefKind::Ordinary, DeclNameLoc(SR.End));
     AfterLoggerRef->setImplicit(true);
     ApplyExpr *AfterLoggerCall = CallExpr::createImplicit(
-        Context, AfterLoggerRef, ArgsWithSourceRange, ArgLabels);
+        Context, AfterLoggerRef,
+        ArgumentList::forImplicitUnlabeled(Context, LoggerArgs));
     Added<ApplyExpr *> AddedAfterLogger(AfterLoggerCall);
     if (!doTypeCheck(Context, TypeCheckDC, AddedAfterLogger)) {
-      // typically due to 'use of unresolved identifier '__builtin_pc_after''
+      // typically due to 'cannot find '__builtin_pc_after' in scope'
       return E; // return E, it will be used in recovering from TC failure
     }
 
@@ -586,53 +614,37 @@ public:
     return *AddedGet;
   }
 
-  Added<Stmt *> buildLoggerCallWithArgs(const char *LoggerName,
-                                        SourceRange SR) {
+  Added<Stmt *> buildLoggerCall(DeclNameRef LoggerName, SourceRange SR) {
     if (!SR.isValid()) {
       return nullptr;
     }
 
     std::pair<unsigned, unsigned> StartLC =
-        Context.SourceMgr.getLineAndColumn(SR.Start);
+        Context.SourceMgr.getPresumedLineAndColumnForLoc(SR.Start);
 
-    std::pair<unsigned, unsigned> EndLC = Context.SourceMgr.getLineAndColumn(
-        Lexer::getLocForEndOfToken(Context.SourceMgr, SR.End));
+    std::pair<unsigned, unsigned> EndLC =
+        Context.SourceMgr.getPresumedLineAndColumnForLoc(
+            Lexer::getLocForEndOfToken(Context.SourceMgr, SR.End));
 
-    const size_t buf_size = 8;
+    Expr *StartLine = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.first, SR.Start);
+    Expr *EndLine = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.first, SR.End);
+    Expr *StartColumn = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.second, SR.Start);
+    Expr *EndColumn = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.second, SR.End);
 
-    char *start_line_buf = (char *)Context.Allocate(buf_size, 1);
-    char *end_line_buf = (char *)Context.Allocate(buf_size, 1);
-    char *start_column_buf = (char *)Context.Allocate(buf_size, 1);
-    char *end_column_buf = (char *)Context.Allocate(buf_size, 1);
-
-    ::snprintf(start_line_buf, buf_size, "%u", StartLC.first);
-    ::snprintf(start_column_buf, buf_size, "%u", StartLC.second);
-    ::snprintf(end_line_buf, buf_size, "%u", EndLC.first);
-    ::snprintf(end_column_buf, buf_size, "%u", EndLC.second);
-
-    Expr *StartLine =
-        new (Context) IntegerLiteralExpr(start_line_buf, SR.End, true);
-    Expr *EndLine =
-        new (Context) IntegerLiteralExpr(end_line_buf, SR.End, true);
-    Expr *StartColumn =
-        new (Context) IntegerLiteralExpr(start_column_buf, SR.End, true);
-    Expr *EndColumn =
-        new (Context) IntegerLiteralExpr(end_column_buf, SR.End, true);
-
-    llvm::SmallVector<Expr *, 4> ArgsWithSourceRange{};
-
-    ArgsWithSourceRange.append({StartLine, EndLine, StartColumn, EndColumn});
+    Expr *ModuleExpr = buildIDArgumentExpr(ModuleIdentifier, SR);
+    Expr *FileExpr = buildIDArgumentExpr(FileIdentifier, SR);
 
     UnresolvedDeclRefExpr *LoggerRef = new (Context)
-        UnresolvedDeclRefExpr(Context.getIdentifier(LoggerName),
+        UnresolvedDeclRefExpr(LoggerName,
                               DeclRefKind::Ordinary, DeclNameLoc(SR.End));
 
     LoggerRef->setImplicit(true);
 
-    SmallVector<Identifier, 4> ArgLabels(ArgsWithSourceRange.size(),
-                                         Identifier());
-    ApplyExpr *LoggerCall = CallExpr::createImplicit(
-        Context, LoggerRef, ArgsWithSourceRange, ArgLabels);
+    auto *ArgList = ArgumentList::forImplicitUnlabeled(Context, {
+      StartLine, EndLine, StartColumn, EndColumn, ModuleExpr, FileExpr
+    });
+    ApplyExpr *LoggerCall =
+        CallExpr::createImplicit(Context, LoggerRef, ArgList);
     Added<ApplyExpr *> AddedLogger(LoggerCall);
 
     if (!doTypeCheck(Context, TypeCheckDC, AddedLogger)) {
@@ -657,48 +669,48 @@ public:
 
 } // end anonymous namespace
 
-void swift::performPCMacro(SourceFile &SF, TopLevelContext &TLC) {
+void swift::performPCMacro(SourceFile &SF) {
   class ExpressionFinder : public ASTWalker {
   private:
     unsigned TmpNameIndex = 0;
-    TopLevelContext &TLC;
 
   public:
-    ExpressionFinder(TopLevelContext &TLC) : TLC(TLC) {}
+    ExpressionFinder() = default;
 
-    bool walkToDeclPre(Decl *D) override {
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Expansion;
+    }
+
+    PreWalkAction walkToDeclPre(Decl *D) override {
+      ASTContext &ctx = D->getASTContext();
       if (auto *FD = dyn_cast<AbstractFunctionDecl>(D)) {
         if (!FD->isImplicit()) {
           if (FD->getBody()) {
-            ASTContext &ctx = FD->getASTContext();
             Instrumenter I(ctx, FD, TmpNameIndex);
             I.transformDecl(FD);
-            return false;
+            return Action::SkipNode();
           }
         }
       } else if (auto *TLCD = dyn_cast<TopLevelCodeDecl>(D)) {
         if (!TLCD->isImplicit()) {
           if (BraceStmt *Body = TLCD->getBody()) {
-            ASTContext &ctx = static_cast<Decl *>(TLCD)->getASTContext();
             Instrumenter I(ctx, TLCD, TmpNameIndex);
-            BraceStmt *NewBody = I.transformBraceStmt(Body, true);
+            BraceStmt *NewBody = I.transformBraceStmt(Body, nullptr, true);
             if (NewBody != Body) {
               TLCD->setBody(NewBody);
-              TypeChecker TC(ctx);
-              TC.checkTopLevelErrorHandling(TLCD);
-              TC.contextualizeTopLevelCode(TLC,
-                                           SmallVector<Decl *, 1>(1, TLCD));
+              TypeChecker::checkTopLevelEffects(TLCD);
+              TypeChecker::contextualizeTopLevelCode(TLCD);
             }
-            return false;
+            return Action::SkipNode();
           }
         }
       }
-      return true;
+      return Action::Continue();
     }
   };
 
-  ExpressionFinder EF(TLC);
-  for (Decl *D : SF.Decls) {
+  ExpressionFinder EF;
+  for (Decl *D : SF.getTopLevelDecls()) {
     D->walk(EF);
   }
 }

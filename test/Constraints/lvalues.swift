@@ -76,28 +76,29 @@ f2(&non_settable_x) // expected-error{{cannot pass immutable value as inout argu
 f1(&non_settable_x) // expected-error{{cannot pass immutable value as inout argument: 'non_settable_x' is a get-only property}}
 // - inout assignment
 non_settable_x += x // expected-error{{left side of mutating operator isn't mutable: 'non_settable_x' is a get-only property}}
-+++non_settable_x // expected-error{{cannot pass immutable value as inout argument: 'non_settable_x' is a get-only property}}
++++non_settable_x // expected-error{{cannot pass immutable value to mutating operator: 'non_settable_x' is a get-only property}}
 
 // non-settable property is non-settable:
 z.non_settable_x = x // expected-error{{cannot assign to property: 'non_settable_x' is a get-only property}}
 f2(&z.non_settable_x) // expected-error{{cannot pass immutable value as inout argument: 'non_settable_x' is a get-only property}}
 f1(&z.non_settable_x) // expected-error{{cannot pass immutable value as inout argument: 'non_settable_x' is a get-only property}}
 z.non_settable_x += x // expected-error{{left side of mutating operator isn't mutable: 'non_settable_x' is a get-only property}}
-+++z.non_settable_x // expected-error{{cannot pass immutable value as inout argument: 'non_settable_x' is a get-only property}}
++++z.non_settable_x // expected-error{{cannot pass immutable value to mutating operator: 'non_settable_x' is a get-only property}}
 
 // non-settable subscript is non-settable:
 z[0] = 0.0 // expected-error{{cannot assign through subscript: subscript is get-only}}
 f2(&z[0]) // expected-error{{cannot pass immutable value as inout argument: subscript is get-only}}
 f1(&z[0]) // expected-error{{cannot pass immutable value as inout argument: subscript is get-only}}
 z[0] += 0.0 // expected-error{{left side of mutating operator isn't mutable: subscript is get-only}}
-+++z[0] // expected-error{{cannot pass immutable value as inout argument: subscript is get-only}}
++++z[0] // expected-error{{cannot convert value of type 'Double' to expected argument type 'X'}}
++++z[(i: 0, j: 0)] // expected-error{{cannot pass immutable value to mutating operator: subscript is get-only}}
 
 // settable property of an rvalue value type is non-settable:
 fz().settable_x = x // expected-error{{cannot assign to property: 'fz' returns immutable value}}
 f2(&fz().settable_x) // expected-error{{cannot pass immutable value as inout argument: 'fz' returns immutable value}}
 f1(&fz().settable_x) // expected-error{{cannot pass immutable value as inout argument: 'fz' returns immutable value}}
 fz().settable_x += x // expected-error{{left side of mutating operator isn't mutable: 'fz' returns immutable value}}
-+++fz().settable_x // expected-error{{cannot pass immutable value as inout argument: 'fz' returns immutable value}}
++++fz().settable_x // expected-error{{cannot pass immutable value to mutating operator: 'fz' returns immutable value}}
 
 // settable property of an rvalue reference type IS SETTABLE:
 fref().property = 0.0
@@ -111,7 +112,7 @@ z.non_settable_x.property = 1.0 // expected-error{{cannot assign to property: 'n
 f2(&z.non_settable_x.property) // expected-error{{cannot pass immutable value as inout argument: 'non_settable_x' is a get-only property}}
 f1(&z.non_settable_x.property) // expected-error{{cannot pass immutable value as inout argument: 'non_settable_x' is a get-only property}}
 z.non_settable_x.property += 1.0 // expected-error{{left side of mutating operator isn't mutable: 'non_settable_x' is a get-only property}}
-+++z.non_settable_x.property // expected-error{{cannot pass immutable value as inout argument: 'non_settable_x' is a get-only property}}
++++z.non_settable_x.property // expected-error{{cannot convert value of type 'Double' to expected argument type 'X'}}
 
 // settable property of a non-settable reference type IS SETTABLE:
 z.non_settable_reftype.property = 1.0
@@ -158,16 +159,14 @@ func testInOut(_ arg: inout Int) {
 }
 
 // Don't infer inout types.
-var ir = &i // expected-error{{variable has type 'inout Int' which includes nested inout parameters}} \
-            // expected-error{{'&' can only appear immediately in a call argument list}}
-var ir2 = ((&i)) // expected-error{{variable has type 'inout Int' which includes nested inout parameters}} \
-                 // expected-error{{'&' can only appear immediately in a call argument list}}
+var ir = &i // expected-error {{'&' may only be used to pass an argument to inout parameter}}
+var ir2 = ((&i)) // expected-error {{'&' may only be used to pass an argument to inout parameter}}
 
 // <rdar://problem/17133089>
 func takeArrayRef(_ x: inout Array<String>) { }
 
 // rdar://22308291
-takeArrayRef(["asdf", "1234"]) // expected-error{{contextual type 'inout Array<String>' cannot be used with array literal}}
+takeArrayRef(["asdf", "1234"]) // expected-error{{cannot pass immutable value of type '[String]' as inout argument}}
 
 // <rdar://problem/19835413> Reference to value from array changed
 func rdar19835413() {
@@ -201,9 +200,9 @@ func testImmutableUnsafePointer(_ p: UnsafePointer<Int>) {
   p[0] = 1 // expected-error {{cannot assign through subscript: subscript is get-only}}
 }
 
-// <https://bugs.swift.org/browse/SR-7> Inferring closure param type to 
-// inout crashes compiler
-let g = { x in f0(x) } // expected-error{{passing value of type 'Int' to an inout parameter requires explicit '&'}} {{19-19=&}}
+/// https://github.com/apple/swift/issues/42633
+/// Inferring closure param type to `inout` crashes compiler
+let _ = { x in f0(x) } // expected-error{{passing value of type 'Int' to an inout parameter requires explicit '&'}} {{19-19=&}}
 
 // <rdar://problem/17245353> Crash with optional closure taking inout
 func rdar17245353() {
@@ -235,10 +234,79 @@ r23331567 { $0 += 1 }
 // <rdar://problem/30685195> Compiler crash with invalid assignment
 struct G<T> {
   subscript(x: Int) -> T { get { } nonmutating set { } }
-  // expected-note@-1 {{'subscript' declared here}}
+  // expected-note@-1 {{'subscript(_:)' declared here}}
 }
 
 func wump<T>(to: T, _ body: (G<T>) -> ()) {}
 
 wump(to: 0, { $0[] = 0 })
-// expected-error@-1 {{missing argument for parameter #1 in call}}
+// expected-error@-1 {{missing argument for parameter #1 in subscript}}
+
+// https://github.com/apple/swift/issues/56129
+
+extension MutableCollection {
+  public mutating func writePrefix<I: IteratorProtocol>(from source: inout I)
+    -> (writtenCount: Int, afterLastWritten: Index)
+    where I.Element == Element
+  {
+    fatalError()
+  }
+  
+  public mutating func writePrefix<Source: Collection>(from source: Source)
+    -> (writtenCount: Int, afterLastWritten: Index, afterLastRead: Source.Index)
+    where Source.Element == Element
+  {
+    fatalError()
+  }
+
+}
+
+func testWritePrefixIterator() {
+  var a = Array(0..<10)
+  
+  var underflow = (1..<10).makeIterator()
+  var (writtenCount, afterLastWritten) = a.writePrefix(from: underflow) // expected-error {{passing value of type 'IndexingIterator<Range<Int>>' to an inout parameter requires explicit '&'}} {{62-62=&}}
+}
+
+// rdar://problem/71356981 - wrong error message for state passed as inout with ampersand within parentheses
+func look_through_parens_when_checking_inout() {
+  struct Point {
+    var x: Int = 0
+    var y: Int = 0
+  }
+
+  func modifyPoint(_ point: inout Point, _: Int = 42) {}
+  func modifyPoint(_ point: inout Point, msg: String) {}
+  func modifyPoint(source: inout Point) {}
+
+  var point = Point(x: 0, y: 0)
+  modifyPoint((&point)) // expected-error {{'&' may only be used to pass an argument to inout parameter}} {{16-17=(}} {{15-16=&}}
+  modifyPoint(((&point))) // expected-error {{'&' may only be used to pass an argument to inout parameter}} {{17-18=(}} {{15-16=&}}
+  modifyPoint(source: (&point)) // expected-error {{'&' may only be used to pass an argument to inout parameter}} {{24-25=(}} {{23-24=&}}
+  modifyPoint(source: ((&point))) // expected-error {{'&' may only be used to pass an argument to inout parameter}} {{25-26=(}} {{23-24=&}}
+  modifyPoint((&point), 0) // expected-error {{'&' may only be used to pass an argument to inout parameter}} {{16-17=(}} {{15-16=&}}
+  modifyPoint((&point), msg: "") // expected-error {{'&' may only be used to pass an argument to inout parameter}} {{16-17=(}} {{15-16=&}}
+}
+
+// rdar://96631324 - compiler crash while producing diagnostics
+func test_incorrect_inout_at_assignment_source() {
+  class S {
+    var prop: String = ""
+  }
+
+  func test(s: S) {
+    let str: String = ""
+    let val: Int = 0
+
+    s.prop = &str // expected-error {{'&' may only be used to pass an argument to inout parameter}}
+    s.prop = &val // expected-error {{'&' may only be used to pass an argument to inout parameter}}
+  }
+}
+
+// rdar://100369066 - type of expression is ambiguous when `&` is used incorrectly
+func test_invalid_inout_with_restrictions(lhs: inout any BinaryInteger, rhs: any BinaryInteger) {
+  lhs = &rhs // expected-error {{'&' may only be used to pass an argument to inout parameter}}
+
+  var other: (any BinaryInteger)? = nil
+  other = &rhs // expected-error {{'&' may only be used to pass an argument to inout parameter}}
+}

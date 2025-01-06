@@ -32,7 +32,7 @@ func _findStringSwitchCase(
   return -1
 }
 
-@_fixed_layout // needs known size for static allocation
+@frozen // needs known size for static allocation
 public // used by COMPILER_INTRINSIC
 struct _OpaqueStringSwitchCache {
   var a: Builtin.Word
@@ -41,11 +41,10 @@ struct _OpaqueStringSwitchCache {
 
 internal typealias _StringSwitchCache = Dictionary<String, Int>
 
-@_fixed_layout // FIXME(sil-serialize-all)
-@_versioned // FIXME(sil-serialize-all)
 internal struct _StringSwitchContext {
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
+  internal let cases: [StaticString]
+  internal let cachePtr: UnsafeMutablePointer<_StringSwitchCache>
+
   internal init(
     cases: [StaticString],
     cachePtr: UnsafeMutablePointer<_StringSwitchCache>
@@ -53,11 +52,6 @@ internal struct _StringSwitchContext {
     self.cases = cases
     self.cachePtr = cachePtr
   }
-
-  @_versioned // FIXME(sil-serialize-all)
-  internal let cases: [StaticString]
-  @_versioned // FIXME(sil-serialize-all)
-  internal let cachePtr: UnsafeMutablePointer<_StringSwitchCache>
 }
 
 /// The compiler intrinsic which is called to lookup a string in a table
@@ -74,33 +68,33 @@ func _findStringSwitchCaseWithCache(
   string: String,
   cache: inout _OpaqueStringSwitchCache) -> Int {
 
-  return withUnsafeMutableBytes(of: &cache) {
-    (bufPtr: UnsafeMutableRawBufferPointer) -> Int in
-
-    let oncePtr = bufPtr.baseAddress!
-    let cacheRawPtr = oncePtr + MemoryLayout<Builtin.Word>.stride
-    let cachePtr = cacheRawPtr.bindMemory(to: _StringSwitchCache.self, capacity: 1)
-    var context = _StringSwitchContext(cases: cases, cachePtr: cachePtr)
-    withUnsafeMutablePointer(to: &context) { (context) -> () in
-      Builtin.onceWithContext(oncePtr._rawValue, _createStringTableCache,
-                              context._rawValue)
-    }
-    let cache = cachePtr.pointee;
-    if let idx = cache[string] {
-      return idx
-    }
-    return -1
+#if $BuiltinUnprotectedAddressOf
+  let ptr = UnsafeMutableRawPointer(Builtin.unprotectedAddressOf(&cache))
+#else
+  let ptr = UnsafeMutableRawPointer(Builtin.addressof(&cache))
+#endif
+  let oncePtr = ptr
+  let cacheRawPtr = oncePtr + MemoryLayout<Builtin.Word>.stride
+  let cachePtr = cacheRawPtr.bindMemory(to: _StringSwitchCache.self, capacity: 1)
+  var context = _StringSwitchContext(cases: cases, cachePtr: cachePtr)
+  withUnsafeMutablePointer(to: &context) { (context) -> () in
+    Builtin.onceWithContext(oncePtr._rawValue, _createStringTableCache,
+                            context._rawValue)
   }
+  let cache = cachePtr.pointee;
+  if let idx = cache[string] {
+    return idx
+  }
+  return -1
 }
 
 /// Builds the string switch case.
-@_inlineable // FIXME(sil-serialize-all)
-@_versioned // FIXME(sil-serialize-all)
 internal func _createStringTableCache(_ cacheRawPtr: Builtin.RawPointer) {
   let context = UnsafePointer<_StringSwitchContext>(cacheRawPtr).pointee
   var cache = _StringSwitchCache()
   cache.reserveCapacity(context.cases.count)
-  assert(MemoryLayout<_StringSwitchCache>.size <= MemoryLayout<Builtin.Word>.size)
+  _internalInvariant(
+    MemoryLayout<_StringSwitchCache>.size <= MemoryLayout<Builtin.Word>.size)
 
   for (idx, s) in context.cases.enumerated() {
     let key = String(_builtinStringLiteral: s.utf8Start._rawValue,

@@ -1,5 +1,6 @@
 // RUN: %empty-directory(%t)
 // RUN: %target-build-swift %s -o %t/a.out
+// RUN: %target-codesign %t/a.out
 // RUN: %target-run %t/a.out | %FileCheck %s
 // REQUIRES: executable_test
 
@@ -520,10 +521,10 @@ func presentEitherOrsOf<T, U>(t: T, u: U) {
   presentEitherOr(EitherOr<T, U>.Right(u))
 }
 
-presentEitherOr(EitherOr<(), ()>.Left())  // CHECK-NEXT: Left(())
+presentEitherOr(EitherOr<(), ()>.Left(()))  // CHECK-NEXT: Left(())
 presentEitherOr(EitherOr<(), ()>.Middle)  // CHECK-NEXT: Middle
 presentEitherOr(EitherOr<(), ()>.Center)  // CHECK-NEXT: Center
-presentEitherOr(EitherOr<(), ()>.Right()) // CHECK-NEXT: Right(())
+presentEitherOr(EitherOr<(), ()>.Right(())) // CHECK-NEXT: Right(())
 
 // CHECK-NEXT: Left(())
 // CHECK-NEXT: Middle
@@ -542,7 +543,7 @@ presentEitherOr(EitherOr<Int, String>.Right("foo")) // CHECK-NEXT: Right(foo)
 // CHECK-NEXT: Right(foo)
 presentEitherOrsOf(t: 1, u: "foo")
 
-presentEitherOr(EitherOr<(), String>.Left())       // CHECK-NEXT: Left(())
+presentEitherOr(EitherOr<(), String>.Left(()))       // CHECK-NEXT: Left(())
 presentEitherOr(EitherOr<(), String>.Middle)       // CHECK-NEXT: Middle
 presentEitherOr(EitherOr<(), String>.Center)       // CHECK-NEXT: Center
 presentEitherOr(EitherOr<(), String>.Right("foo")) // CHECK-NEXT: Right(foo)
@@ -553,7 +554,8 @@ presentEitherOr(EitherOr<(), String>.Right("foo")) // CHECK-NEXT: Right(foo)
 // CHECK-NEXT: Right(foo)
 presentEitherOrsOf(t: (), u: "foo")
 
-// SR-5148
+// https://github.com/apple/swift/issues/47724
+
 enum Payload {
     case email
 }
@@ -651,3 +653,95 @@ func run() {
 }
 
 run()
+
+public enum Indirect<T> {
+  indirect case payload((T, other: T))
+  case none
+}
+
+public func testIndirectEnum<T>(_ payload: T) -> Indirect<T> {
+  return Indirect.payload((payload, other: payload))
+}
+
+public func testCase(_ closure: @escaping (Int) -> ()) -> Indirect<(Int) -> ()> {
+  return testIndirectEnum(closure)
+}
+
+// CHECK: payload((Function), other: (Function))
+print(testCase({ _ in }))
+
+
+enum MultiIndirectRef {
+  case empty
+  indirect case ind(Int)
+  case collection([Int])
+}
+
+struct Container {
+  var storage : MultiIndirectRef = .empty
+
+  mutating func adoptStyle(_ s: Int) {
+    storage = .ind(s)
+  }
+}
+
+func copyStorage(_ s: Int, _ x : Container) -> Container {
+  var c = x
+  c.adoptStyle(s)
+  return c
+}
+
+func testCase() {
+  let l = Container()
+  let c = copyStorage(5, l)
+  print(c)
+}
+
+// CHECK: Container(storage: a.MultiIndirectRef.ind(5))
+testCase()
+
+
+enum BitEnum {
+  case first
+  case second
+}
+protocol Init {
+  init()
+}
+struct TrailingByte : Init {
+  var x = 2
+  var y = BitEnum.first
+  init() {
+    x = 2
+    y = BitEnum.first
+  }
+}
+
+@inline(never)
+func capture<T>(_ t: inout T) {
+  print("captured \(t)")
+}
+
+@inline(never)
+func reproduction<T: Init>(_ x: Int, _ y: Int, _ t: T) {
+  var o : Optional<T> = nil
+
+
+  for i in 0 ..< x {
+     if  i == y {
+        o = T()
+     }
+  }
+
+  capture(&o)
+
+  if var byte = o {
+    print("there is a byte (failure)")
+    print(byte)
+  } else {
+    print("there is no byte")
+  }
+}
+
+// CHECK: there is no byte
+reproduction(2, 3, TrailingByte())

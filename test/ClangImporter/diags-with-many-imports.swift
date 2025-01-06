@@ -1,7 +1,7 @@
-// RUN: not %target-swift-frontend -typecheck %s -I %S/Inputs/many-imports -import-objc-header %S/Inputs/many-imports/obsoleted.h 2>&1 | %FileCheck %s
-// RUN: %target-swift-frontend -emit-pch %S/Inputs/many-imports/obsoleted.h -o %t.pch
-// RUN: not %target-swift-frontend -typecheck %s -I %S/Inputs/many-imports -import-objc-header %t.pch 2>&1 | %FileCheck %s
-// RUN: not %target-swift-frontend -typecheck %s -I %S/Inputs/many-imports -import-objc-header %S/Inputs/many-imports/obsoleted.h -pch-output-dir %t/pch 2>&1 | %FileCheck %s
+// RUN: not %target-swift-frontend -typecheck %s -I %S/Inputs/many-imports -enable-objc-interop -import-objc-header %S/Inputs/many-imports/obsoleted.h 2>&1 | %FileCheck %s
+// RUN: %target-swift-frontend -enable-objc-interop -emit-pch %S/Inputs/many-imports/obsoleted.h -o %t.pch
+// RUN: not %target-swift-frontend -typecheck %s -I %S/Inputs/many-imports -enable-objc-interop -import-objc-header %t.pch 2>&1 | %FileCheck %s
+// RUN: not %target-swift-frontend -typecheck %s -I %S/Inputs/many-imports -enable-objc-interop -import-objc-header %S/Inputs/many-imports/obsoleted.h -pch-output-dir %t/pch 2>&1 | %FileCheck %s
 
 import Module1
 import Module2
@@ -108,4 +108,4 @@ import Module100
 obsoleted()
 // CHECK: [[@LINE-1]]:1: error:
 // CHECK: explicitly marked unavailable here
-// CHECK-NEXT: func obsoleted()
+// CHECK: void obsoleted() __attribute__((unavailable));

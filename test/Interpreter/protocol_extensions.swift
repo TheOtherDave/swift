@@ -3,6 +3,7 @@
 
 import StdlibUnittest
 
+defer { runAllTests() }
 
 var ProtocolExtensionTestSuite = TestSuite("ProtocolExtensions")
 
@@ -65,7 +66,7 @@ extension Sequence {
 
 extension Sequence {
   public func myZip<S : Sequence>(_ s: S) -> Zip2Sequence<Self, S> {
-    return Zip2Sequence(_sequence1: self, _sequence2: s)
+    return zip(self, s)
   }
 }
 
@@ -284,7 +285,8 @@ ProtocolExtensionTestSuite.test("ClassInitializer") {
   expectTrue(Sub.self == metatypes[3].1)
 }
 
-// https://bugs.swift.org/browse/SR-617
+// https://github.com/apple/swift/issues/43234
+
 protocol SelfMetadataTest {
   associatedtype T = Int
 
@@ -314,6 +316,8 @@ extension SelfMetadataTest {
 class SelfMetadataBase : SelfMetadataTest {}
 
 class SelfMetadataDerived : SelfMetadataBase {}
+
+class SelfMetadataGeneric<T> : SelfMetadataTest {}
 
 func testSelfMetadata<T : SelfMetadataTest>(_ x: T, _ t: T.T) -> [Any.Type] {
   return [x.staticTypeOfSelf(),
@@ -348,6 +352,46 @@ ProtocolExtensionTestSuite.test("WitnessSelf") {
     expectTrue(SelfMetadataDerived.self == result[2])
     expectTrue(SelfMetadataDerived.self == result[3])
   }
+
+  // Make sure the calling convention works out if 'Self' is a generic
+  // class too.
+  do {
+    let result = testSelfMetadata(SelfMetadataGeneric<Int>(), 0)
+    expectTrue(SelfMetadataGeneric<Int>.self == result[0])
+    expectTrue(SelfMetadataGeneric<Int>.self == result[1])
+    expectTrue(SelfMetadataGeneric<Int>.self == result[2])
+    expectTrue(SelfMetadataGeneric<Int>.self == result[3])
+  }
 }
 
-runAllTests()
+@_marker protocol Addable {}
+extension Addable {
+    func increment(this x: Int) -> Int { return x + 100 }
+}
+extension String: Addable {}
+
+ProtocolExtensionTestSuite.test("MarkerProtocolExtensions") {
+    expectTrue("hello".increment(this: 11) == 111)
+}
+
+protocol DefaultArgumentsInExtension {
+    func foo(a: Int, b: Int) -> (Int, Int)
+}
+extension DefaultArgumentsInExtension {
+    func foo(a: Int, b: Int = 1) -> (Int, Int) {
+        self.foo(a: a * 10, b: b * 10)
+    }
+}
+struct DefaultArgumentsInExtensionImpl: DefaultArgumentsInExtension {
+    func foo(a: Int, b: Int) -> (Int, Int) {
+        (a * 2, b * 2)
+    }
+}
+
+ProtocolExtensionTestSuite.test("DefaultArgumentsInExtension") {
+    let instance = DefaultArgumentsInExtensionImpl()
+    expectEqual((4, 6), instance.foo(a: 2, b: 3))
+    expectEqual((4, 6), (instance as any DefaultArgumentsInExtension).foo(a: 2, b: 3))
+    expectEqual((40, 20), instance.foo(a: 2))
+    expectEqual((40, 20), (instance as any DefaultArgumentsInExtension).foo(a: 2))
+}

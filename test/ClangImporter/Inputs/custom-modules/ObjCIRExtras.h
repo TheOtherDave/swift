@@ -60,6 +60,23 @@
 @interface SwiftNameTestErrorSub : SwiftNameTestError
 @end
 
+@interface SwiftGenericNameTest<T> : NSObject
+@end
+
+@interface SwiftConstrGenericNameTest<T:NSNumber *> : NSNumber
+@end
+
 int global_int SWIFT_NAME(GlobalInt);
+
+@compatibility_alias SwiftNameAlias SwiftNameTest;
+@compatibility_alias SwiftGenericNameAlias SwiftGenericNameTest;
+@compatibility_alias SwiftConstrGenericNameAlias SwiftConstrGenericNameTest;
+
+SWIFT_NAME(CircularName.Inner) @interface CircularName : NSObject @end
+
+SWIFT_NAME(MutuallyCircularNameB.Inner) @interface MutuallyCircularNameA : NSObject @end
+SWIFT_NAME(MutuallyCircularNameA.Inner) @interface MutuallyCircularNameB : NSObject @end
+
+void circularFriends(CircularName*, MutuallyCircularNameA*);
 
 #pragma clang assume_nonnull end

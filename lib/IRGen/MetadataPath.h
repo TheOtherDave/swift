@@ -19,7 +19,7 @@
 #define SWIFT_IRGEN_METADATAPATH_H
 
 #include "swift/Basic/EncodedSequence.h"
-#include "swift/Reflection/MetadataSource.h"
+#include "swift/RemoteInspection/MetadataSource.h"
 #include "WitnessIndex.h"
 #include "IRGen.h"
 
@@ -31,11 +31,13 @@ namespace swift {
   class ProtocolDecl;
   class CanType;
   class Decl;
+  enum class MetadataState : size_t;
 
 namespace irgen {
+  class DynamicMetadataRequest;
   class IRGenFunction;
   class LocalTypeDataKey;
-
+  class MetadataResponse;
 
 /// A path from one source metadata --- either Swift type metadata or a Swift
 /// protocol conformance --- to another.
@@ -55,13 +57,32 @@ class MetadataPath {
       /// Witness table at requirement index P of a generic nominal type.
       NominalTypeArgumentConformance,
 
+      /// Pack length at requirement index P of a generic nominal type.
+      NominalTypeArgumentShape,
+
       /// Type metadata at requirement index P of a generic nominal type.
       NominalTypeArgument,
+
+      /// Value at requirement index P of a generic nominal type.
+      NominalValueArgument,
 
       /// Conditional conformance at index P (i.e. the P'th element) of a
       /// conformance.
       ConditionalConformance,
-      LastWithPrimaryIndex = ConditionalConformance,
+
+      /// The pattern type of a pack expansion at index P in a pack.
+      PackExpansionPattern,
+
+      /// The count type of a pack expansion at index P in a pack.
+      PackExpansionCount,
+
+      /// Materialize tuple as a pack.
+      TuplePack,
+
+      /// Materialize length of tuple as a pack shape expression.
+      TupleShape,
+
+      LastWithPrimaryIndex = TupleShape,
 
       // Everything past this point has no index.
 
@@ -102,12 +123,20 @@ class MetadataPath {
       switch (getKind()) {
       case Kind::OutOfLineBaseProtocol:
       case Kind::NominalTypeArgumentConformance:
+      case Kind::NominalTypeArgumentShape:
       case Kind::NominalTypeArgument:
+      case Kind::NominalValueArgument:
       case Kind::ConditionalConformance:
+      case Kind::TupleShape:
         return OperationCost::Load;
 
+      case Kind::TuplePack:
       case Kind::AssociatedConformance:
         return OperationCost::Call;
+
+      case Kind::PackExpansionPattern:
+      case Kind::PackExpansionCount:
+        return OperationCost::Arithmetic;
 
       case Kind::Impossible:
         llvm_unreachable("cannot compute cost of an impossible path");
@@ -158,6 +187,20 @@ public:
                              index));
   }
 
+  /// Add a step to this path which gets the pack length stored at
+  /// requirement index n in a generic type metadata.
+  void addNominalTypeArgumentShapeComponent(unsigned index) {
+    Path.push_back(Component(Component::Kind::NominalTypeArgumentShape,
+                             index));
+  }
+
+  /// Add a step to this path which gets the value stored at requirement
+  /// index n in a generic type metadata.
+  void addNominalValueArgumentComponent(unsigned index) {
+    Path.push_back(Component(Component::Kind::NominalValueArgument,
+                             index));
+  }
+
   /// Add a step to this path which gets the inherited protocol at
   /// a particular witness index.
   void addInheritedProtocolComponent(WitnessIndex index) {
@@ -178,26 +221,44 @@ public:
     Path.push_back(Component(Component::Kind::ConditionalConformance, index));
   }
 
+  void addPackExpansionPatternComponent(unsigned index) {
+    Path.push_back(Component(Component::Kind::PackExpansionPattern, index));
+  }
+
+  void addPackExpansionCountComponent(unsigned index) {
+    Path.push_back(Component(Component::Kind::PackExpansionCount, index));
+  }
+
+  void addTuplePackComponent() {
+    Path.push_back(Component(Component::Kind::TuplePack, /*index=*/0));
+  }
+
+  void addTupleShapeComponent() {
+    Path.push_back(Component(Component::Kind::TupleShape, /*index=*/0));
+  }
+
   /// Return an abstract measurement of the cost of this path.
   OperationCost cost() const {
     auto cost = OperationCost::Free;
-    for (const Component &component : Path)
+    for (const Component component : Path)
       cost += component.cost();
     return cost;
   }
 
   /// Given a pointer to type metadata, follow a path from it.
-  llvm::Value *followFromTypeMetadata(IRGenFunction &IGF,
-                                      CanType sourceType,
-                                      llvm::Value *source,
-                                      Map<llvm::Value*> *cache) const;
+  MetadataResponse followFromTypeMetadata(IRGenFunction &IGF,
+                                          CanType sourceType,
+                                          MetadataResponse source,
+                                          DynamicMetadataRequest request,
+                                          Map<MetadataResponse> *cache) const;
 
   /// Given a pointer to a protocol witness table, follow a path from it.
-  llvm::Value *followFromWitnessTable(IRGenFunction &IGF,
-                                      CanType conformingType,
-                                      ProtocolConformanceRef conformance,
-                                      llvm::Value *source,
-                                      Map<llvm::Value*> *cache) const;
+  MetadataResponse followFromWitnessTable(IRGenFunction &IGF,
+                                          CanType conformingType,
+                                          ProtocolConformanceRef conformance,
+                                          MetadataResponse source,
+                                          DynamicMetadataRequest request,
+                                          Map<MetadataResponse> *cache) const;
 
   template <typename Allocator>
   const reflection::MetadataSource *
@@ -227,18 +288,20 @@ public:
   }
 
 private:
-  static llvm::Value *follow(IRGenFunction &IGF,
-                             LocalTypeDataKey key,
-                             llvm::Value *source,
-                             MetadataPath::iterator begin,
-                             MetadataPath::iterator end,
-                             Map<llvm::Value*> *cache);
+  static MetadataResponse follow(IRGenFunction &IGF,
+                                 LocalTypeDataKey key,
+                                 MetadataResponse source,
+                                 MetadataPath::iterator begin,
+                                 MetadataPath::iterator end,
+                                 DynamicMetadataRequest request,
+                                 Map<MetadataResponse> *cache);
 
   /// Follow a single component of a metadata path.
-  static llvm::Value *followComponent(IRGenFunction &IGF,
-                                      LocalTypeDataKey &key,
-                                      llvm::Value *source,
-                                      Component component);
+  static MetadataResponse followComponent(IRGenFunction &IGF,
+                                          LocalTypeDataKey &key,
+                                          MetadataResponse source,
+                                          Component component,
+                                          DynamicMetadataRequest request);
 };
 
 } // end namespace irgen

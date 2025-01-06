@@ -6,8 +6,8 @@
 // REQUIRES: OS=macosx
 
 import OpenGL.GL3
-_ = glGetString
-_ = OpenGL.glGetString
+_ = glGetString // expected-warning * {{'glGetString' was deprecated}}
+_ = OpenGL.glGetString // expected-warning * {{'glGetString' was deprecated}}
 _ = GL_COLOR_BUFFER_BIT
 _ = OpenGL.GL_COLOR_BUFFER_BIT
 
@@ -20,7 +20,7 @@ typealias PanRecognizer = NSPanGestureRecognizer
 typealias PanRecognizer2 = AppKit.NSPanGestureRecognizer
 
 #if !NO_ERROR
-_ = glVertexPointer // expected-error{{use of unresolved identifier 'glVertexPointer'}}
+_ = glVertexPointer // expected-error{{cannot find 'glVertexPointer' in scope}}
 #endif
 
 // FIXME: Remove -verify-ignore-unknown.

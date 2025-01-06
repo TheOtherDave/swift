@@ -13,6 +13,7 @@
 #ifndef SWIFT_CLANGNODE_H
 #define SWIFT_CLANGNODE_H
 
+#include "swift/Basic/Debug.h"
 #include "llvm/ADT/PointerUnion.h"
 
 namespace clang {
@@ -48,8 +49,8 @@ class ClangNode {
   template <typename T>
   using Box = detail::ClangNodeBox<T>;
 
-  llvm::PointerUnion4<Box<clang::Decl>, Box<clang::MacroInfo>,
-                      Box<clang::ModuleMacro>, Box<clang::Module>> Ptr;
+  llvm::PointerUnion<Box<clang::Decl>, Box<clang::MacroInfo>,
+                     Box<clang::ModuleMacro>, Box<clang::Module>> Ptr;
 
 public:
   ClangNode() = default;
@@ -98,6 +99,8 @@ public:
   clang::SourceLocation getLocation() const;
   clang::SourceRange getSourceRange() const;
 
+  SWIFT_DEBUG_DUMP;
+
   void *getOpaqueValue() const { return Ptr.getOpaqueValue(); }
   static inline ClangNode getFromOpaqueValue(void *VP) {
     ClangNode N;
@@ -111,7 +114,7 @@ public:
 namespace llvm {
 template <typename T>
 struct PointerLikeTypeTraits<swift::detail::ClangNodeBox<T>> {
-  using Box = swift::detail::ClangNodeBox<T>;
+  using Box = ::swift::detail::ClangNodeBox<T>;
 
   static inline void *getAsVoidPointer(Box P) {
     return const_cast<void *>(static_cast<const void *>(P.value));

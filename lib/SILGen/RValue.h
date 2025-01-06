@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -24,6 +24,7 @@
 #define SWIFT_LOWERING_RVALUE_H
 
 #include "ManagedValue.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/NullablePtr.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -35,6 +36,7 @@ class Initialization;
 class Scope;
 class SILGenFunction;
 class TypeLowering;
+class CleanupCloner;
 
 /// An "exploded" SIL rvalue, in which tuple values are recursively
 /// destructured.
@@ -50,7 +52,7 @@ class TypeLowering;
 ///   cleanups. This is verified upon construction of an RValue.
 ///
 ///   2. All sub-ManagedValues with non-trivial ValueOwnershipKind must have the
-///   same ValueOwnershipKind. There is a subtle thing occuring here. Since all
+///   same ValueOwnershipKind. There is a subtle thing occurring here. Since all
 ///   addresses are viewed from an ownership perspective as having trivial
 ///   ownership, this causes the verification to ignore address only
 ///   values. Once we transition to opaque values, the verification will
@@ -71,12 +73,13 @@ class TypeLowering;
 class RValue {
   friend class swift::Lowering::Scope;
   friend class swift::Lowering::ArgumentSource;
+  friend class swift::Lowering::CleanupCloner;
 
   std::vector<ManagedValue> values;
   CanType type;
   unsigned elementsToBeAdded;
   
-  /// \brief Flag value used to mark an rvalue as invalid.
+  /// Flag value used to mark an rvalue as invalid.
   ///
   /// The reasons why this can be true is:
   ///
@@ -172,6 +175,9 @@ public:
   static RValue forInContext() {
     return RValue(InContext);
   }
+
+  static unsigned getRValueSize(CanType substType);
+  static unsigned getRValueSize(AbstractionPattern origType, CanType substType);
   
   /// Create an RValue to which values will be subsequently added using
   /// addElement(), with the level of tuple expansion in the input specified
@@ -205,11 +211,6 @@ public:
   /// True if this rvalue was emitted into context.
   bool isInContext() const & { return elementsToBeAdded == InContext; }
   
-  /// True if this represents an lvalue.
-  bool isLValue() const & {
-    return isa<InOutType>(type);
-  }
-  
   /// Add an element to the rvalue. The rvalue must not yet be complete.
   void addElement(RValue &&element) &;
   
@@ -234,7 +235,17 @@ public:
   /// The values must not require any cleanups.
   SILValue getUnmanagedSingleValue(SILGenFunction &SGF, SILLocation l) const &;
 
+  SILType getTypeOfSingleValue() const & {
+    assert(isComplete() && values.size() == 1);
+    return values[0].getType();
+  }
+
   ManagedValue getScalarValue() && {
+    if (isInContext()) {
+      makeUsed();
+      return ManagedValue::forInContext();
+    }
+
     assert(!isa<TupleType>(type) && "getScalarValue of a tuple rvalue");
     assert(values.size() == 1);
     auto value = values[0];
@@ -242,17 +253,23 @@ public:
     return value;
   }
 
-  /// Returns true if this is an rvalue that can be used safely as a +1 rvalue.
+  /// Returns true if this rvalue can be consumed.
   ///
-  /// This returns true iff:
+  /// This is true if each element either has a cleanup or is an SSA value
+  /// without ownership.
   ///
-  /// 1. All sub-values are trivially typed.
-  /// 2. There exists at least one non-trivial typed sub-value and all such
-  /// sub-values all have cleanups.
-  ///
-  /// *NOTE* Due to 1. isPlusOne and isPlusZero both return true for rvalues
-  /// consisting of only trivial values.
+  /// When an SSA value does not have ownership, it can be used by a consuming
+  /// operation without destroying it. Consuming a value by address, however,
+  /// deinitializes the memory regardless of whether the value has ownership.
   bool isPlusOne(SILGenFunction &SGF) const &;
+
+  /// Returns true if this rvalue can be forwarded without necessarilly
+  /// destroying the original.
+  ///
+  /// This is true if either isPlusOne is true or the value is trivial. A
+  /// trivial value in memory can be forwarded as a +1 value without
+  /// deinitializing the memory.
+  bool isPlusOneOrTrivial(SILGenFunction &SGF) const &;
 
   /// Returns true if this is an rvalue that can be used safely as a +0 rvalue.
   ///
@@ -310,40 +327,6 @@ public:
   /// be returned. Otherwise, an object will be returned. So this is a
   /// convenient way to determine if an RValue needs an address.
   SILType getLoweredImplodedTupleType(SILGenFunction &SGF) const &;
-
-  /// Rewrite the type of this r-value.
-  void rewriteType(CanType newType) & {
-#ifndef NDEBUG
-    static const auto areSimilarTypes = [](CanType l, CanType r) {
-      if (l == r) return true;
-
-      // Allow function types to disagree about 'noescape'.
-      if (auto lf = dyn_cast<FunctionType>(l)) {
-        if (auto rf = dyn_cast<FunctionType>(r)) {
-          return lf.getInput() == rf.getInput()
-              && lf.getResult() == rf.getResult()
-              && lf->getExtInfo().withNoEscape(false) ==
-                 lf->getExtInfo().withNoEscape(false);
-        }
-      }
-      return false;
-    };
-
-    static const auto isSingleElementTuple = [](CanType type, CanType eltType) {
-      if (auto tupleType = dyn_cast<TupleType>(type)) {
-        return tupleType->getNumElements() == 1 &&
-               areSimilarTypes(tupleType.getElementType(0), eltType);
-      }
-      return false;
-    };
-
-    // We only allow a very modest set of changes to a type.
-    assert(areSimilarTypes(newType, type) ||
-           isSingleElementTuple(newType, type) ||
-           isSingleElementTuple(type, newType));
-#endif
-    type = newType;
-  }
   
   /// Emit an equivalent value with independent ownership.
   RValue copy(SILGenFunction &SGF, SILLocation loc) const &;
@@ -354,6 +337,8 @@ public:
 
   /// Borrow all subvalues of the rvalue.
   RValue borrow(SILGenFunction &SGF, SILLocation loc) const &;
+
+  RValue copyForDiagnostics() const;
 
   static bool areObviouslySameValue(SILValue lhs, SILValue rhs);
   bool isObviouslyEqual(const RValue &rhs) const;

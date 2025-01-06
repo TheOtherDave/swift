@@ -17,25 +17,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#if !(defined(DIAG) || (defined(ERROR) && defined(WARNING) && defined(NOTE)))
-#  error Must define either DIAG or the set {ERROR,WARNING,NOTE}
-#endif
-
-#ifndef ERROR
-#  define ERROR(ID,Options,Text,Signature)   \
-  DIAG(ERROR,ID,Options,Text,Signature)
-#endif
-
-#ifndef WARNING
-#  define WARNING(ID,Options,Text,Signature) \
-  DIAG(WARNING,ID,Options,Text,Signature)
-#endif
-
-#ifndef NOTE
-#  define NOTE(ID,Options,Text,Signature) \
-  DIAG(NOTE,ID,Options,Text,Signature)
-#endif
-
+#define DEFINE_DIAGNOSTIC_MACROS
+#include "DefineDiagnosticMacros.h"
 
 ERROR(no_llvm_target,none,
       "error loading LLVM target for triple '%0': %1", (StringRef, StringRef))
@@ -63,12 +46,39 @@ ERROR(alignment_dynamic_type_layout_unsupported,none,
 ERROR(alignment_less_than_natural,none,
       "@_alignment cannot decrease alignment below natural alignment of %0",
       (unsigned))
+ERROR(alignment_more_than_maximum,none,
+      "@_alignment cannot increase alignment above maximum alignment of %0",
+      (unsigned))
+      
+ERROR(temporary_allocation_size_negative,none,
+      "allocation capacity must be greater than or equal to zero", ())
+ERROR(temporary_allocation_size_overflow,none,
+      "allocation byte count too large", ())
+ERROR(temporary_allocation_alignment_not_positive,none,
+      "alignment value must be greater than zero", ())
+ERROR(temporary_allocation_alignment_not_power_of_2,none,
+      "alignment value must be a power of two", ())
 
-#ifndef DIAG_NO_UNDEF
-# if defined(DIAG)
-#  undef DIAG
-# endif
-# undef NOTE
-# undef WARNING
-# undef ERROR
-#endif
+ERROR(explosion_size_oveflow,none,
+      "explosion size too large", ())
+
+NOTE(layout_strings_blocked,none,
+     "Layout string value witnesses have been disabled for module '%0' "
+     "through block list entry", (StringRef))
+
+ERROR(attr_objc_implementation_resilient_property_not_supported, none,
+      "'@implementation' does not support stored properties whose size can "
+      "change due to library evolution; store this value in an object or 'any' "
+      "type",
+      ())
+ERROR(attr_objc_implementation_resilient_property_deployment_target, none,
+      "'@implementation' on %0 %1 does not support stored properties whose "
+      "size can change due to library evolution; raise the minimum deployment "
+      "target to %0 %2 or store this value in an object or 'any' type",
+      (StringRef, const llvm::VersionTuple, const llvm::VersionTuple))
+
+ERROR(unable_to_load_pass_plugin,none,
+      "unable to load plugin '%0': '%1'", (StringRef, StringRef))
+
+#define UNDEFINE_DIAGNOSTIC_MACROS
+#include "DefineDiagnosticMacros.h"

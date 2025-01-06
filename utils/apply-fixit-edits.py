@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # utils/apply-fixit-edits.py - Apply edits from .remap files -*- python -*-
 #
 # This source file is part of the Swift.org open source project
@@ -8,8 +8,6 @@
 #
 # See https://swift.org/LICENSE.txt for license information
 # See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
-
-from __future__ import print_function
 
 import argparse
 import collections
@@ -36,8 +34,6 @@ def apply_edits(path):
     for remap_file in remap_files:
         with open(remap_file) as f:
             json_data = f.read()
-        json_data = json_data.replace(",\n }", "\n }")
-        json_data = json_data.replace(",\n]", "\n]")
         curr_edits = json.loads(json_data)
         for ed in curr_edits:
             fname = ed["file"]
@@ -46,7 +42,7 @@ def apply_edits(path):
             text = ed.get("text", "")
             edits_per_file[fname].append((offset, length, text))
 
-    for fname, edits in edits_per_file.iteritems():
+    for fname, edits in edits_per_file.items():
         print('Updating', fname)
         edits.sort(reverse=True)
         with open(fname) as f:

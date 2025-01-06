@@ -472,7 +472,7 @@ their naming:
 Prefix and suffix operations should be migrated to be subscripting operations
 with one-sided ranges i.e. `s.prefix(upTo: i)` should become `s[..<i]`, as
 in
-[this proposal](https://github.com/apple/swift-evolution/blob/9cf2685293108ea3efcbebb7ee6a8618b83d4a90/proposals/0132-sequence-end-ops.md).
+[this proposal](https://github.com/swiftlang/swift-evolution/blob/9cf2685293108ea3efcbebb7ee6a8618b83d4a90/proposals/0132-sequence-end-ops.md).
 With generic subscripting in the language, that will allow us to collapse a wide
 variety of methods and subscript overloads into a single implementation, and
 give users an easy-to-use and composable way to describe subranges.
@@ -845,7 +845,7 @@ logical operations in different ways, with the following axes:
 
 We should represent these aspects as orthogonal, composable components,
 abstracting pattern matchers into a protocol like
-[this one](https://github.com/apple/swift/blob/master/test/Prototypes/PatternMatching.swift#L33),
+[this one](https://github.com/swiftlang/swift/blob/main/test/Prototypes/PatternMatching.swift#L33),
 that can allow us to define logical operations once, without introducing
 overloads, and massively reducing API surface area.
 
@@ -895,7 +895,7 @@ difficult to serialize.
 
 The index translation problem has two aspects:
 
-  1. `String` views cannot consume one anothers' indices without a cumbersome
+  1. `String` views cannot consume one another's indices without a cumbersome
     conversion step.  An index into a `String`'s `characters` must be translated
     before it can be used as a position in its `unicodeScalars`.  Although these
     translations are rarely needed, they add conceptual and API complexity.
@@ -1022,10 +1022,11 @@ domain-specific language (just write ordinary swift code!) and its type safety
 problems (put the data right where it belongs!) but the following issues prevent
 it from being useful for localized formatting (among other jobs):
 
-  * [SR-2303](https://bugs.swift.org/browse/SR-2303) We are unable to restrict
-    types used in string interpolation.
-  * [SR-1260](https://bugs.swift.org/browse/SR-1260) String interpolation can't
-    distinguish (fragments of) the base string from the string substitutions.
+  * [#44910](https://github.com/swiftlang/swift/issues/44910): We are unable to
+    restrict types used in string interpolation.
+  * [#43868](https://github.com/swiftlang/swift/issues/43868): String interpolation
+    can't distinguish (fragments of) the base string
+    from the string substitutions.
 
 In the long run, we should improve Swift string interpolation to the point where
 it can participate in most any formatting job.  Mostly this centers around
@@ -1188,7 +1189,7 @@ typealias Substring = StringFacade<StringStorage.SubSequence>
 This design would allow us to de-emphasize lower-level `String` APIs such as
 access to the specific encoding, by putting them behind a `.unicode` property.
 A similar effect in a facade-less design would require a new top-level
-`StringProtocol` playing the role of the facade with an an `associatedtype
+`StringProtocol` playing the role of the facade with an `associatedtype
 Storage : Unicode`.
 
 An interesting variation on this design is possible if defaulted generic

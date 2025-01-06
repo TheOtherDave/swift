@@ -13,21 +13,33 @@
 #include "sourcekitd/sourcekitd.h"
 
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/Support/Signals.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Signals.h"
+#include "llvm/Support/raw_ostream.h"
 #include <fstream>
+#include <optional>
 #include <regex>
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
 #include <unistd.h>
 #include <sys/param.h>
+#elif defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <Windows.h>
+#endif
 
 // FIXME: Platform compatibility.
 #include <dispatch/dispatch.h>
 
 using namespace llvm;
+
+#if defined(_WIN32)
+namespace {
+int STDOUT_FILENO = _fileno(stdout);
+}
+#endif
 
 namespace {
 struct TestOptions {
@@ -35,26 +47,29 @@ struct TestOptions {
   StringRef completionToken;
   StringRef popularAPI;
   StringRef unpopularAPI;
-  Optional<bool> sortByName;
-  Optional<bool> useImportDepth;
-  Optional<bool> groupOverloads;
-  Optional<bool> groupStems;
-  Optional<bool> includeExactMatch;
-  Optional<bool> addInnerResults;
-  Optional<bool> addInnerOperators;
-  Optional<bool> addInitsToTopLevel;
-  Optional<unsigned> requestStart;
-  Optional<unsigned> requestLimit;
-  Optional<unsigned> hideUnderscores;
-  Optional<bool> hideByName;
-  Optional<bool> hideLowPriority;
-  Optional<unsigned> showTopNonLiteral;
-  Optional<bool> fuzzyMatching;
-  Optional<unsigned> fuzzyWeight;
-  Optional<unsigned> popularityBonus;
+  std::optional<bool> sortByName;
+  std::optional<bool> useImportDepth;
+  std::optional<bool> groupOverloads;
+  std::optional<bool> groupStems;
+  std::optional<bool> includeExactMatch;
+  std::optional<bool> addInnerResults;
+  std::optional<bool> addInnerOperators;
+  std::optional<bool> addInitsToTopLevel;
+  std::optional<unsigned> requestStart;
+  std::optional<unsigned> requestLimit;
+  std::optional<unsigned> hideUnderscores;
+  std::optional<bool> hideByName;
+  std::optional<bool> hideLowPriority;
+  std::optional<unsigned> showTopNonLiteral;
+  std::optional<bool> fuzzyMatching;
+  std::optional<unsigned> fuzzyWeight;
+  std::optional<unsigned> popularityBonus;
   StringRef filterRulesJSON;
+  std::string moduleCachePath;
   bool rawOutput = false;
   bool structureOutput = false;
+  bool disableImplicitConcurrencyModuleImport = false;
+  bool disableImplicitStringProcessingModuleImport = false;
   ArrayRef<const char *> compilerArgs;
 };
 } // end anonymous namespace
@@ -64,7 +79,6 @@ static sourcekitd_uid_t KeyRequest;
 static sourcekitd_uid_t KeyCompilerArgs;
 static sourcekitd_uid_t KeyOffset;
 static sourcekitd_uid_t KeyLength;
-static sourcekitd_uid_t KeyActionable;
 static sourcekitd_uid_t KeySourceFile;
 static sourcekitd_uid_t KeySourceText;
 static sourcekitd_uid_t KeyName;
@@ -112,12 +126,12 @@ static bool parseOptions(ArrayRef<const char *> args, TestOptions &options,
       options.compilerArgs = args.slice(i + 1);
       break;
     }
-    if (opt == "-" || !opt.startswith("-")) {
+    if (opt == "-" || !opt.starts_with("-")) {
       options.sourceFile = args[i];
       continue;
     }
 
-    if (opt.startswith("--")) {
+    if (opt.starts_with("--")) {
       error = std::string("unrecognized option '") + args[i] + "'";
       return false;
     }
@@ -240,6 +254,12 @@ static bool parseOptions(ArrayRef<const char *> args, TestOptions &options,
         return false;
       }
       options.showTopNonLiteral = uval;
+    } else if (opt == "module-cache-path") {
+      options.moduleCachePath = value.str();
+    } else if (opt == "disable-implicit-concurrency-module-import") {
+      options.disableImplicitConcurrencyModuleImport = true;
+    } else if (opt == "disable-implicit-string-processing-module-import") {
+      options.disableImplicitStringProcessingModuleImport = true;
     }
   }
 
@@ -286,7 +306,6 @@ static int skt_main(int argc, const char **argv) {
   KeyCompilerArgs = sourcekitd_uid_get_from_cstr("key.compilerargs");
   KeyOffset = sourcekitd_uid_get_from_cstr("key.offset");
   KeyLength = sourcekitd_uid_get_from_cstr("key.length");
-  KeyActionable = sourcekitd_uid_get_from_cstr("key.actionable");
   KeyKind = sourcekitd_uid_get_from_cstr("key.kind");
   KeyCodeCompleteOptions =
       sourcekitd_uid_get_from_cstr("key.codecomplete.options");
@@ -339,7 +358,7 @@ static int skt_main(int argc, const char **argv) {
   KeyUnpopular = sourcekitd_uid_get_from_cstr("key.unpopular");
   KeySubStructure = sourcekitd_uid_get_from_cstr("key.substructure");
 
-  auto Args = llvm::makeArrayRef(argv + 1, argc - 1);
+  auto Args = llvm::ArrayRef(argv + 1, argc - 1);
   TestOptions options;
   std::string error;
   if (!parseOptions(Args, options, error)) {
@@ -382,7 +401,6 @@ removeCodeCompletionTokens(StringRef Input, StringRef TokenName,
     if (match[1].str() != TokenName)
       continue;
     *CompletionOffset = CleanFile.size();
-    CleanFile.push_back('\0');
     if (match.size() == 2 || !match[2].matched)
       continue;
 
@@ -391,7 +409,7 @@ removeCodeCompletionTokens(StringRef Input, StringRef TokenName,
     StringRef next = StringRef(fullMatch).split(',').second;
     while (next != "") {
       auto split = next.split(',');
-      prefixes.push_back(split.first);
+      prefixes.push_back(split.first.str());
       next = split.second;
     }
   }
@@ -553,6 +571,7 @@ public:
 static void printResponse(sourcekitd_response_t resp, bool raw, bool structure,
                           unsigned indentation) {
   if (raw) {
+    llvm::outs().flush();
     sourcekitd_response_description_dump_filedesc(resp, STDOUT_FILENO);
     return;
   }
@@ -606,7 +625,7 @@ static bool codeCompleteRequest(sourcekitd_uid_t requestUID, const char *name,
 
   auto opts = sourcekitd_request_dictionary_create(nullptr, nullptr, 0);
   {
-    auto addBoolOption = [&](sourcekitd_uid_t key, Optional<bool> option) {
+    auto addBoolOption = [&](sourcekitd_uid_t key, std::optional<bool> option) {
       if (option)
         sourcekitd_request_dictionary_set_int64(opts, key, *option);
     };
@@ -622,7 +641,8 @@ static bool codeCompleteRequest(sourcekitd_uid_t requestUID, const char *name,
     addBoolOption(KeyHideLowPriority, options.hideLowPriority);
     addBoolOption(KeyHideByName, options.hideByName);
 
-    auto addIntOption = [&](sourcekitd_uid_t key, Optional<unsigned> option) {
+    auto addIntOption = [&](sourcekitd_uid_t key,
+                            std::optional<unsigned> option) {
       if (option)
         sourcekitd_request_dictionary_set_int64(opts, key, *option);
     };
@@ -664,9 +684,25 @@ static bool codeCompleteRequest(sourcekitd_uid_t requestUID, const char *name,
       sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND,"-sdk");
       sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND, sdk);
     }
+    if (!options.moduleCachePath.empty()) {
+      sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND, "-module-cache-path");
+      sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND, options.moduleCachePath.c_str());
+    }
     // Add -- options.
     for (const char *arg : options.compilerArgs)
       sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND, arg);
+    if (options.disableImplicitConcurrencyModuleImport) {
+      sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND,
+          "-Xfrontend");
+      sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND,
+          "-disable-implicit-concurrency-module-import");
+    }
+    if (options.disableImplicitStringProcessingModuleImport) {
+      sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND,
+          "-Xfrontend");
+      sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND,
+          "-disable-implicit-string-processing-module-import");
+    }
   }
   sourcekitd_request_dictionary_set_value(request, KeyCompilerArgs, args);
   sourcekitd_request_release(args);
@@ -679,7 +715,7 @@ static bool codeCompleteRequest(sourcekitd_uid_t requestUID, const char *name,
 
 static bool readPopularAPIList(StringRef filename,
                                std::vector<std::string> &result) {
-  std::ifstream in(filename);
+  std::ifstream in(filename.str());
   if (!in.is_open()) {
     llvm::errs() << "error opening '" << filename << "'\n";
     return true;

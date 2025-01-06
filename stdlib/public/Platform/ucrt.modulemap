@@ -10,13 +10,13 @@
 //
 //===----------------------------------------------------------------------===//
 
+module _complex [system] {
+  header "complex.h"
+  export *
+}
+
 module ucrt [system] {
   module C {
-    module complex {
-      header "complex.h"
-      export *
-    }
-
     module ctype {
       header "ctype.h"
       export *
@@ -29,6 +29,11 @@ module ucrt [system] {
 
     module fenv {
       header "fenv.h"
+      export *
+    }
+
+    module float {
+      header "float.h"
       export *
     }
 
@@ -60,6 +65,13 @@ module ucrt [system] {
     module stdio {
       header "stdio.h"
       export *
+
+      // NOTE(compnerd) this is a horrible workaround for the fact that
+      // Microsoft has fully inlined nearly all of the printf family of
+      // functions in the headers which results in the definitions being elided
+      // resulting in undefined symbols.  The legacy_stdio_definitions provides
+      // out-of-line definitions for these functions.
+      link "legacy_stdio_definitions"
     }
 
     module stdlib {
@@ -78,11 +90,22 @@ module ucrt [system] {
     }
 
     module POSIX {
+      module fcntl {
+        header "fcntl.h"
+        export *
+      }
+
       module sys {
         export *
 
         module stat {
           header "sys/stat.h"
+          header "direct.h"
+          export *
+        }
+
+        module timeb {
+          header "sys/timeb.h"
           export *
         }
 
@@ -99,8 +122,91 @@ module ucrt [system] {
     }
   }
 
+  module conio {
+    header "conio.h"
+    export *
+  }
+
+  module dos {
+    header "dos.h"
+    export *
+  }
+
+  module malloc {
+    header "malloc.h"
+    export *
+  }
+
+  module minmax {
+    header "minmax.h"
+    export *
+  }
+
+  module multibyte {
+    header "mbstring.h"
+    export *
+  }
+
+  module process {
+    header "process.h"
+    export *
+  }
+
+  module wchar {
+    header "wchar.h"
+    export *
+  }
+}
+
+module corecrt [system] {
+  use vcruntime
+
+  header "corecrt.h"
+  header "corecrt_stdio_config.h"
+  export *
+
+  module conio {
+    header "corecrt_wconio.h"
+    export *
+  }
+
   module io {
     header "corecrt_io.h"
+    export *
+  }
+
+  module malloc {
+    header "corecrt_malloc.h"
+    export *
+  }
+
+  module math {
+    header "corecrt_math.h"
+    export *
+  }
+
+  module share {
+    header "corecrt_share.h"
+    export *
+  }
+
+  module stdio {
+    header "corecrt_wstdio.h"
+    export *
+  }
+
+  module stdlib {
+    header "corecrt_wstdlib.h"
+    export *
+  }
+
+  module string {
+    header "corecrt_wstring.h"
+    export *
+  }
+
+  module time {
+    header "corecrt_wtime.h"
     export *
   }
 }

@@ -17,13 +17,15 @@
 #ifndef SWIFT_ATTRKIND_H
 #define SWIFT_ATTRKIND_H
 
+#include "swift/Basic/InlineBitfield.h"
+#include "swift/Basic/LLVM.h"
 #include "swift/Config.h"
 #include "llvm/Support/DataTypes.h"
 
 namespace swift {
 
 /// The associativity of a binary operator.
-enum class Associativity : unsigned char {
+enum class Associativity : uint8_t {
   /// Non-associative operators cannot be written next to other
   /// operators with the same precedence.  Relational operators are
   /// typically non-associative.
@@ -37,6 +39,9 @@ enum class Associativity : unsigned char {
   /// next to other right-associative operators of the same precedence.
   Right
 };
+
+/// Returns the in-source spelling of the given associativity.
+StringRef getAssociativitySpelling(Associativity value);
 
 /// The kind of unary operator, if any.
 enum class UnaryOperatorKind : uint8_t {
@@ -55,6 +60,12 @@ enum class AccessLevel : uint8_t {
   FilePrivate,
   /// Internal access is limited to the current module.
   Internal,
+  /// Package access is not limited, but some capabilities may be
+  /// restricted outside of the current package containing modules.
+  /// It's similar to Public in that it's accessible from other modules
+  /// and subclassable only within the defining module as long as
+  /// the modules are in the same package.
+  Package,
   /// Public access is not limited, but some capabilities may be
   /// restricted outside of the current module.
   Public,
@@ -62,33 +73,84 @@ enum class AccessLevel : uint8_t {
   Open,
 };
 
+/// Returns the in-source spelling of the given access level.
+StringRef getAccessLevelSpelling(AccessLevel value);
+
 enum class InlineKind : uint8_t {
   Never = 0,
-  Always = 1
+  Always = 1,
+  Last_InlineKind = Always
 };
 
-/// This enum represents the possible values of the @effects attribute.
+enum : unsigned { NumInlineKindBits =
+  countBitsUsed(static_cast<unsigned>(InlineKind::Last_InlineKind)) };
+
+
+/// This enum represents the possible values of the @_effects attribute.
 /// These values are ordered from the strongest guarantee to the weakest,
 /// so please do not reorder existing values.
 enum class EffectsKind : uint8_t {
   ReadNone,
   ReadOnly,
+  ReleaseNone,
   ReadWrite,
-  Unspecified
+  Unspecified,
+  Custom,
+  Last_EffectsKind = Unspecified
 };
 
+enum : unsigned { NumEffectsKindBits =
+  countBitsUsed(static_cast<unsigned>(EffectsKind::Last_EffectsKind)) };
+
+/// This enum represents the possible values of the @_expose attribute.
+enum class ExposureKind: uint8_t {
+  Cxx,
+  Wasm,
+  Last_ExposureKind = Wasm
+};
+
+enum : unsigned { NumExposureKindBits =
+  countBitsUsed(static_cast<unsigned>(ExposureKind::Last_ExposureKind)) };
   
-enum DeclAttrKind : unsigned {
-#define DECL_ATTR(_, NAME, ...) DAK_##NAME,
-#include "swift/AST/Attr.def"
-  DAK_Count
+/// This enum represents the possible values of the @_extern attribute.
+enum class ExternKind: uint8_t {
+  /// Reference an externally defined C function.
+  /// The imported function has C function pointer representation,
+  /// and is called using the C calling convention.
+  C,
+  /// Reference an externally defined function through WebAssembly's
+  /// import mechanism.
+  /// This does not specify the calling convention and can be used
+  /// with other extern kinds together.
+  /// Effectively, this is no-op on non-WebAssembly targets.
+  Wasm,
+  Last_ExternKind = Wasm
 };
 
-// Define enumerators for each type attribute, e.g. TAK_weak.
-enum TypeAttrKind {
-#define TYPE_ATTR(X) TAK_##X,
-#include "swift/AST/Attr.def"
-  TAK_Count
+enum : unsigned { NumExternKindBits =
+  countBitsUsed(static_cast<unsigned>(ExternKind::Last_ExternKind)) };
+
+enum class DeclAttrKind : unsigned {
+#define DECL_ATTR(_, CLASS, ...) CLASS,
+#define LAST_DECL_ATTR(CLASS) Last_DeclAttr = CLASS,
+#include "swift/AST/DeclAttr.def"
+};
+
+enum : unsigned {
+  NumDeclAttrKinds = static_cast<unsigned>(DeclAttrKind::Last_DeclAttr) + 1,
+  NumDeclAttrKindBits = countBitsUsed(NumDeclAttrKinds - 1),
+};
+
+// Define enumerators for each type attribute, e.g. TypeAttrKind::Weak.
+enum class TypeAttrKind {
+#define TYPE_ATTR(_, CLASS) CLASS,
+#define LAST_TYPE_ATTR(CLASS) Last_TypeAttr = CLASS,
+#include "swift/AST/TypeAttr.def"
+};
+
+enum : unsigned {
+  NumTypeAttrKinds = static_cast<unsigned>(TypeAttrKind::Last_TypeAttr) + 1,
+  NumTypeAttrKindBits = countBitsUsed(NumTypeAttrKinds - 1),
 };
 
 } // end namespace swift

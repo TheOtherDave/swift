@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2021 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -16,10 +16,12 @@
 
 import TestsUtils
 
-public let StaticArrayTest = BenchmarkInfo(
-  name: "StaticArray",
-  runFunction: run_StaticArray,
-  tags: [.validation, .api, .Array])
+public let benchmarks = [
+  BenchmarkInfo(
+    name: "StaticArray",
+    runFunction: run_StaticArray,
+    tags: [.validation, .api, .Array]),
+]
 
 protocol StaticArrayProtocol {
   associatedtype ElemTy
@@ -48,9 +50,7 @@ struct A2X<T : StaticArrayProtocol> : StaticArrayProtocol {
 
 struct StaticArray<
   T : StaticArrayProtocol
-> : StaticArrayProtocol, RandomAccessCollection, MutableCollection {
-  typealias Indices = CountableRange<Int>
-  
+> : StaticArrayProtocol, RandomAccessCollection, MutableCollection {  
   init(_ defaultValue : T.ElemTy) { values = T(defaultValue) }
   var values : T
   func get(_ idx: Int) -> T.ElemTy { return values.get(idx) }
@@ -58,7 +58,6 @@ struct StaticArray<
   func count() -> Int { return values.count() }
 
   typealias Index = Int
-  typealias IndexDistance = Int
   let startIndex: Int = 0
   var endIndex: Int { return count()}
 
@@ -89,13 +88,13 @@ typealias SA128Int = StaticArray<A2X<A2X<A2X<A2X<A2X<A2X<A0<Int>>>>>>>>
 
 // Make sure the optimizer does not optimize the compute away.
 @inline(never)
-public func sink(_ value: Int) { if False() { print(value) }}
+public func sink(_ value: Int) { if getFalse() { print(value) }}
 
 
 @inline(never)
-public func run_StaticArray(_ N: Int) {
+public func run_StaticArray(_ n: Int) {
 
-  for _ in 1...N {
+  for _ in 1...n {
     var staticArray = SA128Int(0)
     for i in 0..<staticArray.count() { staticArray[i] = i ^ 123 }
     staticArray.sort()

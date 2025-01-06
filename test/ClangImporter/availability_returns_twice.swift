@@ -1,11 +1,24 @@
-// RUN: %target-swift-frontend -typecheck -verify %s
+// RUN: %target-typecheck-verify-swift
 
-#if os(OSX) || os(iOS) || os(watchOS) || os(tvOS)
+// UNSUPPORTED: OS=windows-msvc
+
+// `setjmp` is not available on WebAssembly/WASI
+// UNSUPPORTED: OS=wasi
+
+// https://github.com/apple/swift/issues/51632
+// In Android jmp_buf is int[16], which doesn't convert to &Int
+// XFAIL: OS=linux-androideabi
+// XFAIL: OS=linux-android
+// XFAIL: OS=openbsd
+
+#if canImport(Darwin)
   import Darwin
   typealias JumpBuffer = Int32
-#else
+#elseif canImport(Glibc)
   import Glibc
   typealias JumpBuffer = jmp_buf
+#else
+#error("Unsupported platform")
 #endif
 
 func test_unavailable_returns_twice_function() {

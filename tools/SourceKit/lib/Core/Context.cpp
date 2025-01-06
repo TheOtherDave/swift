@@ -16,11 +16,37 @@
 
 using namespace SourceKit;
 
-SourceKit::Context::Context(StringRef RuntimeLibPath,
+GlobalConfig::Settings GlobalConfig::update(
+    std::optional<unsigned> CompletionMaxASTContextReuseCount,
+    std::optional<unsigned> CompletionCheckDependencyInterval) {
+  llvm::sys::ScopedLock L(Mtx);
+  if (CompletionMaxASTContextReuseCount.has_value())
+    State.IDEInspectionOpts.MaxASTContextReuseCount =
+        *CompletionMaxASTContextReuseCount;
+  if (CompletionCheckDependencyInterval.has_value())
+    State.IDEInspectionOpts.CheckDependencyInterval =
+        *CompletionCheckDependencyInterval;
+  return State;
+}
+
+GlobalConfig::Settings::IDEInspectionOptions
+GlobalConfig::getIDEInspectionOpts() const {
+  llvm::sys::ScopedLock L(Mtx);
+  return State.IDEInspectionOpts;
+}
+
+SourceKit::Context::Context(
+    StringRef SwiftExecutablePath, StringRef RuntimeLibPath,
+    StringRef DiagnosticDocumentationPath,
     llvm::function_ref<std::unique_ptr<LangSupport>(Context &)>
-    LangSupportFactoryFn,
-    bool shouldDispatchNotificationsOnMain) : RuntimeLibPath(RuntimeLibPath),
-    NotificationCtr(new NotificationCenter(shouldDispatchNotificationsOnMain)) {
+        LangSupportFactoryFn,
+    bool shouldDispatchNotificationsOnMain)
+    : SwiftExecutablePath(SwiftExecutablePath), RuntimeLibPath(RuntimeLibPath),
+      DiagnosticDocumentationPath(DiagnosticDocumentationPath),
+      NotificationCtr(
+          new NotificationCenter(shouldDispatchNotificationsOnMain)),
+      Config(new GlobalConfig()), ReqTracker(new RequestTracker()),
+      SlowRequestSim(new SlowRequestSimulator(ReqTracker)) {
   // Should be called last after everything is initialized.
   SwiftLang = LangSupportFactoryFn(*this);
 }

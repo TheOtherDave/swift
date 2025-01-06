@@ -17,6 +17,7 @@ protocol BooleanProtocol {
 extension Bool : BooleanProtocol {
   var boolValue: Bool { return self }
 }
-func f<T : BooleanProtocol>(_ b: T) {
-}
-f(true as BooleanProtocol) // expected-error {{cannot invoke 'f' with an argument list of type '(BooleanProtocol)'}} // expected-note {{expected an argument list of type '(T)'}}
+func f<T : BooleanProtocol>(_ b: T) {}
+// expected-note@-1 {{required by global function 'f' where 'T' = 'any BooleanProtocol'}}
+
+f(true as BooleanProtocol) // expected-error {{type 'any BooleanProtocol' cannot conform to 'BooleanProtocol'}} expected-note {{only concrete types such as structs, enums and classes can conform to protocols}}

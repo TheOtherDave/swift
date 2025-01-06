@@ -14,55 +14,6 @@ import ObjectiveC
 import Foundation
 import StdlibUnittest
 
-internal var _temporaryLocaleCurrentLocale: NSLocale?
-
-extension NSLocale {
-  @objc
-  public class func _swiftUnittest_currentLocale() -> NSLocale {
-    return _temporaryLocaleCurrentLocale!
-  }
-}
-
-public func withOverriddenLocaleCurrentLocale<Result>(
-  _ temporaryLocale: NSLocale,
-  _ body: () -> Result
-) -> Result {
-  guard let oldMethod = class_getClassMethod(
-    NSLocale.self, #selector(getter: NSLocale.current)) as Optional
-  else {
-    _preconditionFailure("Could not find +[Locale currentLocale]")
-  }
-
-  guard let newMethod = class_getClassMethod(
-    NSLocale.self, #selector(NSLocale._swiftUnittest_currentLocale)) as Optional
-  else {
-    _preconditionFailure("Could not find +[Locale _swiftUnittest_currentLocale]")
-  }
-
-  precondition(_temporaryLocaleCurrentLocale == nil,
-    "Nested calls to withOverriddenLocaleCurrentLocale are not supported")
-
-  _temporaryLocaleCurrentLocale = temporaryLocale
-  method_exchangeImplementations(oldMethod, newMethod)
-  let result = body()
-  method_exchangeImplementations(newMethod, oldMethod)
-  _temporaryLocaleCurrentLocale = nil
-
-  return result
-}
-
-public func withOverriddenLocaleCurrentLocale<Result>(
-  _ temporaryLocaleIdentifier: String,
-  _ body: () -> Result
-) -> Result {
-  precondition(
-    NSLocale.availableLocaleIdentifiers.contains(temporaryLocaleIdentifier),
-    "Requested locale \(temporaryLocaleIdentifier) is not available")
-
-  return withOverriddenLocaleCurrentLocale(
-    NSLocale(localeIdentifier: temporaryLocaleIdentifier), body)
-}
-
 /// Executes the `body` in an autorelease pool if the platform does not
 /// implement the return-autoreleased optimization.
 ///
@@ -72,14 +23,14 @@ public func withOverriddenLocaleCurrentLocale<Result>(
 public func autoreleasepoolIfUnoptimizedReturnAutoreleased(
   invoking body: () -> Void
 ) {
-#if arch(i386) && (os(iOS) || os(watchOS))
+#if targetEnvironment(simulator) && arch(i386) && (os(iOS) || os(watchOS) || os(visionOS))
   autoreleasepool(invoking: body)
 #else
   body()
 #endif
 }
 
-@_versioned
+@usableFromInline
 @_silgen_name("NSArray_getObjects")
 func NSArray_getObjects(
   nsArray: AnyObject,
@@ -100,23 +51,26 @@ extension NSArray {
   }
 }
 
-@_silgen_name("NSDictionary_getObjects")
-func NSDictionary_getObjects(
+@_silgen_name("NSDictionary_getObjectsAndKeysWithCount")
+func NSDictionary_getObjectsAndKeysWithCount(
   nsDictionary: NSDictionary,
   objects: AutoreleasingUnsafeMutablePointer<AnyObject?>?,
-  andKeys keys: AutoreleasingUnsafeMutablePointer<AnyObject?>?
+  andKeys keys: AutoreleasingUnsafeMutablePointer<AnyObject?>?,
+  count: Int
 )
 
 extension NSDictionary {
   @nonobjc // FIXME: there should be no need in this attribute.
   public func available_getObjects(
     _ objects: AutoreleasingUnsafeMutablePointer<AnyObject?>?,
-    andKeys keys: AutoreleasingUnsafeMutablePointer<AnyObject?>?
+    andKeys keys: AutoreleasingUnsafeMutablePointer<AnyObject?>?,
+    count: Int
   ) {
-    return NSDictionary_getObjects(
+    return NSDictionary_getObjectsAndKeysWithCount(
       nsDictionary: self,
       objects: objects,
-      andKeys: keys)
+      andKeys: keys,
+      count: count)
   }
 }
 

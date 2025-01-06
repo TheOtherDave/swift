@@ -1,10 +1,22 @@
-// RUN: %empty-directory(%t)
-// RUN: cp %s %t/main.swift
-// RUN: %target-build-swift -Xfrontend -playground -Xfrontend -playground-high-performance -Xfrontend -debugger-support -o %t/main %S/Inputs/PlaygroundsRuntime.swift %t/main.swift
-// RUN: %target-run %t/main | %FileCheck %s
-// RUN: %target-build-swift -Xfrontend -pc-macro -Xfrontend -playground -Xfrontend -playground-high-performance -Xfrontend -debugger-support -o %t/main %S/Inputs/PlaygroundsRuntime.swift %S/Inputs/SilentPCMacroRuntime.swift %t/main.swift
-// RUN: %target-run %t/main | %FileCheck %s
+// Tests that `-playground-high-performance` turns off expensive logging, and
+// that turning off the corresponding options using `-playground-option` with
+// a `No` prefix does the same thing.
+//
 // REQUIRES: executable_test
+//
+// -playground -playground-high-performance
+// RUN: %target-playground-build-run-swift(-swift-version 5 -Xfrontend -playground -Xfrontend -playground-high-performance) | %FileCheck %s
+// RUN: %target-playground-build-run-swift(-swift-version 6 -Xfrontend -playground -Xfrontend -playground-high-performance) | %FileCheck %s
+//
+// -pc-macro -playground  -playground-high-performance
+// RUN: %target-playground-build-run-swift(-swift-version 5 -Xfrontend -pc-macro -Xfrontend -playground -Xfrontend -playground-high-performance) | %FileCheck %s
+// RUN: %target-playground-build-run-swift(-swift-version 6 -Xfrontend -pc-macro -Xfrontend -playground -Xfrontend -playground-high-performance) | %FileCheck %s
+//
+// -playground -playground-option NoScopeEvents -playground-option NoFunctionParameters
+// RUN: %target-playground-build-run-swift(-swift-version 5 -Xfrontend -playground -Xfrontend -playground-option -Xfrontend NoScopeEvents -Xfrontend -playground-option -Xfrontend NoFunctionParameters) | %FileCheck %s
+// RUN: %target-playground-build-run-swift(-swift-version 6 -Xfrontend -playground -Xfrontend -playground-option -Xfrontend NoScopeEvents -Xfrontend -playground-option -Xfrontend NoFunctionParameters) | %FileCheck %s
+
+import PlaygroundSupport
 
 var a = true
 if (a) {
@@ -16,26 +28,26 @@ if (a) {
 for i in 0..<3 {
   i
 }
-// CHECK: [{{.*}}] $builtin_log[a='true']
-// CHECK-NEXT: [{{.*}}] $builtin_log[='5']
-// CHECK-NEXT: [{{.*}}] $builtin_log[='0']
-// CHECK-NEXT: [{{.*}}] $builtin_log[='1']
-// CHECK-NEXT: [{{.*}}] $builtin_log[='2']
+// CHECK: [{{.*}}] __builtin_log[a='true']
+// CHECK-NEXT: [{{.*}}] __builtin_log[='5']
+// CHECK-NEXT: [{{.*}}] __builtin_log[='0']
+// CHECK-NEXT: [{{.*}}] __builtin_log[='1']
+// CHECK-NEXT: [{{.*}}] __builtin_log[='2']
 
 var b = true
 for i in 0..<3 {
   i
   continue
 }
-// CHECK-NEXT: [{{.*}}] $builtin_log[b='true']
-// CHECK-NEXT: [{{.*}}] $builtin_log[='0']
-// CHECK-NEXT: [{{.*}}] $builtin_log[='1']
-// CHECK-NEXT: [{{.*}}] $builtin_log[='2']
+// CHECK-NEXT: [{{.*}}] __builtin_log[b='true']
+// CHECK-NEXT: [{{.*}}] __builtin_log[='0']
+// CHECK-NEXT: [{{.*}}] __builtin_log[='1']
+// CHECK-NEXT: [{{.*}}] __builtin_log[='2']
 
 var c = true
 for i in 0..<3 {
   i
   break
 }
-// CHECK-NEXT: [{{.*}}] $builtin_log[c='true']
-// CHECK-NEXT: [{{.*}}] $builtin_log[='0']
+// CHECK-NEXT: [{{.*}}] __builtin_log[c='true']
+// CHECK-NEXT: [{{.*}}] __builtin_log[='0']

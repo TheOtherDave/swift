@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2021 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -12,59 +12,66 @@
 
 import TestsUtils
 
-public let ReversedCollections = [
-  BenchmarkInfo(name: "ReversedArray", runFunction: run_ReversedArray, tags: [.validation, .api, .Array]),
-  BenchmarkInfo(name: "ReversedBidirectional", runFunction: run_ReversedBidirectional, tags: [.validation, .api]),
-  BenchmarkInfo(name: "ReversedDictionary", runFunction: run_ReversedDictionary, tags: [.validation, .api, .Dictionary]),
+public let benchmarks = [
+  BenchmarkInfo(name: "ReversedArray2", runFunction: run_ReversedArray, tags: [.validation, .api, .Array],
+      setUpFunction: { blackHole(arrayInput) },
+      tearDownFunction: { arrayInput = nil }),
+  BenchmarkInfo(name: "ReversedBidirectional", runFunction: run_ReversedBidirectional, tags: [.validation, .api, .cpubench]),
+  BenchmarkInfo(name: "ReversedDictionary2", runFunction: run_ReversedDictionary, tags: [.validation, .api, .Dictionary],
+      setUpFunction: { blackHole(dictionaryInput) },
+      tearDownFunction: { dictionaryInput = nil })
 ]
 
 // These benchmarks compare the performance of iteration through several
 // collection types after being reversed.
-var x = 0
 let length = 100_000
 
+var arrayInput: [Int]! = Array(repeating: 1, count: length).reversed()
+
 @inline(never)
-public func run_ReversedArray(_ N: Int) {
-  let array = Array(repeating: 1, count: length)
-  let reversedArray = array.reversed()
+public func run_ReversedArray(_ n: Int) {
+  let reversedArray: [Int] = arrayInput
 
   // Iterate over the underlying type
   // ReversedRandomAccessCollection<Array<Int>>
-  for _ in 1...N {
+  for _ in 1...n {
     for item in reversedArray {
-      x = item
+      blackHole(item)
     }
   }
 }
 
 @inline(never)
-public func run_ReversedBidirectional(_ N: Int) {
-  let bidirectional = AnyBidirectionalCollection(0..<length)
-  let reversedBidirectional = bidirectional.reversed()
-
+public func run_ReversedBidirectional(_ n: Int) {
   // Iterate over the underlying type
   // ReversedCollection<AnyBidirectionalCollection<Int>>
-  for _ in 1...N {
+  for _ in 1...n {
+    let bidirectional = AnyBidirectionalCollection(0..<length)
+    let reversedBidirectional = bidirectional.reversed()
     for item in reversedBidirectional {
-      x = item
+      blackHole(item)
     }
   }
 }
 
-@inline(never)
-public func run_ReversedDictionary(_ N: Int) {
+var dictionaryInput: [(Int, Int)]! = {
   var dictionary = [Int: Int]()
   for k in 0..<length {
-    dictionary[k] = x
+    dictionary[k] = k
   }
-  let reversedDictionary = dictionary.reversed()
+  return dictionary.reversed()
+}()
+
+@inline(never)
+public func run_ReversedDictionary(_ n: Int) {
+  let reversedDictionary: [(Int, Int)] = dictionaryInput
 
   // Iterate over the underlying type
   // Array<(Int, Int)>
-  for _ in 1...N {
+  for _ in 1...n {
     for (key, value) in reversedDictionary {
-      x = key
-      x = value
+      blackHole(key)
+      blackHole(value)
     }
   }
 }

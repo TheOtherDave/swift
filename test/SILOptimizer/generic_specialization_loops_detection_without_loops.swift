@@ -6,7 +6,7 @@
 // Tests in this file should not result in any detected specialization loops at all.
 // CHECK-NOT: generic specialization loop
 
-// Check specializations of mutually recusrive functions, where
+// Check specializations of mutually recursive functions, where
 // there is no specialization loop.
 // CHECK-LABEL: sil{{.*}}testFooBar1{{.*}}convention
 @inline(never)
@@ -35,7 +35,7 @@ public func testFooBar6() {
   foo6(1)
 }
 
-// Check specializations of mutually recusrive functions, where
+// Check specializations of mutually recursive functions, where
 // there is no specialization loop.
 @inline(never)
 public func foo2<T>(_ x: [T]) {
@@ -137,13 +137,13 @@ func flood2<T>(_ x: T) {
 @inline(never)
 public func run_TypeFlood(_ N: Int) {
   for _ in 1...N {
-    flood3(Some1<Some1<Some1<Int>>>())
-    flood3(Some1<Some1<Some0<Int>>>())
-    flood3(Some1<Some0<Some1<Int>>>())
-    flood3(Some1<Some0<Some0<Int>>>())
-    flood3(Some0<Some1<Some1<Int>>>())
-    flood3(Some0<Some1<Some0<Int>>>())
-    flood3(Some0<Some0<Some1<Int>>>())
-    flood3(Some0<Some0<Some0<Int>>>())
+    flood2(Some1<Some1<Some1<Int>>>())
+    flood2(Some1<Some1<Some0<Int>>>())
+    flood2(Some1<Some0<Some1<Int>>>())
+    flood2(Some1<Some0<Some0<Int>>>())
+    flood2(Some0<Some1<Some1<Int>>>())
+    flood2(Some0<Some1<Some0<Int>>>())
+    flood2(Some0<Some0<Some1<Int>>>())
+    flood2(Some0<Some0<Some0<Int>>>())
   }
 }

@@ -1,5 +1,5 @@
 if(TARGET swiftDemangle)
-  add_swift_unittest(SwiftDemangleTests
+  add_swift_unittest(SwiftDemangleTests IS_TARGET_TEST
     DemangleTest.cpp
   )
   set_target_properties(SwiftDemangleTests
@@ -7,6 +7,7 @@ if(TARGET swiftDemangle)
   )
   
   target_link_libraries(SwiftDemangleTests
+    PRIVATE
     swiftDemangle
   )
 endif()

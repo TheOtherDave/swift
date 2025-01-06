@@ -20,6 +20,7 @@
 #define SWIFT_IRGEN_RESILIENTTYPEINFO_H
 
 #include "NonFixedTypeInfo.h"
+#include "Outlining.h"
 
 namespace swift {
 namespace irgen {
@@ -42,9 +43,13 @@ namespace irgen {
 template <class Impl>
 class ResilientTypeInfo : public WitnessSizedTypeInfo<Impl> {
 protected:
-  ResilientTypeInfo(llvm::Type *type)
+  ResilientTypeInfo(llvm::Type *type,
+                    IsCopyable_t copyable,
+                    IsABIAccessible_t abiAccessible)
     : WitnessSizedTypeInfo<Impl>(type, Alignment(1),
-                                 IsNotPOD, IsNotBitwiseTakable) {}
+                                 IsNotTriviallyDestroyable, IsNotBitwiseTakable,
+                                 copyable,
+                                 abiAccessible) {}
 
 public:
   void assignWithCopy(IRGenFunction &IGF, Address dest, Address src, SILType T,
@@ -87,13 +92,6 @@ public:
     return this->getAddressForPointer(addr);
   }
 
-  Address initializeBufferWithTakeOfBuffer(IRGenFunction &IGF,
-                                   Address dest, Address src,
-                                   SILType T) const override {
-    auto addr = emitInitializeBufferWithTakeOfBufferCall(IGF, T, dest, src);
-    return this->getAddressForPointer(addr);
-  }
-
   void initializeWithCopy(IRGenFunction &IGF, Address dest, Address src,
                           SILType T, bool isOutlined) const override {
     emitInitializeWithCopyCall(IGF, T, dest, src);
@@ -106,7 +104,8 @@ public:
   }
 
   void initializeWithTake(IRGenFunction &IGF, Address dest, Address src,
-                          SILType T, bool isOutlined) const override {
+                          SILType T, bool isOutlined,
+                          bool zeroizeIfSensitive) const override {
     emitInitializeWithTakeCall(IGF, T, dest, src);
   }
 
@@ -143,51 +142,24 @@ public:
   bool mayHaveExtraInhabitants(IRGenModule &IGM) const override {
     return true;
   }
-  llvm::Value *getExtraInhabitantIndex(IRGenFunction &IGF,
-                                       Address src,
-                                       SILType T) const override {
-    return emitGetExtraInhabitantIndexCall(IGF, T, src);
-  }
-  void storeExtraInhabitant(IRGenFunction &IGF,
-                            llvm::Value *index,
-                            Address dest,
-                            SILType T) const override {
-    emitStoreExtraInhabitantCall(IGF, T, index, dest);
-  }
-
-  void initializeMetadata(IRGenFunction &IGF,
-                          llvm::Value *metadata,
-                          llvm::Value *vwtable,
-                          SILType T) const override {
-    // Resilient value types and archetypes always refer to an existing type.
-    // A witness table should never be independently initialized for one.
-    llvm_unreachable("initializing value witness table for opaque type?!");
-  }
 
   llvm::Value *getEnumTagSinglePayload(IRGenFunction &IGF,
                                        llvm::Value *numEmptyCases,
                                        Address enumAddr,
-                                       SILType T) const override {
+                                       SILType T,
+                                       bool isOutlined) const override {
     return emitGetEnumTagSinglePayloadCall(IGF, T, numEmptyCases, enumAddr);
   }
 
   void storeEnumTagSinglePayload(IRGenFunction &IGF, llvm::Value *whichCase,
                                  llvm::Value *numEmptyCases, Address enumAddr,
-                                 SILType T) const override {
+                                 SILType T, bool isOutlined) const override {
     emitStoreEnumTagSinglePayloadCall(IGF, T, whichCase, numEmptyCases, enumAddr);
   }
 
-  void collectArchetypeMetadata(
-      IRGenFunction &IGF,
-      llvm::MapVector<CanType, llvm::Value *> &typeToMetadataVec,
-      SILType T) const override {
-    if (!T.hasArchetype()) {
-      return;
-    }
-    auto canType = T.getSwiftRValueType();
-    auto *metadata = IGF.emitTypeMetadataRefForLayout(T);
-    assert(metadata && "Expected Type Metadata Ref");
-    typeToMetadataVec.insert(std::make_pair(canType, metadata));
+  void collectMetadataForOutlining(OutliningMetadataCollector &collector,
+                                   SILType T) const override {
+    collector.collectTypeMetadata(T);
   }
 };
 

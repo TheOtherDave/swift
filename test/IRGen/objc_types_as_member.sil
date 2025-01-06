@@ -1,6 +1,6 @@
-// RUN: rm -rf %t && mkdir -p %t
+// RUN: %empty-directory(%t)
 // RUN: %build-irgen-test-overlays
-// RUN: %target-swift-frontend(mock-sdk: -sdk %S/Inputs -I %t) %s -emit-ir | %FileCheck %s
+// RUN: %target-swift-frontend(mock-sdk: -sdk %S/Inputs -I %t) %s -emit-ir | %FileCheck %s -DINT=i%target-ptrsize
 
 // REQUIRES: objc_interop
 
@@ -8,9 +8,11 @@ import gizmo
 
 sil @use_metatype : $@convention(thin) <T> (@thin T.Type) -> ()
 
-// CHECK-LABEL: define swiftcc void @test(%TSo9InnerTypeC* swiftself, %swift.type* %Self, i8** %SelfWitnessTable)
-// CHECK:   [[TMP:%.*]] = call %swift.type* @_T0So9OuterTypeCMa()
-// CHECK:   call swiftcc void @use_metatype(%swift.type* [[TMP]])
+// CHECK-LABEL: define swiftcc void @test(ptr swiftself %0, ptr %Self, ptr %SelfWitnessTable)
+// FIXME:   Metadata realization via demangling is disabled for now
+// CHECK:   [[TMP:%.*]] = call swiftcc %swift.metadata_response @"$sSo9OuterTypeCMa"
+// CHECK:   [[METADATA:%.*]] = extractvalue %swift.metadata_response %1, 0
+// CHECK:   call swiftcc void @use_metatype(ptr [[METADATA]])
 // CHECK:   ret void
 
 sil @test : $@convention(witness_method: NSRuncing) (@guaranteed OuterType.InnerType) -> () {
@@ -20,8 +22,3 @@ bb0(%0 : $OuterType.InnerType):
   %3 = apply %1<OuterType>(%2) : $@convention(thin) <τ_0_0> (@thin τ_0_0.Type) -> ()
   return %3 : $()
 }
-
-// CHECK-LABEL: define {{.*}}%swift.type* @_T0So9OuterTypeCMa()
-// CHECK:  [[TMP:%.*]] = call %objc_class* @swift_rt_swift_getInitializedObjCClass(
-// CHECK:  call %swift.type* @swift_getObjCClassMetadata(%objc_class* [[TMP]])
-// CHECK:  ret

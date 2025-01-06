@@ -8,6 +8,7 @@ NS_ASSUME_NONNULL_BEGIN
 /* This class has instance variables which are not apparent in the
    interface.  Subclasses will need to be slid by the ObjC runtime. */
 @interface HasHiddenIvars : NSObject
+- (instancetype)init;
 @property NSInteger x;
 @property NSInteger y;
 @property NSInteger z;
@@ -115,6 +116,9 @@ NS_ASSUME_NONNULL_BEGIN
 __attribute__((swift_name("OuterType.InnerType")))
 @interface OuterTypeInnerType : NSObject
 @property NSArray<OuterType *> *things;
+@end
+
+@interface ObjCPrintOnDealloc : NSObject
 @end
 
 NS_ASSUME_NONNULL_END

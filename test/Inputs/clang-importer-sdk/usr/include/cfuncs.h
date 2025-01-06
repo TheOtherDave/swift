@@ -11,6 +11,12 @@ float cfunc4();
 void exit(int);
 
 double pow(double x, double y);
+long double powl(long double x, long double y);
+
+void f16ptrfunc(__fp16 *);
+#if defined __arm__ || defined __arm64__ || defined __aarch64__
+_Float16 f16func(_Float16);
+#endif
 
 int puts(const char *);
 
@@ -52,3 +58,7 @@ struct not_importable;
 
 void opaque_pointer_param(struct not_importable *);
 
+int unsupported_parameter_type(int param1, _Complex int param2);
+_Complex int unsupported_return_type();
+
+void nullability_note(const char * _Nonnull const * _Nonnull parameter);

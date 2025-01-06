@@ -1,7 +1,7 @@
 // RUN: %empty-directory(%t)
 
 // FIXME: BEGIN -enable-source-import hackaround
-// RUN:  %target-swift-frontend(mock-sdk: -sdk %S/../Inputs/clang-importer-sdk -I %t) -emit-module -o %t  %S/../Inputs/clang-importer-sdk/swift-modules/ObjectiveC.swift
+// RUN:  %target-swift-frontend(mock-sdk: -sdk %S/../Inputs/clang-importer-sdk -I %t) -emit-module -o %t  %S/../Inputs/clang-importer-sdk/swift-modules/ObjectiveC.swift -disable-objc-attr-requires-foundation-module
 // RUN:  %target-swift-frontend(mock-sdk: -sdk %S/../Inputs/clang-importer-sdk -I %t) -emit-module -o %t  %S/../Inputs/clang-importer-sdk/swift-modules/CoreGraphics.swift
 // RUN:  %target-swift-frontend(mock-sdk: -sdk %S/../Inputs/clang-importer-sdk -I %t) -emit-module -o %t  %S/../Inputs/clang-importer-sdk/swift-modules/Foundation.swift
 // RUN:  %target-swift-frontend(mock-sdk: -sdk %S/../Inputs/clang-importer-sdk -I %t) -emit-module -o %t  %S/../Inputs/clang-importer-sdk/swift-modules/AppKit.swift
@@ -43,6 +43,18 @@ class A_Child : Base {
   override func doAnotherThing() throws {}
 
   // CHECK-NEXT: - (nonnull instancetype)init OBJC_DESIGNATED_INITIALIZER;
+} // CHECK-NEXT: @end
+
+// CHECK-LABEL: @interface A_Child ({{.*}}) <Proto>
+extension A_Child : Proto {
+  // CHECK-NEXT: - (NSUInteger)proto SWIFT_WARN_UNUSED_RESULT;
+  func proto() -> Int { return 0 }
+
+  // CHECK-NEXT: - (NSUInteger)proto:(NSUInteger)_ SWIFT_WARN_UNUSED_RESULT;
+  func proto(_: Int) -> Int { return 0 }
+
+  // CHECK-NEXT: - (NSUInteger)proto:(NSUInteger)_ y:(NSUInteger)y SWIFT_WARN_UNUSED_RESULT;
+  func proto(_: Int, y: Int) -> Int { return 0 }
 } // CHECK-NEXT: @end
 
 // CHECK-LABEL: @interface A_Grandchild : A_Child

@@ -6,7 +6,7 @@ import Swift
 
 // Make sure we inline everything.
 
-// CHECK-LABEL: sil @main
+// CHECK-LABEL: sil {{.*}}@main
 // CHECK: bb0({{.*}}):
 // CHECK-NEXT: alloc_global
 // CHECK-NEXT: global_addr
@@ -16,5 +16,5 @@ import Swift
 // CHECK-NEXT: integer_literal
 // CHECK-NEXT: return
 
-var a = doSomething()
+public var a = doSomething()
 a.isBConfused()

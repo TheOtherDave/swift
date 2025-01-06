@@ -27,7 +27,7 @@ class SILBuilder;
 
 class SILDebuggerClient : public DebuggerClient {
 public:
-  typedef SmallVectorImpl<LookupResultEntry> ResultVector;
+  using ResultVector = SmallVectorImpl<LookupResultEntry>;
 
   SILDebuggerClient(ASTContext &C) : DebuggerClient(C) { }
   virtual ~SILDebuggerClient() = default;
@@ -38,11 +38,11 @@ public:
   virtual SILValue emitLValueForVariable(VarDecl *var,
                                          SILBuilder &builder) = 0;
 
-  inline SILDebuggerClient *getAsSILDebuggerClient() {
+  inline SILDebuggerClient *getAsSILDebuggerClient() override {
     return this;
   }
 private:
-  virtual void anchor();
+  virtual void anchor() override;
 };
 
 } // namespace swift

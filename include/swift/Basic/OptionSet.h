@@ -17,14 +17,19 @@
 #ifndef SWIFT_BASIC_OPTIONSET_H
 #define SWIFT_BASIC_OPTIONSET_H
 
-#include "llvm/ADT/None.h"
-
-#include <type_traits>
 #include <cstdint>
+#include <initializer_list>
+#include <optional>
+#include <type_traits>
 
 namespace swift {
-
-using llvm::None;
+/// The Swift standard library also has an `OptionSet` type that is imported
+/// when using C++ to Swift interop within the compiler.
+/// Since the Swift stdlib is also imported in the `swift` namespace, the two
+/// types would conflict. Move the compiler's OptionSet into a sub-namespace
+/// to avoid collisions. Below we do `using namespace optionset`, which makes
+/// the C++ `OptionSet` type available everywhere the `swift` namespace is used.
+namespace optionset {
 
 /// The class template \c OptionSet captures a set of options stored as the
 /// bits in an unsigned integral value.
@@ -50,22 +55,26 @@ class OptionSet {
 
 public:
   /// Create an empty option set.
-  OptionSet() : Storage() { }
+  constexpr OptionSet() : Storage() {}
 
   /// Create an empty option set.
-  OptionSet(llvm::NoneType) : Storage() { }
+  constexpr OptionSet(std::nullopt_t) : Storage() {}
 
   /// Create an option set with only the given option set.
-  OptionSet(Flags flag) : Storage(static_cast<StorageType>(flag)) { }
+  constexpr OptionSet(Flags flag) : Storage(static_cast<StorageType>(flag)) {}
+
+  /// Create an option set containing the given options.
+  constexpr OptionSet(std::initializer_list<Flags> flags)
+      : Storage(combineFlags(flags)) {}
 
   /// Create an option set from raw storage.
-  explicit OptionSet(StorageType storage) : Storage(storage) { }
+  explicit constexpr OptionSet(StorageType storage) : Storage(storage) {}
 
   /// Check whether an option set is non-empty.
-  explicit operator bool() const { return Storage != 0; }
+  explicit constexpr operator bool() const { return Storage != 0; }
 
   /// Explicitly convert an option set to its underlying storage.
-  explicit operator StorageType() const { return Storage; }
+  explicit constexpr operator StorageType() const { return Storage; }
 
   /// Explicitly convert an option set to intptr_t, for use in
   /// llvm::PointerIntPair.
@@ -73,49 +82,59 @@ public:
   /// This member is not present if the underlying type is bigger than
   /// a pointer.
   template <typename T = std::intptr_t>
-  explicit operator typename std::enable_if<sizeof(StorageType) <= sizeof(T),
-      std::intptr_t>::type () const {
+  explicit constexpr
+  operator typename std::enable_if<sizeof(StorageType) <= sizeof(T),
+                                   std::intptr_t>::type() const {
     return static_cast<intptr_t>(Storage);
   }
 
   /// Retrieve the "raw" representation of this option set.
   StorageType toRaw() const { return Storage; }
-  
+
   /// Determine whether this option set contains all of the options in the
   /// given set.
-  bool contains(OptionSet set) const {
+  constexpr bool contains(OptionSet set) const {
     return !static_cast<bool>(set - *this);
   }
 
+  /// Check if this option set contains the exact same options as the given set.
+  constexpr bool containsOnly(OptionSet set) const {
+    return Storage == set.Storage;
+  }
+
+  // '==' and '!=' are deliberately not defined because they provide a pitfall
+  // where someone might use '==' but really want 'contains'. If you actually
+  // want '==' behavior, use 'containsOnly'.
+
   /// Produce the union of two option sets.
-  friend OptionSet operator|(OptionSet lhs, OptionSet rhs) {
+  friend constexpr OptionSet operator|(OptionSet lhs, OptionSet rhs) {
     return OptionSet(lhs.Storage | rhs.Storage);
   }
 
   /// Produce the union of two option sets.
-  friend OptionSet &operator|=(OptionSet &lhs, OptionSet rhs) {
+  friend constexpr OptionSet &operator|=(OptionSet &lhs, OptionSet rhs) {
     lhs.Storage |= rhs.Storage;
     return lhs;
- }
+  }
 
   /// Produce the intersection of two option sets.
-  friend OptionSet operator&(OptionSet lhs, OptionSet rhs) {
+  friend constexpr OptionSet operator&(OptionSet lhs, OptionSet rhs) {
     return OptionSet(lhs.Storage & rhs.Storage);
   }
 
   /// Produce the intersection of two option sets.
-  friend OptionSet &operator&=(OptionSet &lhs, OptionSet rhs) {
+  friend constexpr OptionSet &operator&=(OptionSet &lhs, OptionSet rhs) {
     lhs.Storage &= rhs.Storage;
     return lhs;
   }
 
   /// Produce the difference of two option sets.
-  friend OptionSet operator-(OptionSet lhs, OptionSet rhs) {
+  friend constexpr OptionSet operator-(OptionSet lhs, OptionSet rhs) {
     return OptionSet(lhs.Storage & ~rhs.Storage);
   }
 
-  /// Produce the intersection of two option sets.
-  friend OptionSet &operator-=(OptionSet &lhs, OptionSet rhs) {
+  /// Produce the difference of two option sets.
+  friend constexpr OptionSet &operator-=(OptionSet &lhs, OptionSet rhs) {
     lhs.Storage &= ~rhs.Storage;
     return lhs;
   }
@@ -126,11 +145,20 @@ private:
 
   static void _checkResultTypeOperatorOr(...) {}
 
+  static constexpr StorageType
+  combineFlags(const std::initializer_list<Flags> &flags) {
+    OptionSet result;
+    for (Flags flag : flags)
+      result |= flag;
+    return result.Storage;
+  }
+
   static_assert(!std::is_same<decltype(_checkResultTypeOperatorOr(Flags())),
                               Flags>::value,
                 "operator| should produce an OptionSet");
 };
-
+} // end namespace optionset
+using namespace optionset;
 } // end namespace swift
 
 #endif // SWIFT_BASIC_OPTIONSET_H

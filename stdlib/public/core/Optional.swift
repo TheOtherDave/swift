@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2024 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -10,8 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-/// A type that represents either a wrapped value or `nil`, the absence of a
-/// value.
+/// A type that represents either a wrapped value or the absence of a value.
 ///
 /// You use the `Optional` type whenever you use optional values, even if you
 /// never type the word `Optional`. Swift's type system usually shows the
@@ -72,7 +71,7 @@
 /// optional chaining to access the `hasSuffix(_:)` method on a `String?`
 /// instance.
 ///
-///     if let isPNG = imagePaths["star"]?.hasSuffix(".png") {
+///     if imagePaths["star"]?.hasSuffix(".png") == true {
 ///         print("The star image is in PNG format")
 ///     }
 ///     // Prints "The star image is in PNG format"
@@ -118,8 +117,8 @@
 ///
 /// Unconditionally unwrapping a `nil` instance with `!` triggers a runtime
 /// error.
-@_fixed_layout
-public enum Optional<Wrapped> : ExpressibleByNilLiteral {
+@frozen
+public enum Optional<Wrapped: ~Copyable>: ~Copyable {
   // The compiler has special knowledge of Optional<Wrapped>, including the fact
   // that it is an `enum` with cases named `none` and `some`.
 
@@ -131,16 +130,44 @@ public enum Optional<Wrapped> : ExpressibleByNilLiteral {
 
   /// The presence of a value, stored as `Wrapped`.
   case some(Wrapped)
+}
 
-  /// Creates an instance that stores the given value.
-  @_inlineable // FIXME(sil-serialize-all)
+extension Optional: Copyable where Wrapped: Copyable {}
+
+extension Optional: Sendable where Wrapped: ~Copyable & Sendable { }
+
+extension Optional: BitwiseCopyable where Wrapped: BitwiseCopyable { }
+
+@_preInverseGenerics
+extension Optional: ExpressibleByNilLiteral where Wrapped: ~Copyable {
+  /// Creates an instance initialized with `nil`.
+  ///
+  /// Do not call this initializer directly. It is used by the compiler when you
+  /// initialize an `Optional` instance with a `nil` literal. For example:
+  ///
+  ///     var i: Index? = nil
+  ///
+  /// In this example, the assignment to the `i` variable calls this
+  /// initializer behind the scenes.
   @_transparent
-  public init(_ some: Wrapped) { self = .some(some) }
+  @_preInverseGenerics
+  public init(nilLiteral: ()) {
+    self = .none
+  }
+}
 
+extension Optional where Wrapped: ~Copyable {
+  /// Creates an instance that stores the given value.
+  @_transparent
+  @_preInverseGenerics
+  public init(_ some: consuming Wrapped) { self = .some(some) }
+}
+
+extension Optional {
   /// Evaluates the given closure when this `Optional` instance is not `nil`,
   /// passing the unwrapped value as a parameter.
   ///
-  /// Use the `map` method with a closure that returns a nonoptional value.
+  /// Use the `map` method with a closure that returns a non-optional value.
   /// This example performs an arithmetic operation on an
   /// optional integer.
   ///
@@ -158,8 +185,21 @@ public enum Optional<Wrapped> : ExpressibleByNilLiteral {
   ///   of the instance.
   /// - Returns: The result of the given closure. If this instance is `nil`,
   ///   returns `nil`.
-  @_inlineable
-  public func map<U>(
+  @_alwaysEmitIntoClient
+  public func map<E: Error, U: ~Copyable>(
+    _ transform: (Wrapped) throws(E) -> U
+  ) throws(E) -> U? {
+    switch self {
+    case .some(let y):
+      return .some(try transform(y))
+    case .none:
+      return .none
+    }
+  }
+
+  @_spi(SwiftStdlibLegacyABI) @available(swift, obsoleted: 1)
+  @usableFromInline
+  internal func map<U>(
     _ transform: (Wrapped) throws -> U
   ) rethrows -> U? {
     switch self {
@@ -169,7 +209,37 @@ public enum Optional<Wrapped> : ExpressibleByNilLiteral {
       return .none
     }
   }
+}
 
+extension Optional where Wrapped: ~Copyable {
+  // FIXME(NCG): Make this public.
+  @_alwaysEmitIntoClient
+  public consuming func _consumingMap<U: ~Copyable, E: Error>(
+    _ transform: (consuming Wrapped) throws(E) -> U
+  ) throws(E) -> U? {
+    switch consume self {
+    case .some(let y):
+      return .some(try transform(y))
+    case .none:
+      return .none
+    }
+  }
+
+  // FIXME(NCG): Make this public.
+  @_alwaysEmitIntoClient
+  public borrowing func _borrowingMap<U: ~Copyable, E: Error>(
+    _ transform: (borrowing Wrapped) throws(E) -> U
+  ) throws(E) -> U? {
+    switch self {
+    case .some(let y):
+      return .some(try transform(y))
+    case .none:
+      return .none
+    }
+  }
+}
+
+extension Optional {
   /// Evaluates the given closure when this `Optional` instance is not `nil`,
   /// passing the unwrapped value as a parameter.
   ///
@@ -186,11 +256,24 @@ public enum Optional<Wrapped> : ExpressibleByNilLiteral {
   ///     // Prints "Optional(1764)"
   ///
   /// - Parameter transform: A closure that takes the unwrapped value
-  ///   of the instance.  
+  ///   of the instance.
   /// - Returns: The result of the given closure. If this instance is `nil`,
   ///   returns `nil`.
-  @_inlineable
-  public func flatMap<U>(
+  @_alwaysEmitIntoClient
+  public func flatMap<E: Error, U: ~Copyable>(
+    _ transform: (Wrapped) throws(E) -> U?
+  ) throws(E) -> U? {
+    switch self {
+    case .some(let y):
+      return try transform(y)
+    case .none:
+      return .none
+    }
+  }
+
+  @_spi(SwiftStdlibLegacyABI) @available(swift, obsoleted: 1)
+  @usableFromInline
+  internal func flatMap<U>(
     _ transform: (Wrapped) throws -> U?
   ) rethrows -> U? {
     switch self {
@@ -200,22 +283,37 @@ public enum Optional<Wrapped> : ExpressibleByNilLiteral {
       return .none
     }
   }
+}
 
-  /// Creates an instance initialized with `nil`.
-  ///
-  /// Do not call this initializer directly. It is used by the compiler when you
-  /// initialize an `Optional` instance with a `nil` literal. For example:
-  ///
-  ///     var i: Index? = nil
-  ///
-  /// In this example, the assignment to the `i` variable calls this
-  /// initializer behind the scenes.
-  @_inlineable // FIXME(sil-serialize-all)
-  @_transparent
-  public init(nilLiteral: ()) {
-    self = .none
+extension Optional where Wrapped: ~Copyable {
+  // FIXME(NCG): Make this public.
+  @_alwaysEmitIntoClient
+  public consuming func _consumingFlatMap<U: ~Copyable, E: Error>(
+    _ transform: (consuming Wrapped) throws(E) -> U?
+  ) throws(E) -> U? {
+    switch consume self {
+    case .some(let y):
+      return try transform(consume y)
+    case .none:
+      return .none
+    }
   }
 
+  // FIXME(NCG): Make this public.
+  @_alwaysEmitIntoClient
+  public func _borrowingFlatMap<U: ~Copyable, E: Error>(
+    _ transform: (borrowing Wrapped) throws(E) -> U?
+  ) throws(E) -> U? {
+    switch self {
+    case .some(let y):
+      return try transform(y)
+    case .none:
+      return .none
+    }
+  }
+}
+
+extension Optional {
   /// The wrapped value of this instance, unwrapped without checking whether
   /// the instance is `nil`.
   ///
@@ -239,7 +337,8 @@ public enum Optional<Wrapped> : ExpressibleByNilLiteral {
   ///   `unsafelyUnwrapped` only when you are confident that this instance
   ///   will never be equal to `nil` and only after you've tried using the
   ///   postfix `!` operator.
-  @_inlineable
+  @inlinable
+  @unsafe
   public var unsafelyUnwrapped: Wrapped {
     @inline(__always)
     get {
@@ -249,42 +348,104 @@ public enum Optional<Wrapped> : ExpressibleByNilLiteral {
       _debugPreconditionFailure("unsafelyUnwrapped of nil optional")
     }
   }
+}
 
+extension Optional where Wrapped: ~Copyable {
+  // FIXME(NCG): Do we want this? It seems like we do. Make this public.
+  @_alwaysEmitIntoClient
+  public consuming func _consumingUnsafelyUnwrap() -> Wrapped {
+    switch consume self {
+    case .some(let x):
+      return x
+    case .none:
+      _debugPreconditionFailure("consumingUsafelyUnwrap of nil optional")
+    }
+  }
+}
+
+extension Optional {
   /// - Returns: `unsafelyUnwrapped`.
   ///
   /// This version is for internal stdlib use; it avoids any checking
   /// overhead for users, even in Debug builds.
-  @_inlineable
-  public // SPI(SwiftExperimental)
-  var _unsafelyUnwrappedUnchecked: Wrapped {
+  @inlinable
+  internal var _unsafelyUnwrappedUnchecked: Wrapped {
     @inline(__always)
     get {
       if let x = self {
         return x
       }
-      _sanityCheckFailure("_unsafelyUnwrappedUnchecked of nil optional")
+      _internalInvariantFailure("_unsafelyUnwrappedUnchecked of nil optional")
     }
   }
 }
 
-extension Optional : CustomDebugStringConvertible {
+extension Optional where Wrapped: ~Copyable {
+  /// - Returns: `unsafelyUnwrapped`.
+  ///
+  /// This version is for internal stdlib use; it avoids any checking
+  /// overhead for users, even in Debug builds.
+  @_alwaysEmitIntoClient
+  internal consuming func _consumingUncheckedUnwrapped() -> Wrapped {
+    if let x = self {
+      return x
+    }
+    _internalInvariantFailure("_uncheckedUnwrapped of nil optional")
+  }
+}
+
+extension Optional where Wrapped: ~Copyable {
+  /// Takes the wrapped value being stored in this instance and returns it while
+  /// also setting the instance to `nil`. If there is no value being stored in
+  /// this instance, this returns `nil` instead.
+  ///
+  ///     var numberOfShoes: Int? = 34
+  ///
+  ///     if let numberOfShoes = numberOfShoes.take() {
+  ///       print(numberOfShoes)
+  ///       // Prints "34"
+  ///     }
+  ///
+  ///     print(numberOfShoes)
+  ///     // Prints "nil"
+  ///
+  /// - Returns: The wrapped value being stored in this instance. If this
+  ///   instance is `nil`, returns `nil`.
+  @_alwaysEmitIntoClient
+  public mutating func take() -> Self {
+    let result = consume self
+    self = nil
+    return result
+  }
+}
+
+@_unavailableInEmbedded
+extension Optional: CustomDebugStringConvertible {
   /// A textual representation of this instance, suitable for debugging.
-  @_inlineable // FIXME(sil-serialize-all)
   public var debugDescription: String {
     switch self {
     case .some(let value):
+#if !SWIFT_STDLIB_STATIC_PRINT
       var result = "Optional("
+      #if !$Embedded
       debugPrint(value, terminator: "", to: &result)
+      #else
+      _ = value
+      "(cannot print value in embedded Swift)".write(to: &result)
+      #endif
       result += ")"
       return result
+#else
+    return "(optional printing not available)"
+#endif
     case .none:
       return "nil"
     }
   }
 }
 
-extension Optional : CustomReflectable {
-  @_inlineable // FIXME(sil-serialize-all)
+#if SWIFT_ENABLE_REFLECTION
+extension Optional: CustomReflectable {
   public var customMirror: Mirror {
     switch self {
     case .some(let value):
@@ -297,23 +458,35 @@ extension Optional : CustomReflectable {
     }
   }
 }
+#endif
 
-@_inlineable // FIXME(sil-serialize-all)
 @_transparent
 public // COMPILER_INTRINSIC
 func _diagnoseUnexpectedNilOptional(_filenameStart: Builtin.RawPointer,
                                     _filenameLength: Builtin.Word,
                                     _filenameIsASCII: Builtin.Int1,
-                                    _line: Builtin.Word) {
-  _preconditionFailure(
-    "Unexpectedly found nil while unwrapping an Optional value",
-    file: StaticString(_start: _filenameStart,
-                       utf8CodeUnitCount: _filenameLength,
-                       isASCII: _filenameIsASCII),
-    line: UInt(_line))
+                                    _line: Builtin.Word,
+                                    _isImplicitUnwrap: Builtin.Int1) {
+  // Cannot use _preconditionFailure as the file and line info would not be
+  // printed.
+  if Bool(_isImplicitUnwrap) {
+    _preconditionFailure(
+      "Unexpectedly found nil while implicitly unwrapping an Optional value",
+      file: StaticString(_start: _filenameStart,
+                         utf8CodeUnitCount: _filenameLength,
+                         isASCII: _filenameIsASCII),
+      line: UInt(_line))
+  } else {
+    _preconditionFailure(
+      "Unexpectedly found nil while unwrapping an Optional value",
+      file: StaticString(_start: _filenameStart,
+                         utf8CodeUnitCount: _filenameLength,
+                         isASCII: _filenameIsASCII),
+      line: UInt(_line))
+  }
 }
 
-extension Optional : Equatable where Wrapped : Equatable {
+extension Optional: Equatable where Wrapped: Equatable {
   /// Returns a Boolean value indicating whether two optional instances are
   /// equal.
   ///
@@ -337,9 +510,9 @@ extension Optional : Equatable where Wrapped : Equatable {
   /// `numberToMatch` constant is wrapped as an optional before comparing to the
   /// optional `numberFromString`:
   ///
-  ///     let numberToFind: Int = 23
+  ///     let numberToMatch: Int = 23
   ///     let numberFromString: Int? = Int("23")      // Optional(23)
-  ///     if numberToFind == numberFromString {
+  ///     if numberToMatch == numberFromString {
   ///         print("It's a match!")
   ///     }
   ///     // Prints "It's a match!"
@@ -358,7 +531,7 @@ extension Optional : Equatable where Wrapped : Equatable {
   /// - Parameters:
   ///   - lhs: An optional value to compare.
   ///   - rhs: Another optional value to compare.
-  @_inlineable
+  @_transparent
   public static func ==(lhs: Wrapped?, rhs: Wrapped?) -> Bool {
     switch (lhs, rhs) {
     case let (l?, r?):
@@ -369,58 +542,37 @@ extension Optional : Equatable where Wrapped : Equatable {
       return false
     }
   }
-  
-  /// Returns a Boolean value indicating whether two optional instances are not
-  /// equal.
+}
+
+extension Optional: Hashable where Wrapped: Hashable {
+  /// Hashes the essential components of this value by feeding them into the
+  /// given hasher.
   ///
-  /// Use this not-equal-to operator (`!=`) to compare any two optional instances
-  /// of a type that conforms to the `Equatable` protocol. The comparison
-  /// returns `true` if only one of the arguments is `nil` or if the two
-  /// arguments wrap values that are not equal. The comparison returns `false`
-  /// if both arguments are `nil` or if the two arguments wrap values that are
-  /// equal.
-  ///
-  ///     let group1 = [2, 4, 6, 8, 10]
-  ///     let group2 = [1, 3, 5, 7, 9]
-  ///     if group1.first != group2.first {
-  ///         print("The two groups start differently.")
-  ///     }
-  ///     // Prints "The two groups start differently."
-  ///
-  /// You can also use this operator to compare a non-optional value to an
-  /// optional that wraps the same type. The non-optional value is wrapped as an
-  /// optional before the comparison is made. In this example, the
-  /// `numberToMatch` constant is wrapped as an optional before comparing to the
-  /// optional `numberFromString`:
-  ///
-  ///     let numberToFind: Int = 23
-  ///     let numberFromString: Int? = Int("not-a-number")      // nil
-  ///     if numberToFind != numberFromString {
-  ///         print("No match.")
-  ///     }
-  ///     // Prints "No match."
-  ///
-  /// - Parameters:
-  ///   - lhs: An optional value to compare.
-  ///   - rhs: Another optional value to compare.
-  @_inlineable
-  public static func !=(lhs: Wrapped?, rhs: Wrapped?) -> Bool {
-    return !(lhs == rhs)
+  /// - Parameter hasher: The hasher to use when combining the components
+  ///   of this instance.
+  @inlinable
+  public func hash(into hasher: inout Hasher) {
+    switch self {
+    case .none:
+      hasher.combine(0 as UInt8)
+    case .some(let wrapped):
+      hasher.combine(1 as UInt8)
+      hasher.combine(wrapped)
+    }
   }
 }
 
 // Enable pattern matching against the nil literal, even if the element type
 // isn't equatable.
-@_fixed_layout
-public struct _OptionalNilComparisonType : ExpressibleByNilLiteral {
+@frozen
+public struct _OptionalNilComparisonType: ExpressibleByNilLiteral {
   /// Create an instance initialized with `nil`.
-  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
   public init(nilLiteral: ()) {
   }
 }
 
-extension Optional {
+extension Optional where Wrapped: ~Copyable {
   /// Returns a Boolean value indicating whether an argument matches `nil`.
   ///
   /// You can use the pattern-matching operator (`~=`) to test whether an
@@ -451,11 +603,14 @@ extension Optional {
   /// - Parameters:
   ///   - lhs: A `nil` literal.
   ///   - rhs: A value to match against `nil`.
-  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
-  static public func ~=(lhs: _OptionalNilComparisonType, rhs: Wrapped?) -> Bool {
+  @_preInverseGenerics
+  public static func ~=(
+    lhs: _OptionalNilComparisonType,
+    rhs: borrowing Wrapped?
+  ) -> Bool {
     switch rhs {
-    case .some(_):
+    case .some:
       return false
     case .none:
       return true
@@ -486,11 +641,14 @@ extension Optional {
   /// - Parameters:
   ///   - lhs: A value to compare to `nil`.
   ///   - rhs: A `nil` literal.
-  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
-  static public func ==(lhs: Wrapped?, rhs: _OptionalNilComparisonType) -> Bool {
+  @_preInverseGenerics
+  public static func ==(
+    lhs: borrowing Wrapped?,
+    rhs: _OptionalNilComparisonType
+  ) -> Bool {
     switch lhs {
-    case .some(_):
+    case .some:
       return false
     case .none:
       return true
@@ -518,11 +676,14 @@ extension Optional {
   /// - Parameters:
   ///   - lhs: A value to compare to `nil`.
   ///   - rhs: A `nil` literal.
-  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
-  static public func !=(lhs: Wrapped?, rhs: _OptionalNilComparisonType) -> Bool {
+  @_preInverseGenerics
+  public static func !=(
+    lhs: borrowing Wrapped?,
+    rhs: _OptionalNilComparisonType
+  ) -> Bool {
     switch lhs {
-    case .some(_):
+    case .some:
       return true
     case .none:
       return false
@@ -550,11 +711,14 @@ extension Optional {
   /// - Parameters:
   ///   - lhs: A `nil` literal.
   ///   - rhs: A value to compare to `nil`.
-  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
-  static public func ==(lhs: _OptionalNilComparisonType, rhs: Wrapped?) -> Bool {
+  @_preInverseGenerics
+  public static func ==(
+    lhs: _OptionalNilComparisonType,
+    rhs: borrowing Wrapped?
+  ) -> Bool {
     switch rhs {
-    case .some(_):
+    case .some:
       return false
     case .none:
       return true
@@ -582,11 +746,14 @@ extension Optional {
   /// - Parameters:
   ///   - lhs: A `nil` literal.
   ///   - rhs: A value to compare to `nil`.
-  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
-  static public func !=(lhs: _OptionalNilComparisonType, rhs: Wrapped?) -> Bool {
+  @_preInverseGenerics
+  public static func !=(
+    lhs: _OptionalNilComparisonType,
+    rhs: borrowing Wrapped?
+  ) -> Bool {
     switch rhs {
-    case .some(_):
+    case .some:
       return true
     case .none:
       return false
@@ -599,7 +766,7 @@ extension Optional {
 ///
 /// A nil-coalescing operation unwraps the left-hand side if it has a value, or
 /// it returns the right-hand side as a default. The result of this operation
-/// will have the nonoptional type of the left-hand side's `Wrapped` type.
+/// will have the non-optional type of the left-hand side's `Wrapped` type.
 ///
 /// This operator uses short-circuit evaluation: `optional` is checked first,
 /// and `defaultValue` is evaluated only if `optional` is `nil`. For example:
@@ -626,10 +793,27 @@ extension Optional {
 ///   - optional: An optional value.
 ///   - defaultValue: A value to use as a default. `defaultValue` is the same
 ///     type as the `Wrapped` type of `optional`.
-@_inlineable // FIXME(sil-serialize-all)
 @_transparent
-public func ?? <T>(optional: T?, defaultValue: @autoclosure () throws -> T)
-    rethrows -> T {
+@_alwaysEmitIntoClient
+public func ?? <T: ~Copyable>(
+  optional: consuming T?,
+  defaultValue: @autoclosure () throws -> T // FIXME: typed throw
+) rethrows -> T {
+  switch consume optional {
+  case .some(let value):
+    return value
+  case .none:
+    return try defaultValue()
+  }
+}
+
+@_spi(SwiftStdlibLegacyABI) @available(swift, obsoleted: 1)
+@_silgen_name("$ss2qqoiyxxSg_xyKXKtKlF")
+@usableFromInline
+internal func _legacy_abi_optionalNilCoalescingOperator <T>(
+  optional: T?,
+  defaultValue: @autoclosure () throws -> T
+) rethrows -> T {
   switch optional {
   case .some(let value):
     return value
@@ -680,10 +864,27 @@ public func ?? <T>(optional: T?, defaultValue: @autoclosure () throws -> T)
 ///   - optional: An optional value.
 ///   - defaultValue: A value to use as a default. `defaultValue` and
 ///     `optional` have the same type.
-@_inlineable // FIXME(sil-serialize-all)
 @_transparent
-public func ?? <T>(optional: T?, defaultValue: @autoclosure () throws -> T?)
-    rethrows -> T? {
+@_alwaysEmitIntoClient
+// FIXME: This needs to support typed throws.
+public func ?? <T: ~Copyable>(
+  optional: consuming T?,
+  defaultValue: @autoclosure () throws -> T?
+) rethrows -> T? {
+  switch consume optional {
+  case .some(let value):
+    return value
+  case .none:
+    return try defaultValue()
+  }
+}
+
+@_spi(SwiftStdlibLegacyABI) @available(swift, obsoleted: 1)
+@usableFromInline
+internal func ?? <T>(
+  optional: T?,
+  defaultValue: @autoclosure () throws -> T?
+) rethrows -> T? {
   switch optional {
   case .some(let value):
     return value
@@ -697,16 +898,13 @@ public func ?? <T>(optional: T?, defaultValue: @autoclosure () throws -> T?)
 //===----------------------------------------------------------------------===//
 
 #if _runtime(_ObjC)
-extension Optional : _ObjectiveCBridgeable {
+extension Optional: _ObjectiveCBridgeable {
   // The object that represents `none` for an Optional of this type.
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
-  internal static var _nilSentinel : AnyObject {
+  internal static var _nilSentinel: AnyObject {
     @_silgen_name("_swift_Foundation_getOptionalNilSentinelObject")
     get
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
   public func _bridgeToObjectiveC() -> AnyObject {
     // Bridge a wrapped value by unwrapping.
     if let value = self {
@@ -716,7 +914,6 @@ extension Optional : _ObjectiveCBridgeable {
     return type(of: self)._nilSentinel
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
   public static func _forceBridgeFromObjectiveC(
     _ source: AnyObject,
     result: inout Optional<Wrapped>?
@@ -734,7 +931,6 @@ extension Optional : _ObjectiveCBridgeable {
     result = .some(.some(unwrappedResult))
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
   public static func _conditionallyBridgeFromObjectiveC(
     _ source: AnyObject,
     result: inout Optional<Wrapped>?
@@ -758,7 +954,7 @@ extension Optional : _ObjectiveCBridgeable {
     }
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
+  @_effects(readonly)
   public static func _unconditionallyBridgeFromObjectiveC(_ source: AnyObject?)
       -> Optional<Wrapped> {
     if let nonnullSource = source {

@@ -1,5 +1,6 @@
-// RUN: %target-sil-opt -assume-parsing-unqualified-ownership-sil -enable-sil-verify-all -generic-specializer %s | %FileCheck %s
+// RUN: %target-sil-opt -sil-print-types -enable-sil-verify-all -generic-specializer %s | %FileCheck %s
 
+// REQUIRES: swift_in_compiler
 
 sil_stage canonical
 
@@ -35,6 +36,8 @@ public struct Val<T> : ValProto {
   init()
 }
 
+class X {}
+
 sil @coerce : $@convention(thin) <T, U, V> (@owned @callee_owned (@owned Ref<T>) -> @owned @callee_owned (@owned Ref<U>) -> @owned Ref<V>) -> @owned @callee_owned (Val<U>) -> Val<V>
 
 sil @merge : $@convention(method) <Self where Self : RefProto><U> (@owned Ref<U>, @in_guaranteed Self) -> @owned Ref<(Self.T, U)> {
@@ -66,7 +69,7 @@ sil @test : $@convention(thin) (Val<Bool>, Val<Int>) -> Val<(Bool, Int)> {
 bb0(%0 : $Val<Bool>, %1 : $Val<Int>):
   // CHECK: [[COERCE:%.*]] = function_ref @coerce
   %2 = function_ref @coerce : $@convention(thin) <τ_0_0, τ_0_1, τ_0_2> (@owned @callee_owned (@owned Ref<τ_0_0>) -> @owned @callee_owned (@owned Ref<τ_0_1>) -> @owned Ref<τ_0_2>) -> @owned @callee_owned (Val<τ_0_1>) -> Val<τ_0_2>
-  // CHECK: [[MERGE:%.*]] = function_ref @_T013merge_curried4main3RefCySbG_SiTg5
+  // CHECK: [[MERGE:%.*]] = function_ref @$s13merge_curried4main3RefCySbG_SiTg5
   %3 = function_ref @merge_curried : $@convention(thin) <τ_0_0 where τ_0_0 : RefProto><τ_1_0> (@in τ_0_0) -> @owned @callee_owned (@owned Ref<τ_1_0>) -> @owned Ref<(τ_0_0.T, τ_1_0)>
   // CHECK: [[PARTIAL:%.*]] = partial_apply [[MERGE]]()
   %4 = partial_apply %3<Ref<Bool>, Int>() : $@convention(thin) <τ_0_0 where τ_0_0 : RefProto><τ_1_0> (@in τ_0_0) -> @owned @callee_owned (@owned Ref<τ_1_0>) -> @owned Ref<(τ_0_0.T, τ_1_0)>
@@ -79,3 +82,93 @@ bb0(%0 : $Val<Bool>, %1 : $Val<Int>):
   %8 = apply %7(%1) : $@callee_owned (Val<Int>) -> Val<(Bool, Int)>
   return %8 : $Val<(Bool, Int)>
 }
+
+// CHECK-LABEL: sil shared @$s9coroutineSb_Tg5 : $@yield_once @convention(thin) (Bool) -> @yields @inout Bool {
+// CHECK:       bb0(%0 : $Bool):
+// CHECK-NEXT:    [[TEMP:%.*]] = alloc_stack $Bool
+// CHECK-NEXT:    store %0 to [[TEMP]] : $*Bool
+// CHECK-NEXT:    yield [[TEMP]] : $*Bool, resume bb1, unwind bb2
+// CHECK:       bb1:
+// CHECK-NEXT:    destroy_addr [[TEMP]] : $*Bool
+// CHECK-NEXT:    [[RV:%.*]] = tuple ()
+// CHECK-NEXT:    dealloc_stack [[TEMP]] : $*Bool
+// CHECK-NEXT:    return [[RV]] : $()
+// CHECK:       bb2:
+// CHECK-NEXT:    destroy_addr [[TEMP]] : $*Bool
+// CHECK-NEXT:    dealloc_stack [[TEMP]] : $*Bool
+// CHECK-NEXT:    unwind
+// CHECK-NEXT:  }
+sil @coroutine : $@yield_once @convention(thin) <T> (@in T) -> @yields @inout T {
+bb0(%0 : $*T):
+  yield %0 : $*T, resume bb1, unwind bb2
+bb1:
+  destroy_addr %0 : $*T
+  %rv = tuple ()
+  return %rv : $()
+bb2:
+  destroy_addr %0 : $*T
+  unwind
+}
+
+// CHECK-LABEL: @test_coroutine : $@convention(thin) (Bool) -> () {
+// CHECK:       bb0(%0 : $Bool):
+// CHECK-NEXT:    [[TEMP:%.*]] = alloc_stack $Bool
+// CHECK-NEXT:    store %0 to [[TEMP]] : $*Bool
+// CHECK-NEXT:    // function_ref
+// CHECK-NEXT:    [[CORO:%.*]] = function_ref @$s9coroutineSb_Tg5 : $@yield_once @convention(thin) (Bool) -> @yields @inout Bool
+// CHECK-NEXT:    [[LOAD:%.*]] = load [[TEMP]] : $*Bool
+// CHECK-NEXT:    ([[ADDR:%.*]], [[TOKEN:%.*]]) = begin_apply [[CORO]]([[LOAD]])
+// CHECK-NEXT:    end_apply [[TOKEN]] as $()
+// CHECK-NEXT:    dealloc_stack [[TEMP]] : $*Bool
+// CHECK-NEXT:    [[RV:%.*]] = tuple ()
+// CHECK-NEXT:    return [[RV]] : $()
+// CHECK-NEXT:  }
+sil @test_coroutine : $@convention(thin) (Bool) -> () {
+bb0(%0 : $Bool):
+  %coro = function_ref @coroutine : $@yield_once @convention(thin) <T> (@in T) -> @yields @inout T
+  %temp = alloc_stack $Bool
+  store %0 to %temp : $*Bool
+  (%addr, %token) = begin_apply %coro<Bool>(%temp) : $@yield_once @convention(thin) <T> (@in T) -> @yields @inout T
+  end_apply %token as $()
+  dealloc_stack %temp : $*Bool
+  %rv = tuple ()
+  return %rv : $()
+}
+
+// CHECK-LABEL: sil shared @$s21arg_escapes_to_return4main1XC_Tg5
+// CHECK-NEXT:  [%0: escape -> %r]
+// CHECK-NEXT:  {{^[^[]}}
+sil @arg_escapes_to_return : $@convention(thin) <T> (@in_guaranteed T) -> @out T {
+[%1: escape -> %0] 
+bb0(%0 : $*T, %1 : $*T):
+  copy_addr %1 to [init] %0 : $*T
+  %4 = tuple ()
+  return %4 : $()
+}
+
+// CHECK-LABEL: sil shared @$s015arg_escapes_to_A04main1XC_Tg5
+// CHECK-NEXT:  [%1: escape -> %0]
+// CHECK-NEXT:  {{^[^[]}}
+sil @arg_escapes_to_arg : $@convention(thin) <T> (@inout T, @in_guaranteed T) -> () {
+[%1: escape -> %0] 
+bb0(%0 : $*T, %1 : $*T):
+  copy_addr %1 to %0 : $*T
+  %4 = tuple ()
+  return %4 : $()
+}
+
+sil @test_escape_effects : $@convention(thin) (@guaranteed X) -> @owned X {
+bb0(%0 : $X):
+  %2 = alloc_stack $X
+  %3 = alloc_stack $X
+  store %0 to %3 : $*X
+  %5 = function_ref @arg_escapes_to_return : $@convention(thin) <τ_0_0> (@in_guaranteed τ_0_0) -> @out τ_0_0
+  %6 = apply %5<X>(%2, %3) : $@convention(thin) <τ_0_0> (@in_guaranteed τ_0_0) -> @out τ_0_0
+  %7 = function_ref @arg_escapes_to_arg : $@convention(thin) <τ_0_0> (@inout τ_0_0, @in_guaranteed τ_0_0) -> ()
+  %8 = apply %7<X>(%2, %3) : $@convention(thin) <τ_0_0> (@inout τ_0_0, @in_guaranteed τ_0_0) -> ()
+  dealloc_stack %3 : $*X
+  %10 = load %2 : $*X
+  dealloc_stack %2 : $*X
+  return %10 : $X
+}
+

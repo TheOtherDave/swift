@@ -17,6 +17,7 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 
 namespace swift {
 
@@ -47,20 +48,28 @@ LayoutConstraint getLayoutConstraint(Identifier ID, ASTContext &Ctx) {
     return LayoutConstraint::getLayoutConstraint(
       LayoutConstraintKind::NativeClass, Ctx);
 
+  if (ID == Ctx.Id_BridgeObjectLayout)
+    return LayoutConstraint::getLayoutConstraint(
+        LayoutConstraintKind::BridgeObject, Ctx);
+
+  if (ID == Ctx.Id_TrivialStrideLayout)
+    return LayoutConstraint::getLayoutConstraint(
+        LayoutConstraintKind::TrivialStride, 0, 0, Ctx);
+
   return LayoutConstraint::getLayoutConstraint(
       LayoutConstraintKind::UnknownLayout, Ctx);
 }
 
-StringRef LayoutConstraintInfo::getName() const {
-  return getName(getKind());
+StringRef LayoutConstraintInfo::getName(bool internalName) const {
+  return getName(getKind(), internalName);
 }
 
-StringRef LayoutConstraintInfo::getName(LayoutConstraintKind Kind) {
+StringRef LayoutConstraintInfo::getName(LayoutConstraintKind Kind, bool internalName) {
   switch (Kind) {
   case LayoutConstraintKind::UnknownLayout:
     return "_UnknownLayout";
   case LayoutConstraintKind::Class:
-    return "AnyObject";
+    return internalName ? "_Class" : "AnyObject";
   case LayoutConstraintKind::NativeClass:
     return "_NativeClass";
   case LayoutConstraintKind::RefCountedObject:
@@ -73,6 +82,10 @@ StringRef LayoutConstraintInfo::getName(LayoutConstraintKind Kind) {
     return "_TrivialAtMost";
   case LayoutConstraintKind::TrivialOfExactSize:
     return "_Trivial";
+  case LayoutConstraintKind::BridgeObject:
+    return "_BridgeObject";
+  case LayoutConstraintKind::TrivialStride:
+    return "_TrivialStride";
   }
 
   llvm_unreachable("Unhandled LayoutConstraintKind in switch.");
@@ -106,8 +119,9 @@ bool LayoutConstraintInfo::isAddressOnlyTrivial(LayoutConstraintKind Kind) {
 }
 
 bool LayoutConstraintInfo::isTrivial(LayoutConstraintKind Kind) {
-  return Kind > LayoutConstraintKind::UnknownLayout &&
-         Kind <= LayoutConstraintKind::Trivial;
+  return (Kind > LayoutConstraintKind::UnknownLayout &&
+          Kind <= LayoutConstraintKind::Trivial) ||
+         Kind == LayoutConstraintKind::TrivialStride;
 }
 
 bool LayoutConstraintInfo::isRefCountedObject(LayoutConstraintKind Kind) {
@@ -132,7 +146,7 @@ bool LayoutConstraintInfo::isNativeClass(LayoutConstraintKind Kind) {
 }
 
 bool LayoutConstraintInfo::isRefCounted(LayoutConstraintKind Kind) {
-  return isAnyRefCountedObject(Kind) || isClass(Kind);
+  return isAnyRefCountedObject(Kind) || isClass(Kind) || isBridgeObject(Kind);
 }
 
 bool LayoutConstraintInfo::isNativeRefCounted(LayoutConstraintKind Kind) {
@@ -140,10 +154,12 @@ bool LayoutConstraintInfo::isNativeRefCounted(LayoutConstraintKind Kind) {
          Kind == LayoutConstraintKind::NativeClass;
 }
 
-void *LayoutConstraintInfo::operator new(size_t bytes, const ASTContext &ctx,
-                                         AllocationArena arena,
-                                         unsigned alignment) {
-  return ctx.Allocate(bytes, alignment, arena);
+bool LayoutConstraintInfo::isBridgeObject(LayoutConstraintKind Kind) {
+  return Kind == LayoutConstraintKind::BridgeObject;
+}
+
+bool LayoutConstraintInfo::isTrivialStride(LayoutConstraintKind Kind) {
+  return Kind == LayoutConstraintKind::TrivialStride;
 }
 
 SourceRange LayoutConstraintLoc::getSourceRange() const { return getLoc(); }
@@ -176,50 +192,64 @@ static LayoutConstraintKind mergeTable[unsigned(E(LastLayout)) +
      E(/* TrivialOfAtMostSize */ TrivialOfAtMostSize), E(/* Trivial */ Trivial),
      E(/* Class */ Class), E(/* NativeClass */ NativeClass),
      E(/* RefCountedObject*/ RefCountedObject),
-     E(/* NativeRefCountedObject */ NativeRefCountedObject)},
+     E(/* NativeRefCountedObject */ NativeRefCountedObject), MERGE_CONFLICT,
+     MERGE_CONFLICT},
 
     // Initialize the row for TrivialOfExactSize.
     {E(/* UnknownLayout */ TrivialOfExactSize),
      E(/* TrivialOfExactSize */ TrivialOfExactSize), MERGE_CONFLICT,
      E(/* Trivial */ TrivialOfExactSize), MERGE_CONFLICT, MERGE_CONFLICT,
-     MERGE_CONFLICT, MERGE_CONFLICT},
+     MERGE_CONFLICT, MERGE_CONFLICT, MERGE_CONFLICT, MERGE_CONFLICT},
 
     // Initialize the row for TrivialOfAtMostSize.
     {E(/* UnknownLayout */ TrivialOfAtMostSize), MERGE_CONFLICT,
      E(/* TrivialOfAtMostSize */ TrivialOfAtMostSize),
      E(/* Trivial */ TrivialOfAtMostSize), MERGE_CONFLICT, MERGE_CONFLICT,
-     MERGE_CONFLICT, MERGE_CONFLICT},
+     MERGE_CONFLICT, MERGE_CONFLICT, MERGE_CONFLICT, MERGE_CONFLICT},
 
     // Initialize the row for Trivial.
     {E(/* UnknownLayout */ Trivial),
      E(/* TrivialOfExactSize */ TrivialOfExactSize),
      E(/* TrivialOfAtMostSize */ TrivialOfAtMostSize), E(/* Trivial */ Trivial),
-     MERGE_CONFLICT, MERGE_CONFLICT, MERGE_CONFLICT, MERGE_CONFLICT},
+     MERGE_CONFLICT, MERGE_CONFLICT, MERGE_CONFLICT, MERGE_CONFLICT,
+     MERGE_CONFLICT, MERGE_CONFLICT},
 
     // Initialize the row for Class.
     {E(/* UnknownLayout*/ Class), MERGE_CONFLICT, MERGE_CONFLICT,
      MERGE_CONFLICT, E(/* Class */ Class), E(/* NativeClass */ NativeClass),
      E(/* RefCountedObject */ Class),
-     E(/* NativeRefCountedObject */ NativeClass)},
+     E(/* NativeRefCountedObject */ NativeClass), MERGE_CONFLICT,
+     MERGE_CONFLICT},
 
     // Initialize the row for NativeClass.
     {E(/* UnknownLayout */ NativeClass), MERGE_CONFLICT, MERGE_CONFLICT,
      MERGE_CONFLICT, E(/* Class */ NativeClass),
      E(/* NativeClass */ NativeClass), E(/* RefCountedObject */ NativeClass),
-     E(/* NativeRefCountedObject */ NativeClass)},
+     E(/* NativeRefCountedObject */ NativeClass), MERGE_CONFLICT,
+     MERGE_CONFLICT},
 
     // Initialize the row for RefCountedObject.
     {E(/* UnknownLayout */ RefCountedObject), MERGE_CONFLICT, MERGE_CONFLICT,
      MERGE_CONFLICT, E(/* Class */ Class), E(/* NativeClass */ NativeClass),
      E(/* RefCountedObject */ RefCountedObject),
-     E(/* NativeRefCountedObject */ NativeRefCountedObject)},
+     E(/* NativeRefCountedObject */ NativeRefCountedObject), MERGE_CONFLICT,
+     MERGE_CONFLICT},
 
     // Initialize the row for NativeRefCountedObject.
     {E(/* UnknownLayout */ NativeRefCountedObject), MERGE_CONFLICT,
      MERGE_CONFLICT, MERGE_CONFLICT, E(/* Class */ NativeClass),
      E(/* NativeClass */ NativeClass),
      E(/* RefCountedObject */ NativeRefCountedObject),
-     E(/* NativeRefCountedObject*/ NativeRefCountedObject)},
+     E(/* NativeRefCountedObject*/ NativeRefCountedObject), MERGE_CONFLICT,
+     MERGE_CONFLICT},
+
+    {E(BridgeObject), MERGE_CONFLICT, MERGE_CONFLICT, MERGE_CONFLICT,
+     MERGE_CONFLICT, MERGE_CONFLICT, MERGE_CONFLICT, MERGE_CONFLICT,
+     E(/*BridgeObject*/ BridgeObject), MERGE_CONFLICT},
+
+    {E(TrivialStride), MERGE_CONFLICT, MERGE_CONFLICT, MERGE_CONFLICT,
+     MERGE_CONFLICT, MERGE_CONFLICT, MERGE_CONFLICT, MERGE_CONFLICT,
+     MERGE_CONFLICT, E(/*TrivialStride*/ TrivialStride)},
 };
 
 #undef E
@@ -315,6 +345,7 @@ LayoutConstraint::merge(LayoutConstraint Other) {
 LayoutConstraint
 LayoutConstraint::getLayoutConstraint(LayoutConstraintKind Kind) {
   assert(!LayoutConstraintInfo::isKnownSizeTrivial(Kind));
+  assert(!LayoutConstraintInfo::isTrivialStride(Kind));
   switch(Kind) {
   case LayoutConstraintKind::Trivial:
     return LayoutConstraint(&LayoutConstraintInfo::TrivialConstraintInfo);
@@ -330,10 +361,14 @@ LayoutConstraint::getLayoutConstraint(LayoutConstraintKind Kind) {
         &LayoutConstraintInfo::RefCountedObjectConstraintInfo);
   case LayoutConstraintKind::UnknownLayout:
     return LayoutConstraint(&LayoutConstraintInfo::UnknownLayoutConstraintInfo);
+  case LayoutConstraintKind::BridgeObject:
+    return LayoutConstraint(&LayoutConstraintInfo::BridgeObjectConstraintInfo);
   case LayoutConstraintKind::TrivialOfAtMostSize:
   case LayoutConstraintKind::TrivialOfExactSize:
+  case LayoutConstraintKind::TrivialStride:
     llvm_unreachable("Wrong layout constraint kind");
   }
+  llvm_unreachable("unhandled kind");
 }
 
 LayoutConstraint LayoutConstraint::getUnknownLayout() {
@@ -356,5 +391,22 @@ LayoutConstraintInfo LayoutConstraintInfo::NativeClassConstraintInfo(
 
 LayoutConstraintInfo LayoutConstraintInfo::TrivialConstraintInfo(
     LayoutConstraintKind::Trivial);
+
+LayoutConstraintInfo LayoutConstraintInfo::BridgeObjectConstraintInfo(
+    LayoutConstraintKind::BridgeObject);
+
+int LayoutConstraint::compare(LayoutConstraint rhs) const {
+  if (Ptr->getKind() != rhs->getKind())
+    return int(rhs->getKind()) - int(Ptr->getKind());
+
+  if (Ptr->SizeInBits != rhs->SizeInBits)
+    return int(rhs->SizeInBits) - int(Ptr->SizeInBits);
+
+  if (Ptr->Alignment != rhs->Alignment)
+    return int(rhs->Alignment) - int(Ptr->Alignment);
+
+  assert(*this == rhs);
+  return 0;
+}
 
 } // end namespace swift

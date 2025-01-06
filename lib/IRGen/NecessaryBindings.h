@@ -27,11 +27,14 @@
 
 namespace swift {
   class CanType;
+  enum class MetadataState : size_t;
   class ProtocolDecl;
   class ProtocolConformanceRef;
+  class SpecializedProtocolConformance;
 
-namespace irgen {
+  namespace irgen {
   class Address;
+  class Explosion;
   class IRGenFunction;
   class IRGenModule;
   class Size;
@@ -39,50 +42,73 @@ namespace irgen {
 /// NecessaryBindings - The set of metadata that must be saved in
 /// order to perform some set of operations on a type.
 class NecessaryBindings {
-  llvm::SetVector<GenericRequirement> Requirements;
+  llvm::SetVector<GenericRequirement> RequirementsSet;
+  SubstitutionMap SubMap;
+  bool NoEscape;
 
 public:
-  NecessaryBindings() = default;
+  NecessaryBindings() {}
+  NecessaryBindings(SubstitutionMap subs, bool noEscape)
+    : SubMap(subs), NoEscape(noEscape) {}
   
+  SubstitutionMap getSubstitutionMap() const {
+    return SubMap;
+  }
+
   /// Collect the necessary bindings to invoke a function with the given
   /// signature.
-  static NecessaryBindings forFunctionInvocations(IRGenModule &IGM,
-                                                  CanSILFunctionType origType,
-                                                  const SubstitutionMap &subs);
-  
-  /// Add whatever information is necessary to reconstruct type metadata
-  /// for the given type.
-  void addTypeMetadata(CanType type);
+  static NecessaryBindings forPartialApplyForwarder(IRGenModule &IGM,
+                                                    CanSILFunctionType origType,
+                                                    SubstitutionMap subs,
+                                                    bool noEscape,
+                                                    bool considerParameterSources);
+
+  /// Collect the necessary bindings to be able to destroy a value inside of a
+  /// fixed-layout boxed allocation.
+  static NecessaryBindings forFixedBox(IRGenModule &IGM,
+                                       SILBoxType *box);
+
+  void addRequirement(GenericRequirement requirement) {
+    auto type = requirement.getTypeParameter().subst(SubMap);
+    if (!type->hasArchetype())
+      return;
+
+    RequirementsSet.insert(requirement);
+  }
 
   /// Get the requirement from the bindings at index i.
   const GenericRequirement &operator[](size_t i) const {
-    return Requirements[i];
+    return RequirementsSet[i];
   }
 
-  size_t size() const {
-    return Requirements.size();
-  }
-
-  /// Add whatever information is necessary to reconstruct a witness table
-  /// reference for the given type.
-  void addProtocolConformance(CanType type, ProtocolConformanceRef conf);
+  size_t size() const { return getRequirements().size(); }
 
   /// Is the work to do trivial?
-  bool empty() const { return Requirements.empty(); }
+  bool empty() const { return getRequirements().empty(); }
 
   /// Returns the required size of the bindings.
   /// Pointer alignment is sufficient.
   Size getBufferSize(IRGenModule &IGM) const;
 
   /// Save the necessary bindings to the given buffer.
-  void save(IRGenFunction &IGF, Address buffer) const;
+  ///
+  /// If `replacementSubs` has a value, then the bindings saved are taken from
+  /// the given substitution map instead of the substitutions
+  void save(IRGenFunction &IGF, Address buffer,
+            std::optional<SubstitutionMap> replacementSubs = std::nullopt)
+            const;
 
   /// Restore the necessary bindings from the given buffer.
-  void restore(IRGenFunction &IGF, Address buffer) const;
+  void restore(IRGenFunction &IGF, Address buffer, MetadataState state) const;
 
-  const llvm::SetVector<GenericRequirement> &getRequirements() const {
-    return Requirements;
+  const llvm::ArrayRef<GenericRequirement> getRequirements() const {
+    return RequirementsSet.getArrayRef();
   }
+
+private:
+  void computeBindings(IRGenModule &IGM,
+                       CanSILFunctionType origType,
+                       bool considerParameterSources);
 };
 
 } // end namespace irgen

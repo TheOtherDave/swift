@@ -1,7 +1,7 @@
-// RUN: rm -rf %t
-// RUN: mkdir -p %t
+// RUN: %empty-directory(%t)
 
 // FIXME: BEGIN -enable-source-import hackaround
+// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -emit-module -o %t %clang-importer-sdk-path/swift-modules/Darwin.swift
 // RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -emit-module -o %t %clang-importer-sdk-path/swift-modules/Foundation.swift
 // FIXME: END -enable-source-import hackaround
 
@@ -10,7 +10,8 @@
 
 // REQUIRES: objc_interop
 
-// SR-3917
+// https://github.com/apple/swift/issues/46502
+
 import def_objc_conforming
 
 func test(x: Foo) { _ = x.badness }

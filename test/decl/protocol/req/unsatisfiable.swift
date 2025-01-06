@@ -5,13 +5,17 @@ protocol P {
   associatedtype B
 
   func f<T: P>(_: T) where T.A == Self.A, T.A == Self.B // expected-error{{instance method requirement 'f' cannot add constraint 'Self.A == Self.B' on 'Self'}}
+  // expected-note@-1 {{protocol requires function 'f' with type '<T> (T) -> ()'}}
 }
 
 extension P {
   func f<T: P>(_: T) where T.A == Self.A, T.A == Self.B { }
+  // expected-note@-1 {{candidate would match if 'X.A' (aka 'X') was the same type as 'X.B' (aka 'Int')}}
 }
 
-struct X : P {
+struct X : P { 
+  // expected-error@-1 {{type 'X' does not conform to protocol 'P'}}
+  // expected-note@-2 {{add stubs for conformance}}
   typealias A = X
   typealias B = Int
 }
@@ -35,16 +39,61 @@ protocol Base {
   associatedtype Assoc
 }
 
-// FIXME: The first error is redundant, isn't correct in what it states, and
-// also should be emitted on the inheritance clause.
-// FIXME: This used to /not/ error in Swift 3. It didn't impose any statically-
-// enforced requirements, but the compiler crashed if you used anything but the
-// same type.
-protocol Sub1: Base { // expected-error {{type 'Self.SubAssoc' constrained to non-protocol, non-class type 'Self.Assoc'}}
-  associatedtype SubAssoc: Assoc // expected-error {{inheritance from non-protocol, non-class type 'Self.Assoc'}}
+protocol Sub1: Base {
+  associatedtype SubAssoc: Assoc
+  // expected-error@-1 {{type 'Self.SubAssoc' constrained to non-protocol, non-class type 'Self.Assoc'}}
 }
-// FIXME: This error is incorrect in what it states and should be emitted on
-// the where-clause.
-protocol Sub2: Base { // expected-error {{type 'Self.SubAssoc' constrained to non-protocol, non-class type 'Self.Assoc'}}
-  associatedtype SubAssoc where SubAssoc: Assoc
+
+// FIXME: This error is incorrect in what it states.
+protocol Sub2: Base {
+  associatedtype SubAssoc where SubAssoc: Assoc // expected-error {{type 'Self.SubAssoc' constrained to non-protocol, non-class type 'Self.Assoc'}}
+}
+
+struct S {}
+
+// FIX-ME: One of these errors is redundant.
+protocol P4 {
+  associatedtype X : S
+  // expected-error@-1 {{type 'Self.X' constrained to non-protocol, non-class type 'S'}}
+}
+
+protocol P5 {
+  associatedtype Y where Y : S // expected-error {{type 'Self.Y' constrained to non-protocol, non-class type 'S'}}
+}
+
+protocol P6 {
+  associatedtype T
+  associatedtype U
+
+  func foo() where T == U
+  // expected-error@-1 {{instance method requirement 'foo()' cannot add constraint 'Self.T == Self.U' on 'Self'}}
+  // expected-note@-2 {{protocol requires function 'foo()' with type '() -> ()'}}
+}
+
+struct S2 : P6 {
+  // expected-error@-1 {{type 'S2' does not conform to protocol 'P6'}}
+  // expected-note@-2 {{add stubs for conformance}}
+  typealias T = Int
+  typealias U = String
+
+  func foo() {}
+  // expected-note@-1 {{candidate would match if 'S2.T' (aka 'Int') was the same type as 'S2.U' (aka 'String')}}
+
+  // FIXME: This error is bogus and should be omitted on account of the protocol requirement itself
+  // being invalid.
+}
+
+// This used to emit a diagnostic with a canonical type in it.
+protocol P7 {
+  associatedtype A
+  func f() // expected-note {{protocol requires function 'f()' with type '() -> ()'}}
+}
+
+extension P7 where A: Equatable {
+  func f() {} // expected-note {{candidate would match if 'C7<T>.A' (aka 'T') conformed to 'Equatable'}}
+}
+
+class C7<T>: P7 { // expected-error {{type 'C7<T>' does not conform to protocol 'P7'}}
+// expected-note@-1 {{add stubs for conformance}}
+  typealias A = T
 }

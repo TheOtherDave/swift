@@ -18,6 +18,12 @@
 //  number of invocations, or per-object counters, which represent the
 //  number of runtime functions calls for a specific object.
 
+// By default, this feature is enabled only when assertions are enabled. To control it
+// separately, set the SWIFT_ENABLE_RUNTIME_FUNCTION_COUNTERS environment variable when
+// invoking build-script:
+// SWIFT_ENABLE_RUNTIME_FUNCTION_COUNTERS=TRUE ./utils/build-script ...
+#if SWIFT_ENABLE_RUNTIME_FUNCTION_COUNTERS
+
 /// Collect all references inside the object using Mirrors.
 /// - Parameter value: the value to be inspected
 /// - Parameter references: the array which should contain the collected
@@ -27,13 +33,11 @@
 internal func _collectAllReferencesInsideObjectImpl(
   _ value: Any,
   references: inout [UnsafeRawPointer],
-  visitedItems: inout [ObjectIdentifier : Int]
+  visitedItems: inout [ObjectIdentifier: Int]
 ) {
   // Use the structural reflection and ignore any
   // custom reflectable overrides.
-  let mirror = Mirror(
-    legacy: _reflect(value),
-    subjectType: type(of: value))
+  let mirror = Mirror(internalReflecting: value)
 
   let id: ObjectIdentifier?
   let ref: UnsafeRawPointer?
@@ -104,21 +108,21 @@ struct _RuntimeFunctionCounters {
   public static let runtimeFunctionCountersOffsets =
     _RuntimeFunctionCounters.getRuntimeFunctionCountersOffsets()
   public static let numRuntimeFunctionCounters =
-    _RuntimeFunctionCounters.getNumRuntimeFunctionCounters()
-  public static let runtimeFunctionNameToIndex: [String : Int] =
+    Int(_RuntimeFunctionCounters.getNumRuntimeFunctionCounters())
+  public static let runtimeFunctionNameToIndex: [String: Int] =
     getRuntimeFunctionNameToIndex()
 
   /// Get the names of all runtime functions whose calls are being
   /// tracked.
   @_silgen_name("_swift_getRuntimeFunctionNames")
-  static public func _getRuntimeFunctionNames() ->
+  public static func _getRuntimeFunctionNames() ->
     UnsafePointer<UnsafePointer<CChar>>
 
-  static public func getRuntimeFunctionNames() -> [String] {
+  public static func getRuntimeFunctionNames() -> [String] {
     let names = _RuntimeFunctionCounters._getRuntimeFunctionNames()
     let numRuntimeFunctionCounters =
-      _RuntimeFunctionCounters.getNumRuntimeFunctionCounters()
-    var functionNames : [String] = []
+      Int(_RuntimeFunctionCounters.getNumRuntimeFunctionCounters())
+    var functionNames: [String] = []
     functionNames.reserveCapacity(numRuntimeFunctionCounters)
     for index in 0..<numRuntimeFunctionCounters {
       let name = String(cString: names[index])
@@ -130,28 +134,28 @@ struct _RuntimeFunctionCounters {
   /// Get the offsets of the collected runtime function counters inside
   /// the state.
   @_silgen_name("_swift_getRuntimeFunctionCountersOffsets")
-  static public func getRuntimeFunctionCountersOffsets() ->
+  public static func getRuntimeFunctionCountersOffsets() ->
     UnsafePointer<UInt16>
 
   /// Get the number of different runtime functions whose calls are being
   /// tracked.
   @_silgen_name("_swift_getNumRuntimeFunctionCounters")
-  static public func getNumRuntimeFunctionCounters() -> Int
+  public static func getNumRuntimeFunctionCounters() -> UInt64
 
   /// Dump all per-object runtime function counters.
   @_silgen_name("_swift_dumpObjectsRuntimeFunctionPointers")
-  static public func dumpObjectsRuntimeFunctionPointers()
+  public static func dumpObjectsRuntimeFunctionPointers()
 
   @discardableResult
   @_silgen_name("_swift_setGlobalRuntimeFunctionCountersUpdateHandler")
-  static public func setGlobalRuntimeFunctionCountersUpdateHandler(
+  public static func setGlobalRuntimeFunctionCountersUpdateHandler(
     handler: RuntimeFunctionCountersUpdateHandler?
   ) -> RuntimeFunctionCountersUpdateHandler?
 
   /// Collect all references inside the object using Mirrors.
-  static public func collectAllReferencesInsideObject(_ value: Any) ->
+  public static func collectAllReferencesInsideObject(_ value: Any) ->
     [UnsafeRawPointer] {
-    var visited : [ObjectIdentifier : Int] = [:]
+    var visited: [ObjectIdentifier: Int] = [:]
     var references: [UnsafeRawPointer] = []
     _collectAllReferencesInsideObjectImpl(
       value, references: &references, visitedItems: &visited)
@@ -159,11 +163,11 @@ struct _RuntimeFunctionCounters {
   }
 
   /// Build a map from counter name to counter index inside the state struct.
-  static internal func getRuntimeFunctionNameToIndex() -> [String : Int] {
+  internal static func getRuntimeFunctionNameToIndex() -> [String: Int] {
     let runtimeFunctionNames = _RuntimeFunctionCounters.getRuntimeFunctionNames()
     let numRuntimeFunctionCounters =
-      _RuntimeFunctionCounters.getNumRuntimeFunctionCounters()
-    var runtimeFunctionNameToIndex : [String : Int] = [:]
+      Int(_RuntimeFunctionCounters.getNumRuntimeFunctionCounters())
+    var runtimeFunctionNameToIndex: [String: Int] = [:]
     runtimeFunctionNameToIndex.reserveCapacity(numRuntimeFunctionCounters)
 
     for index in 0..<numRuntimeFunctionCounters {
@@ -177,15 +181,15 @@ struct _RuntimeFunctionCounters {
 /// This protocol defines a set of operations for accessing runtime function
 /// counters statistics.
 public // @testable
-protocol _RuntimeFunctionCountersStats : CustomDebugStringConvertible {
+protocol _RuntimeFunctionCountersStats: CustomDebugStringConvertible {
   init()
 
   /// Dump the current state of all counters.
-  func dump<T : TextOutputStream>(skipUnchanged: Bool, to: inout T)
+  func dump<T: TextOutputStream>(skipUnchanged: Bool, to: inout T)
 
   /// Dump the diff between the current state and a different state of all
   /// counters.
-  func dumpDiff<T : TextOutputStream>(
+  func dumpDiff<T: TextOutputStream>(
     _ after: Self, skipUnchanged: Bool, to: inout T
   )
 
@@ -313,19 +317,19 @@ internal struct _RuntimeFunctionCountersState: _RuntimeFunctionCountersStats {
 
 extension _RuntimeFunctionCounters {
   @_silgen_name("_swift_getObjectRuntimeFunctionCounters")
-  static internal func getObjectRuntimeFunctionCounters(
+  internal static func getObjectRuntimeFunctionCounters(
     _ object: UnsafeRawPointer, _ result: inout _RuntimeFunctionCountersState)
 
   @_silgen_name("_swift_getGlobalRuntimeFunctionCounters")
-  static internal func getGlobalRuntimeFunctionCounters(
+  internal static func getGlobalRuntimeFunctionCounters(
     _ result: inout _RuntimeFunctionCountersState)
 
   @_silgen_name("_swift_setGlobalRuntimeFunctionCounters")
-  static internal func setGlobalRuntimeFunctionCounters(
+  internal static func setGlobalRuntimeFunctionCounters(
     _ state: inout _RuntimeFunctionCountersState)
 
   @_silgen_name("_swift_setObjectRuntimeFunctionCounters")
-  static internal func setObjectRuntimeFunctionCounters(
+  internal static func setObjectRuntimeFunctionCounters(
     _ object: UnsafeRawPointer,
     _ state: inout _RuntimeFunctionCountersState)
 
@@ -371,7 +375,7 @@ extension _RuntimeFunctionCountersStats {
   typealias Counters = _RuntimeFunctionCounters
   @inline(never)
   public // @testable
-  func dump<T : TextOutputStream>(skipUnchanged: Bool, to: inout T) {
+  func dump<T: TextOutputStream>(skipUnchanged: Bool, to: inout T) {
     for i in 0..<Counters.numRuntimeFunctionCounters {
       if skipUnchanged && self[i] == 0 {
         continue
@@ -386,7 +390,7 @@ extension _RuntimeFunctionCountersStats {
 
   @inline(never)
   public // @testable
-  func dumpDiff<T : TextOutputStream>(
+  func dumpDiff<T: TextOutputStream>(
     _ after: Self, skipUnchanged: Bool, to: inout T
   ) {
     for i in 0..<Counters.numRuntimeFunctionCounters {
@@ -541,3 +545,5 @@ func _measureRuntimeFunctionCountersDiffs(
       mode: savedMode)
     return (globalCountersBefore.diff(globalCountersAfter), objectsCountersDiff)
 }
+
+#endif

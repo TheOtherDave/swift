@@ -1,17 +1,20 @@
-// RUN: %target-typecheck-verify-swift -parse-as-library -swift-version 4
+// RUN: %target-typecheck-verify-swift -parse-as-library
 
 lazy func lazy_func() {} // expected-error {{'lazy' may only be used on 'var' declarations}} {{1-6=}}
 
-lazy var b = 42  // expected-error {{'lazy' must not be used on an already-lazy global}} {{1-6=}}
+lazy var b = 42  // expected-error {{'lazy' cannot be used on an already-lazy global}} {{1-6=}}
 
 struct S {
-  lazy static var lazy_global = 42 // expected-error {{'lazy' must not be used on an already-lazy global}} {{3-8=}}
+  lazy static var lazy_global = 42 // expected-error {{'lazy' cannot be used on an already-lazy global}} {{3-8=}}
 }
 
 protocol SomeProtocol {
-  lazy var x : Int  // expected-error {{'lazy' isn't allowed on a protocol requirement}} {{3-8=}}
-  // expected-error@-1 {{property in protocol must have explicit { get } or { get set } specifier}}
-  lazy var y : Int { get } // expected-error {{'lazy' isn't allowed on a protocol requirement}} {{3-8=}}
+  lazy var x : Int  // expected-error {{'lazy' cannot be used on a protocol requirement}} {{3-8=}}
+  // expected-error@-1 {{property in protocol must have explicit { get } or { get set } specifier}} {{19-19= { get <#set#> \}}}
+  // expected-error@-2 {{lazy properties must have an initializer}}
+  lazy var y : Int { get } // expected-error {{'lazy' cannot be used on a protocol requirement}} {{3-8=}}
+  // expected-error@-1 {{'lazy' cannot be used on a computed property}}
+  // expected-error@-2 {{lazy properties must have an initializer}}
 }
 
 
@@ -21,11 +24,12 @@ class TestClass {
 
   lazy let b = 42  // expected-error {{'lazy' cannot be used on a let}} {{3-8=}}
 
-  lazy var c : Int { return 42 } // expected-error {{'lazy' must not be used on a computed property}} {{3-8=}}
+  lazy var c : Int { return 42 } // expected-error {{'lazy' cannot be used on a computed property}} {{3-8=}}
+  // expected-error@-1 {{lazy properties must have an initializer}}
 
   lazy var d : Int  // expected-error {{lazy properties must have an initializer}} {{3-8=}}
 
-  lazy var (e, f) = (1,2)  // expected-error {{'lazy' cannot destructure an initializer}} {{3-8=}}
+  lazy var (e, f) = (1,2)  // expected-error 2{{'lazy' cannot destructure an initializer}} {{3-8=}}
 
   lazy var g = { 0 }()   // single-expr closure
 
@@ -37,13 +41,21 @@ class TestClass {
 
   lazy var k : Int = { () -> Int in return 0 }()+1  // multi-stmt closure
 
-  lazy var l : Int = 42 {  // expected-error {{lazy properties must not have observers}} {{3-8=}}
-    didSet {
-    }
+  lazy var l : Int = 42 {  // Okay
+    didSet {}
+    willSet {}
+  }
+
+  lazy var m : Int = 42 { // Okay
+    didSet {}
+  }
+
+  lazy var n : Int = 42 {
+    willSet {} // Okay
   }
 
   init() {
-    lazy var localvar = 42  // expected-error {{lazy is only valid for members of a struct or class}} {{5-10=}}
+    lazy var localvar = 42 // Okay
     localvar += 1
     _ = localvar
   }
@@ -82,7 +94,7 @@ class CaptureListInLazyProperty {
 // property type and also as part of the getter
 class WeShouldNotReTypeCheckStatements {
   lazy var firstCase = {
-    _ = nil // expected-error {{'nil' requires a contextual type}}
+    _ = nil // expected-error{{'nil' requires a contextual type}}
     _ = ()
   }
 
@@ -108,11 +120,12 @@ struct Outer {
 
     lazy var y = {_ = 3}()
     // expected-warning@-1 {{variable 'y' inferred to have type '()', which may be unexpected}}
-    // expected-note@-2 {{add an explicit type annotation to silence this warning}}
+    // expected-note@-2 {{add an explicit type annotation to silence this warning}} {{15-15=: ()}}
   }
 }
 
-// https://bugs.swift.org/browse/SR-2616
+// https://github.com/apple/swift/issues/45221
+
 struct Construction {
   init(x: Int, y: Int? = 42) { }
 }
@@ -176,4 +189,45 @@ class ReferenceStaticInLazyProperty {
 
   static var i = 42
   static func f() -> Int { return 0 }
+}
+
+// Explicit access to the lazy variable storage
+class LazyVarContainer {
+  lazy var foo: Int = {
+    return 0
+  }()
+
+  func accessLazyStorage() {
+    $__lazy_storage_$_foo = nil // expected-error {{access to the underlying storage of a lazy property is not allowed}}
+    print($__lazy_storage_$_foo!) // expected-error {{access to the underlying storage of a lazy property is not allowed}}
+    _ = $__lazy_storage_$_foo == nil // expected-error {{access to the underlying storage of a lazy property is not allowed}}
+  }
+}
+
+// Make sure we can still access a synthesized variable with the same name as a lazy storage variable
+// i.e. $__lazy_storage_$_{property_name} when using property wrapper where the property name is 
+// '__lazy_storage_$_{property_name}'.
+@propertyWrapper
+struct Wrapper {
+  var wrappedValue: Int { 1 }
+  var projectedValue: Int { 1 }
+}
+
+struct PropertyWrapperContainer {
+  @Wrapper var __lazy_storage_$_foo
+  func test() {
+    _ = $__lazy_storage_$_foo  // This is okay.
+  }
+}
+
+// rdar://problem/129255769
+struct X {
+  struct Y { }
+
+  func f() {
+    _ = {
+      lazy var x: [Y] = []
+      _ = Y()
+    }
+  }
 }

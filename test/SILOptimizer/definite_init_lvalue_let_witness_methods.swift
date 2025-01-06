@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -emit-sil -enable-sil-ownership -disable-objc-attr-requires-foundation-module -verify %s
+// RUN: %target-swift-frontend -emit-sil -disable-objc-attr-requires-foundation-module -verify %s
 
 // High-level tests that DI rejects passing let constants to
 // mutating witness methods
@@ -20,7 +20,7 @@ class TestClass {
     let testObject: TestProtocol // expected-note {{change 'let' to 'var' to make it mutable}}
     init() {
         testObject = TestStruct(foo: 42)
-        testObject.foo = 666 // expected-error {{cannot perform mutating operation: 'self.testObject' is a 'let' constant}}
+        testObject.foo = 666 // expected-error {{cannot mutate property 'foo' of immutable value 'self.testObject'}}
     }
 }
 
@@ -29,33 +29,34 @@ class TestClass {
 let testObject: TestProtocol  // expected-note {{change 'let' to 'var' to make it mutable}}
 testObject = TestStruct(foo: 42)
 
-testObject.foo = 666 // expected-error {{cannot perform mutating operation: 'testObject' is a 'let' constant}}
+testObject.foo = 666 // expected-error {{cannot mutate property 'foo' of immutable value 'testObject'}}
 
 extension TestProtocol {
     mutating func messThingsUp() {
         foo = 666
     }
+    mutating func messThingsUpAndThenThrow() throws {
+        foo = 616
+    }
 }
 
-// Mark: - Case3: Illegally muatating let constant in a function scope
+// Mark: - Case3: Illegally mutating let constant in a function scope
 
-let testObject2: TestProtocol  // expected-note {{change 'let' to 'var' to make it mutable}}
+let testObject2: TestProtocol
 testObject2 = TestStruct(foo: 42)
-testObject2.messThingsUp() // expected-error {{cannot perform mutating operation: 'testObject2' is a 'let' constant}}
 
 func testFunc() {
     let testObject: TestProtocol // expected-note {{change 'let' to 'var' to make it mutable}}
 
     testObject = TestStruct(foo: 42)
-    testObject.foo = 666 // expected-error {{cannot perform mutating operation: 'testObject' is a 'let' constant}}
+    testObject.foo = 666 // expected-error {{cannot mutate property 'foo' of immutable value 'testObject'}}
 }
 
 // Mark: - Case4: Illegally passing a let constants property as an inout parameter
 
-let testObject3: TestProtocol  // expected-note {{change 'let' to 'var' to make it mutable}}
+let testObject3: TestProtocol
 testObject3 = TestStruct(foo: 42)
 
 func mutateThis(mutatee: inout Int) {
     mutatee = 666
 }
-mutateThis(mutatee: &testObject3.foo) // expected-error {{cannot perform mutating operation: 'testObject3' is a 'let' constant}}

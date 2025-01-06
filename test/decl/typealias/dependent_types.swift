@@ -23,24 +23,25 @@ struct X1<T> : P1 {
   }
 }
 
-struct GenericStruct<T> { // expected-note 2{{generic type 'GenericStruct' declared here}}
+struct GenericStruct<T> { // expected-note 3{{generic type 'GenericStruct' declared here}}
   typealias Alias = T
   typealias MetaAlias = T.Type
 
   typealias Concrete = Int
+  typealias ReferencesConcrete = Concrete
 
   func methodOne() -> Alias.Type {}
   func methodTwo() -> MetaAlias {}
 
   func methodOne() -> Alias.BadType {}
-  // expected-error@-1 {{'BadType' is not a member type of 'GenericStruct.Alias'}}
+  // expected-error@-1 {{'BadType' is not a member type of type 'dependent_types.GenericStruct<T>.Alias'}}
   func methodTwo() -> MetaAlias.BadType {}
-  // expected-error@-1 {{'BadType' is not a member type of 'GenericStruct.MetaAlias'}}
+  // expected-error@-1 {{'BadType' is not a member type of type 'dependent_types.GenericStruct<T>.MetaAlias'}}
 
   var propertyOne: Alias.BadType
-  // expected-error@-1 {{'BadType' is not a member type of 'T'}}
+  // expected-error@-1 {{'BadType' is not a member type of type 'dependent_types.GenericStruct<T>.Alias' (aka 'T')}}
   var propertyTwo: MetaAlias.BadType
-  // expected-error@-1 {{'BadType' is not a member type of 'T.Type'}}
+  // expected-error@-1 {{'BadType' is not a member type of type 'dependent_types.GenericStruct<T>.MetaAlias' (aka 'T.Type')}}
 }
 
 // This was accepted in Swift 3.0 and sort of worked... but we can't
@@ -58,3 +59,18 @@ let _: GenericStruct.MetaAlias = metaFoo()
 // ... but if the typealias has a fully concrete underlying type,
 // we are OK.
 let _: GenericStruct.Concrete = foo()
+
+let _: GenericStruct.ReferencesConcrete = foo()
+// expected-error@-1 {{reference to generic type 'GenericStruct' requires arguments in <...>}}
+
+class SuperG<T, U> {
+  typealias Composed = (T, U)
+}
+
+class SubG<T> : SuperG<T, T> { }
+
+typealias SubGX<T> = SubG<T?>
+
+func checkSugar(gs: SubGX<Int>.Composed) {
+  let i4: Int = gs // expected-error{{cannot convert value of type 'SubGX<Int>.Composed' (aka '(Optional<Int>, Optional<Int>)') to specified type 'Int'}}
+}

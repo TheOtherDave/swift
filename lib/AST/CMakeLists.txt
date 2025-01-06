@@ -1,113 +1,179 @@
 
-if (SWIFT_FORCE_OPTIMIZED_TYPECHECKER)
-  set(EXTRA_AST_FLAGS "FORCE_BUILD_OPTIMIZED")
-endif()
+set(SWIFTAST_LLVM_LINK_COMPONENTS
+  bitreader bitwriter coroutines coverage irreader debuginfoDWARF
+  profiledata instrumentation object objcarcopts mc mcparser
+  bitreader bitwriter lto ipo option core support remarks ${LLVM_TARGETS_TO_BUILD}
+)
 
-add_swift_library(swiftAST STATIC
+add_swift_host_library(swiftAST STATIC
+  AbstractSourceFileDepGraphFactory.cpp
+  AccessNotes.cpp
+  AccessRequests.cpp
+  ActorIsolation.cpp
+  ArgumentList.cpp
   ASTContext.cpp
+  ASTDemangler.cpp
   ASTDumper.cpp
   ASTMangler.cpp
   ASTNode.cpp
   ASTPrinter.cpp
   ASTScope.cpp
+  ASTScopeCreation.cpp
+  ASTScopeLookup.cpp
+  ASTScopePrinting.cpp
+  ASTScopeSourceRange.cpp
   ASTVerifier.cpp
   ASTWalker.cpp
   Attr.cpp
+  AutoDiff.cpp
   Availability.cpp
+  AvailabilityContext.cpp
+  AvailabilityDomain.cpp
+  AvailabilityScope.cpp
   AvailabilitySpec.cpp
   Builtins.cpp
   CaptureInfo.cpp
+  ClangSwiftTypeCorrespondence.cpp
+  ClangTypeConverter.cpp
+  Concurrency.cpp
   ConcreteDeclRef.cpp
+  ConformanceLookup.cpp
   ConformanceLookupTable.cpp
   Decl.cpp
   DeclContext.cpp
   DeclNameLoc.cpp
-  DefaultArgumentKind.cpp
+  DiagnosticBridge.cpp
   DiagnosticConsumer.cpp
   DiagnosticEngine.cpp
+  DiagnosticGroups.cpp
   DiagnosticList.cpp
+  DistributedDecl.cpp
   DocComment.cpp
+  Effects.cpp
+  Evaluator.cpp
+  ExistentialGeneralization.cpp
   Expr.cpp
+  ExtInfo.cpp
+  FeatureSet.cpp
+  FineGrainedDependencies.cpp
+  FineGrainedDependencyFormat.cpp
+  FreestandingMacroExpansion.cpp
+  FrontendSourceFileDepGraphFactory.cpp
+  FunctionRefInfo.cpp
   GenericEnvironment.cpp
+  GenericParamList.cpp
   GenericSignature.cpp
-  GenericSignatureBuilder.cpp
   Identifier.cpp
+  ImportCache.cpp
+  IndexSubset.cpp
+  InlinableText.cpp
   LayoutConstraint.cpp
-  LookupVisibleDecls.cpp
+  LifetimeDependence.cpp
+  LocalArchetypeRequirementCollector.cpp
   Module.cpp
+  ModuleDependencies.cpp
   ModuleLoader.cpp
   ModuleNameLookup.cpp
   NameLookup.cpp
+  NameLookupRequests.cpp
+  OperatorNameLookup.cpp
+  PackConformance.cpp
+  PackExpansionMatcher.cpp
+  ParameterPack.cpp
   Parameter.cpp
   Pattern.cpp
   PlatformKind.cpp
+  PluginLoader.cpp
+  PluginRegistry.cpp
   PrettyStackTrace.cpp
   ProtocolConformance.cpp
+  ProtocolConformanceRef.cpp
   RawComment.cpp
-  SyntaxASTMap.cpp
+  Requirement.cpp
+  RequirementEnvironment.cpp
+  RequirementMachine/ConcreteContraction.cpp
+  RequirementMachine/ConcreteTypeWitness.cpp
+  RequirementMachine/Diagnostics.cpp
+  RequirementMachine/GenericSignatureQueries.cpp
+  RequirementMachine/HomotopyReduction.cpp
+  RequirementMachine/InterfaceType.cpp
+  RequirementMachine/KnuthBendix.cpp
+  RequirementMachine/MinimalConformances.cpp
+  RequirementMachine/NameLookup.cpp
+  RequirementMachine/NormalizeRewritePath.cpp
+  RequirementMachine/PropertyMap.cpp
+  RequirementMachine/PropertyRelations.cpp
+  RequirementMachine/PropertyUnification.cpp
+  RequirementMachine/RequirementBuilder.cpp
+  RequirementMachine/RequirementLowering.cpp
+  RequirementMachine/RequirementMachine.cpp
+  RequirementMachine/RequirementMachineRequests.cpp
+  RequirementMachine/RewriteContext.cpp
+  RequirementMachine/RewriteLoop.cpp
+  RequirementMachine/RewriteSystem.cpp
+  RequirementMachine/Rule.cpp
+  RequirementMachine/RuleBuilder.cpp
+  RequirementMachine/SimplifySubstitutions.cpp
+  RequirementMachine/Symbol.cpp
+  RequirementMachine/Term.cpp
+  RequirementMachine/TypeDifference.cpp
+  SearchPathOptions.cpp
   SILLayout.cpp
   Stmt.cpp
-  Substitution.cpp
-  SubstitutionList.cpp
+  StorageImpl.cpp
   SubstitutionMap.cpp
   SwiftNameTranslation.cpp
   Type.cpp
+  TypeCheckRequests.cpp
+  TypeDeclFinder.cpp
   TypeJoinMeet.cpp
-  TypeRefinementContext.cpp
   TypeRepr.cpp
+  TypeSubstitution.cpp
   TypeWalker.cpp
+  UnqualifiedLookup.cpp
   USRGeneration.cpp
-  DEPENDS
-    swift-syntax-generated-headers
 
-  LINK_LIBRARIES
-    swiftMarkup
-    swiftBasic
-    swiftSyntax
-
-  INTERFACE_LINK_LIBRARIES
-    # Clang dependencies.
-    # FIXME: Clang should really export these in some reasonable manner.
-    clangCodeGen
-    clangIndex
-    clangFormat
-    clangToolingCore
-    clangFrontendTool
-    clangFrontend
-    clangDriver
-    clangSerialization
-    clangParse
-    clangSema
-    clangAnalysis
-    clangEdit
-    clangRewriteFrontend
-    clangRewrite
-    clangAST
-    clangLex
-    clangAPINotes
-    clangBasic
-
-  LLVM_COMPONENT_DEPENDS
-    bitreader bitwriter coroutines coverage irreader debuginfoDWARF
-    profiledata instrumentation object objcarcopts mc mcparser
-    bitreader bitwriter lto ipo option core support ${LLVM_TARGETS_TO_BUILD}
-
-  ${EXTRA_AST_FLAGS}
+  LLVM_LINK_COMPONENTS
+  ${SWIFTAST_LLVM_LINK_COMPONENTS}
   )
 
-# intrinsics_gen is the LLVM tablegen target that generates the include files
-# where intrinsics and attributes are declared. swiftAST depends on these
-# headers.
-# For more information see the comment at the top of lib/CMakeLists.txt.
-add_dependencies(swiftAST intrinsics_gen clang-tablegen-targets)
+add_subdirectory(Bridging)
 
-set(swift_ast_verifier_flag)
-if(SWIFT_AST_VERIFIER)
-  set(swift_ast_verifier_flag " -USWIFT_DISABLE_AST_VERIFIER")
-else()
-  set(swift_ast_verifier_flag " -DSWIFT_DISABLE_AST_VERIFIER=1")
+if(SWIFT_FORCE_OPTIMIZED_TYPECHECKER)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+    target_compile_options(swiftAST PRIVATE /O2 /Ob2)
+  else()
+    target_compile_options(swiftAST PRIVATE -O3)
+  endif()
+endif()
+target_link_libraries(swiftAST INTERFACE
+  clangCodeGen
+  clangIndex
+  clangFormat
+  clangToolingCore
+  clangFrontendTool
+  clangDependencyScanning
+  clangFrontend
+  clangDriver
+  clangSerialization
+  clangParse
+  clangSema
+  clangAnalysis
+  clangEdit
+  clangRewriteFrontend
+  clangRewrite
+  clangAST
+  clangLex
+  clangAPINotes
+  clangBasic)
+
+target_link_libraries(swiftAST
+  PUBLIC swiftBasic
+  PRIVATE swiftMarkup)
+
+if (SWIFT_BUILD_SWIFT_SYNTAX)
+  target_link_libraries(swiftAST
+    PRIVATE swiftASTGen)
 endif()
 
-set_property(SOURCE Verifier.cpp APPEND_STRING PROPERTY COMPILE_FLAGS
-  "${swift_ast_verifier_flag}")
-
+set_swift_llvm_is_available(swiftAST)

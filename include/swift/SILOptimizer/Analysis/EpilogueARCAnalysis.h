@@ -57,11 +57,10 @@ public:
   enum EpilogueARCKind { Retain = 0, Release = 1 };
 
 private:
+  SILPassManager *PM;
+
   /// Current post-order we are using.
   LazyFunctionInfo<PostOrderAnalysis, PostOrderFunctionInfo> PO;
-
-  /// Current alias analysis we are using.
-  AliasAnalysis *AA;
 
   /// Current rc-identity we are using.
   LazyFunctionInfo<RCIdentityAnalysis, RCIdentityFunctionInfo> RCFI;
@@ -83,8 +82,14 @@ private:
   /// The exit blocks of the function.
   llvm::SmallPtrSet<SILBasicBlock *, 2> ExitBlocks;
 
-  EpilogueARCBlockState &getState(SILBasicBlock *BB) {
-    return IndexToStateMap[*PO->getPONumber(BB)];
+  /// Returns the EpilogueARCBlockState for \p BB. If \p BB is unreachable,
+  /// returns None
+  std::optional<EpilogueARCBlockState *> getState(SILBasicBlock *BB) {
+    // poNumber will be None for unreachable blocks
+    auto poNumber = PO->getPONumber(BB);
+    if (poNumber.has_value())
+      return &IndexToStateMap[*poNumber];
+    return std::nullopt;
   }
 
   /// Return true if this is a function exiting block this epilogue ARC
@@ -94,7 +99,8 @@ private:
       return BB->getTerminator()->isFunctionExiting();
 
     return BB->getTerminator()->isFunctionExiting() &&
-           BB->getTerminator()->getTermKind() != TermKind::ThrowInst;
+           BB->getTerminator()->getTermKind() != TermKind::ThrowInst &&
+           BB->getTerminator()->getTermKind() != TermKind::ThrowAddrInst;
   }
 
   /// Return true if this is a function exit block.
@@ -113,7 +119,10 @@ private:
   }
 
   SILValue getArg(SILBasicBlock *BB) {
-    SILValue A = getState(BB).LocalArg;
+    auto state = getState(BB);
+    if (!state)
+      return SILValue();
+    SILValue A = state.value()->LocalArg;
     if (A)
       return A;
     return Arg;
@@ -121,9 +130,9 @@ private:
 
 public:
   /// Constructor.
-  EpilogueARCContext(SILFunction *F, PostOrderAnalysis *PO, AliasAnalysis *AA,
+  EpilogueARCContext(SILFunction *F, PostOrderAnalysis *PO, SILPassManager *PM,
                      RCIdentityAnalysis *RCIA)
-      : PO(F, PO), AA(AA), RCFI(F, RCIA) {}
+      : PM(PM), PO(F, PO), RCFI(F, RCIA) {}
 
   /// Run the data flow to find the epilogue retains or releases.
   bool run(EpilogueARCKind NewKind, SILValue NewArg) {
@@ -165,12 +174,13 @@ public:
   bool mayBlockEpilogueRetain(SILInstruction *II, SILValue Ptr) { 
     // reference decrementing instruction prevents any retain to be identified as
     // epilogue retains.
-    if (mayDecrementRefCount(II, Ptr, AA))
+    auto *function = II->getFunction();
+    if (mayDecrementRefCount(II, Ptr, PM->getAnalysis<AliasAnalysis>(function)))
       return true;
     // Handle self-recursion. A self-recursion can be considered a +1 on the
     // current argument.
     if (auto *AI = dyn_cast<ApplyInst>(II))
-     if (AI->getCalleeFunction() == II->getParent()->getParent())
+     if (AI->getCalleeFunction() == function)
        return true;
     return false;
   } 
@@ -200,9 +210,11 @@ public:
     // We are checking for retain. If this is a self-recursion. call
     // to the function (which returns an owned value) can be treated as
     // the retain instruction.
-    if (auto *AI = dyn_cast<ApplyInst>(II))
-     if (AI->getCalleeFunction() == II->getParent()->getParent())
-       return true;
+    if (auto *AI = dyn_cast<ApplyInst>(II)) {
+      return AI->getCalleeFunction() == II->getParent()->getParent() &&
+             RCFI->getRCIdentityRoot(AI) ==
+             RCFI->getRCIdentityRoot(getArg(AI->getParent()));
+    }
     // Check whether this is a retain instruction and the argument it
     // retains.
     return isRetainInstruction(II) &&
@@ -224,16 +236,10 @@ class EpilogueARCFunctionInfo {
   llvm::DenseMap<SILValue, ARCInstructions> EpilogueReleaseInstCache;
 
 public:
-  void handleDeleteNotification(SILNode *node) {
-    // Being conservative and clear everything for now.
-    EpilogueRetainInstCache.clear();
-    EpilogueReleaseInstCache.clear();
-  }
-
   /// Constructor.
   EpilogueARCFunctionInfo(SILFunction *F, PostOrderAnalysis *PO,
-                          AliasAnalysis *AA, RCIdentityAnalysis *RC)
-      : Context(F, PO, AA, RC) {}
+                          SILPassManager *PM, RCIdentityAnalysis *RC)
+      : Context(F, PO, PM, RC) {}
 
   /// Find the epilogue ARC instruction based on the given \p Kind and given
   /// \p Arg.
@@ -262,46 +268,29 @@ public:
 };
 
 class EpilogueARCAnalysis : public FunctionAnalysisBase<EpilogueARCFunctionInfo> {
+  /// Backlink to the pass manager.
+  SILPassManager *passManager = nullptr;
   /// Current post order analysis we are using.
-  PostOrderAnalysis *PO;
-  /// Current alias analysis we are using.
-  AliasAnalysis *AA;
+  PostOrderAnalysis *PO = nullptr;
   /// Current RC Identity analysis we are using.
-  RCIdentityAnalysis *RC;
-
+  RCIdentityAnalysis *RC = nullptr;
+  
 public:
   EpilogueARCAnalysis(SILModule *)
-    : FunctionAnalysisBase<EpilogueARCFunctionInfo>(AnalysisKind::EpilogueARC),
-      PO(nullptr), AA(nullptr), RC(nullptr) {}
+      : FunctionAnalysisBase<EpilogueARCFunctionInfo>(
+            SILAnalysisKind::EpilogueARC) {}
 
   EpilogueARCAnalysis(const EpilogueARCAnalysis &) = delete;
   EpilogueARCAnalysis &operator=(const EpilogueARCAnalysis &) = delete;
 
-  virtual void handleDeleteNotification(SILNode *node) override {
-    // If the parent function of this instruction was just turned into an
-    // external declaration, bail. This happens during SILFunction destruction.
-    SILFunction *F = node->getFunction();
-    if (F->isExternalDeclaration()) {
-      return;
-    }
-
-    // If we do have an analysis, tell it to handle its delete notifications.
-    if (auto A = maybeGet(F)) {
-      A.get()->handleDeleteNotification(node);
-    }
-  }
-
-  virtual bool needsNotifications() override { return true; }
-
   static bool classof(const SILAnalysis *S) {
-    return S->getKind() == AnalysisKind::EpilogueARC;
+    return S->getKind() == SILAnalysisKind::EpilogueARC;
   }
 
   virtual void initialize(SILPassManager *PM) override;
   
-  virtual EpilogueARCFunctionInfo *newFunctionAnalysis(SILFunction *F) override {
-    return new EpilogueARCFunctionInfo(F, PO, AA, RC);
-  }
+  virtual std::unique_ptr<EpilogueARCFunctionInfo>
+  newFunctionAnalysis(SILFunction *F) override;
 
   virtual bool shouldInvalidate(SILAnalysis::InvalidationKind K) override {
     return true;

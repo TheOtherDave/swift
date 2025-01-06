@@ -14,6 +14,7 @@
 
 #include "RCStateTransition.h"
 #include "swift/SIL/SILInstruction.h"
+#include "swift/SIL/SILFunction.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Debug.h"
 
@@ -28,7 +29,7 @@ static bool isAutoreleasePoolCall(SILInstruction *I) {
   if (!AI)
     return false;
 
-  auto *Fn = AI->getReferencedFunction();
+  auto *Fn = AI->getReferencedFunctionOrNull();
   if (!Fn)
     return false;
 
@@ -78,14 +79,15 @@ RCStateTransitionKind swift::getRCStateTransitionKind(SILNode *N) {
     return RCStateTransitionKind::Unknown;
   }
 
+  // Alloc* are always allocating new classes so they are introducing new
+  // values at +1.
   case SILNodeKind::AllocRefInst:
   case SILNodeKind::AllocRefDynamicInst:
-    // AllocRef* are always allocating new classes so they are introducing new
-    // values at +1.
+  case SILNodeKind::AllocBoxInst:
     return RCStateTransitionKind::StrongEntrance;
 
-  case SILNodeKind::AllocBoxInst:
-    // AllocBox introduce their container result at +1.
+  case SILNodeKind::PartialApplyInst:
+    // Partial apply boxes are introduced at +1.
     return RCStateTransitionKind::StrongEntrance;
 
   default:
@@ -127,12 +129,12 @@ bool RCStateTransition::matchingInst(SILInstruction *Inst) const {
     return false;
 
   if (Kind == RCStateTransitionKind::StrongIncrement) {
-    auto InstTransKind = getRCStateTransitionKind(Inst);
+    auto InstTransKind = getRCStateTransitionKind(Inst->asSILNode());
     return InstTransKind == RCStateTransitionKind::StrongDecrement;
   }
 
   if (Kind == RCStateTransitionKind::StrongDecrement) {
-    auto InstTransKind = getRCStateTransitionKind(Inst);
+    auto InstTransKind = getRCStateTransitionKind(Inst->asSILNode());
     return InstTransKind == RCStateTransitionKind::StrongIncrement;
   }
 

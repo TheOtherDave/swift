@@ -17,7 +17,7 @@
 
 namespace swift {
 
-/// \brief Per-BasicBlock state.
+/// Per-BasicBlock state.
 class ARCSequenceDataflowEvaluator::ARCBBState {
 public:
   using TopDownMapTy = SmallBlotMapVector<SILValue, TopDownRefCountState, 4>;
@@ -103,11 +103,11 @@ public:
 
   /// Blot \p Ptr.
   void clearBottomUpRefCountState(SILValue Ptr) {
-    PtrToBottomUpState.blot(Ptr);
+    PtrToBottomUpState.erase(Ptr);
   }
 
   /// Blot \p Ptr.
-  void clearTopDownRefCountState(SILValue Ptr) { PtrToTopDownState.blot(Ptr); }
+  void clearTopDownRefCountState(SILValue Ptr) { PtrToTopDownState.erase(Ptr); }
 
   void clearTopDownState() { PtrToTopDownState.clear(); }
   void clearBottomUpState() { PtrToBottomUpState.clear(); }
@@ -137,6 +137,9 @@ public:
   /// BB. Used to create an initial state before we merge in other
   /// predecessors. This is currently a stub.
   void initPredTopDown(ARCBBState &PredBB);
+
+  void dumpBottomUpState();
+  void dumpTopDownState();
 };
 
 class ARCSequenceDataflowEvaluator::ARCBBStateInfoHandle {
@@ -190,13 +193,13 @@ public:
   ARCBBStateInfo(SILFunction *F, PostOrderAnalysis *POTA,
                  ProgramTerminationFunctionInfo *PTFI);
 
-  llvm::Optional<ARCBBStateInfoHandle> getBottomUpBBHandle(SILBasicBlock *BB);
-  llvm::Optional<ARCBBStateInfoHandle> getTopDownBBHandle(SILBasicBlock *BB);
+  std::optional<ARCBBStateInfoHandle> getBottomUpBBHandle(SILBasicBlock *BB);
+  std::optional<ARCBBStateInfoHandle> getTopDownBBHandle(SILBasicBlock *BB);
 
   void clear();
 
 private:
-  llvm::Optional<unsigned> getBBID(SILBasicBlock *BB) const;
+  std::optional<unsigned> getBBID(SILBasicBlock *BB) const;
 };
 
 } // end swift namespace

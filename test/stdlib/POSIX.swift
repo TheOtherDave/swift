@@ -1,15 +1,18 @@
 // RUN: %target-run-simple-swift %t
 // REQUIRES: executable_test
-
-// Android Bionic does not provide a working implementation of
-// <semaphore.h>.
-// XFAIL: OS=linux-androideabi
+// UNSUPPORTED: OS=windows-msvc
+// UNSUPPORTED: OS=wasi
 
 import StdlibUnittest
-#if os(Linux)
-  import Glibc
-#else
+import SwiftPrivateLibcExtras
+#if canImport(Darwin)
   import Darwin
+#elseif canImport(Glibc)
+  import Glibc
+#elseif canImport(Android)
+  import Android
+#else
+#error("Unsupported platform")
 #endif
 
 chdir(CommandLine.arguments[1])
@@ -17,7 +20,38 @@ chdir(CommandLine.arguments[1])
 var POSIXTests = TestSuite("POSIXTests")
 
 let semaphoreName = "TestSem"
+#if os(Android)
+// In Android, the cwd is the root directory, which is not writable.
+let fn: String = {
+  let capacity = Int(PATH_MAX)
+  let resolvedPath = UnsafeMutablePointer<Int8>.allocate(capacity: capacity)
+  resolvedPath.initialize(repeating: 0, count: capacity)
+  defer {
+    resolvedPath.deinitialize(count: capacity)
+    resolvedPath.deallocate()
+  }
+  guard let _ = realpath("/proc/self/exe", resolvedPath) else {
+    fatalError("Couldn't obtain executable path")
+  }
+
+  let length = strlen(resolvedPath)
+  precondition(length != 0, "Couldn't obtain valid executable path")
+
+  // Search backwards for the last /, and turn it into a null byte.
+  for idx in stride(from: length-1, through: 0, by: -1) {
+      if Unicode.Scalar(UInt8(resolvedPath[idx])) == Unicode.Scalar("/") {
+        resolvedPath[idx] = 0
+        break
+      }
+
+      precondition(idx != 0, "Couldn't obtain valid executable directory")
+  }
+
+  return String(cString: resolvedPath) + "/test.txt"
+}()
+#else
 let fn = "test.txt"
+#endif
 
 POSIXTests.setUp {
   sem_unlink(semaphoreName)
@@ -25,37 +59,44 @@ POSIXTests.setUp {
 }
 
 // Failed semaphore creation.
+#if !os(Android) // Android doesn’t implement sem_open and always return ENOSYS
 POSIXTests.test("sem_open fail") {
   let sem = sem_open(semaphoreName, 0)
   expectEqual(SEM_FAILED, sem)
   expectEqual(ENOENT, errno)
 }
+#endif
 
 // Successful semaphore creation.
+#if !os(Android) // Android doesn’t implement sem_open and always return ENOSYS
 POSIXTests.test("sem_open success") {
   let sem = sem_open(semaphoreName, O_CREAT, 0o777, 1)
   expectNotEqual(SEM_FAILED, sem)
 
-  let res = sem_close(sem)
+  let res = sem_close(sem!)
   expectEqual(0, res)
 
   let res2 = sem_unlink(semaphoreName)
   expectEqual(0, res2)
 }
+#endif
 
 // Successful semaphore creation with O_EXCL.
+#if !os(Android) // Android doesn’t implement sem_open and always return ENOSYS
 POSIXTests.test("sem_open O_EXCL success") {
   let sem = sem_open(semaphoreName, O_CREAT | O_EXCL, 0o777, 1)
   expectNotEqual(SEM_FAILED, sem)
 
-  let res = sem_close(sem)
+  let res = sem_close(sem!)
   expectEqual(0, res)
 
   let res2 = sem_unlink(semaphoreName)
   expectEqual(0, res2)
 }
+#endif
 
 // Successful creation and re-obtaining of existing semaphore.
+#if !os(Android) // Android doesn’t implement sem_open and always return ENOSYS
 POSIXTests.test("sem_open existing") {
   let sem = sem_open(semaphoreName, O_CREAT, 0o777, 1)
   expectNotEqual(SEM_FAILED, sem)
@@ -65,14 +106,16 @@ POSIXTests.test("sem_open existing") {
   // difficult.
   expectNotEqual(SEM_FAILED, sem2)
 
-  let res = sem_close(sem)
+  let res = sem_close(sem!)
   expectEqual(0, res)
 
   let res2 = sem_unlink(semaphoreName)
   expectEqual(0, res2)
 }
+#endif
 
 // Fail because the semaphore already exists.
+#if !os(Android) // Android doesn’t implement sem_open and always return ENOSYS
 POSIXTests.test("sem_open existing O_EXCL fail") {
   let sem = sem_open(semaphoreName, O_CREAT, 0o777, 1)
   expectNotEqual(SEM_FAILED, sem)
@@ -81,12 +124,13 @@ POSIXTests.test("sem_open existing O_EXCL fail") {
   expectEqual(SEM_FAILED, sem2)
   expectEqual(EEXIST, errno)
 
-  let res = sem_close(sem)
+  let res = sem_close(sem!)
   expectEqual(0, res)
 
   let res2 = sem_unlink(semaphoreName)
   expectEqual(0, res2)
 }
+#endif
 
 // Fail because the file descriptor is invalid.
 POSIXTests.test("ioctl(CInt, UInt, CInt): fail") {
@@ -99,7 +143,7 @@ POSIXTests.test("ioctl(CInt, UInt, CInt): fail") {
   expectEqual(EBADF, errno)
 }
 
-#if os(Linux)
+#if os(Linux) || os(Android)
 // Successful creation of a socket and listing interfaces
 POSIXTests.test("ioctl(CInt, UInt, UnsafeMutableRawPointer): listing interfaces success") {
   // Create a socket
@@ -223,4 +267,3 @@ POSIXTests.test("fcntl(CInt, CInt, UnsafeMutableRawPointer): locking and unlocki
 }
 
 runAllTests()
-

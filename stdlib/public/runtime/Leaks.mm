@@ -131,10 +131,13 @@ static void dumpSwiftHeapObjects() {
     kindDescriptor = #name;                                                    \
     break;
 #include "swift/ABI/MetadataKind.def"
+    default:
+      kindDescriptor = "unknown";
+      break;
     }
 
-    if (const NominalTypeDescriptor *NTD =
-            Metadata->getNominalTypeDescriptor()) {
+    if (auto *NTD =
+            Metadata->getTypeContextDescriptor()) {
       fprintf(stderr, "{"
                       "\"type\": \"nominal\", "
                       "\"name\": \"%s\", "
@@ -225,5 +228,5 @@ static void _swift_leaks_stopTrackingObjCObject(id Object) {
 }
 
 #else
-static char DummyDecl = '';
+static char DummyDecl = '\0';
 #endif

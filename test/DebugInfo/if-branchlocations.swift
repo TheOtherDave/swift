@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend %s -emit-sil -emit-verbose-sil -g -o - | %FileCheck %s
+// RUN: %target-swift-frontend %s -emit-sil -emit-verbose-sil -g -o - | %FileCheck %s --check-prefixes=CHECK
 
 class NSURL {}
 
@@ -32,8 +32,8 @@ class AppDelegate {
           LogStr( "There is a url" )
         }
         // Verify that the branch's location is >= the cleanup's location.
-        // CHECK: strong_release{{.*}}$NSPathControlItem{{.*}}line:[[@LINE+2]]
-        // CHECK-NEXT: br{{.*}}line:[[@LINE+1]]
+        // CHECK-NCP: strong_release{{.*}}$NSPathControlItem{{.*}}line:[[@LINE+2]]
+        // CHECK: br{{.*}}line:[[@LINE+1]]
       }
     }
   }

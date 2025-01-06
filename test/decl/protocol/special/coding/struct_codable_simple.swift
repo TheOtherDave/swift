@@ -29,3 +29,23 @@ let _ = SimpleStruct.encode(to:)
 // The synthesized CodingKeys type should not be accessible from outside the
 // struct.
 let _ = SimpleStruct.CodingKeys.self // expected-error {{'CodingKeys' is inaccessible due to 'private' protection level}}
+
+// rdar://problem/59655704
+// https://github.com/apple/swift/issues/54675
+
+struct S1_54675: Codable { // expected-error {{type 'S1_54675' does not conform to protocol 'Encodable'}} expected-error {{type 'S1_54675' does not conform to protocol 'Decodable'}}
+  var x: Int // expected-note {{'x' previously declared here}}
+  var x: Int // expected-error {{invalid redeclaration of 'x'}}
+  // expected-note@-1 {{cannot automatically synthesize 'Encodable' because 'Int' does not conform to 'Encodable'}}
+  // expected-note@-2 {{cannot automatically synthesize 'Encodable' because 'Int' does not conform to 'Encodable'}}
+}
+
+struct S2_54675: Decodable { // expected-error {{type 'S2_54675' does not conform to protocol 'Decodable'}}
+  var x: Int // expected-note {{'x' previously declared here}}
+  var x: Int // expected-error {{invalid redeclaration of 'x'}}
+}
+
+struct S3_54675: Encodable { // expected-error {{type 'S3_54675' does not conform to protocol 'Encodable'}}
+  var x: Int // expected-note {{'x' previously declared here}}
+  var x: Int // expected-error {{invalid redeclaration of 'x'}}
+}

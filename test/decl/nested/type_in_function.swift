@@ -85,8 +85,8 @@ class OuterGenericClass<T> {
       init(t: T) { super.init(); self.t = t }
     }
 
-    class InnerGenericClass<U> : OuterGenericClass<U> // expected-error {{type 'InnerGenericClass' cannot be nested in generic function 'genericFunction'}}
-      where U : Racoon, U.Stripes == T {
+    class InnerGenericClass<V> : OuterGenericClass<V> // expected-error {{type 'InnerGenericClass' cannot be nested in generic function 'genericFunction'}}
+      where V : Racoon, V.Stripes == T {
       let t: T
 
       init(t: T) { super.init(); self.t = t }
@@ -98,7 +98,8 @@ class OuterGenericClass<T> {
 func f5<T, U>(x: T, y: U) {
   struct Local { // expected-error {{type 'Local' cannot be nested in generic function 'f5(x:y:)'}}
     func f() {
-      _ = 17 as T // expected-error{{'Int' is not convertible to 'T'}} {{14-16=as!}}
+      _ = 17 as T // expected-error{{'Int' is not convertible to 'T'}} 
+      // expected-note@-1{{did you mean to use 'as!' to force downcast?}} {{14-16=as!}}
       _ = 17 as U // okay: refers to 'U' declared within the local class
     }
     typealias U = Int
@@ -119,7 +120,7 @@ struct OuterGenericStruct<A> {
   func middleFunction() {
     struct ConformingType : Racoon {
     // expected-error@-1 {{type 'ConformingType' cannot be nested in generic function 'middleFunction()'}}
-      typealias Stripes = A
+      typealias Stripes = String
     }
   }
 }
@@ -128,21 +129,19 @@ struct OuterGenericStruct<A> {
 func genericFunction<T>(t: T) {
   class First : Second<T>.UnknownType { }
   // expected-error@-1 {{type 'First' cannot be nested in generic function 'genericFunction(t:)'}}
-  class Second<T> : Second { }
+  // expected-error@-2 {{'UnknownType' is not a member type of generic class 'type_in_function.Second<T>'}}
+  class Second<U> : Second { } // expected-note{{'Second' declared here}}
   // expected-error@-1 {{type 'Second' cannot be nested in generic function 'genericFunction(t:)'}}
-  // expected-error@-2 2 {{circular class inheritance Second}}
+  // expected-error@-2 {{'Second' inherits from itself}}
 }
 
-// Spurious "Self or associated type requirements" diagnostic.
-protocol ProtoWithAssocType {
-  associatedtype T = Int
-}
+// Superclass lookup archetype vs interface type mixup
+class Generic<T> {
+  struct Nested {}
 
-func freeFunction() {
-  struct ConformingType : ProtoWithAssocType {
-    typealias T = Int
-
-    func method() -> ProtoWithAssocType {}
-    // expected-error@-1 {{can only be used as a generic constraint because it has Self or associated type requirements}}
+  func outerMethod() {
+    class Inner : Generic<T> { // expected-error {{type 'Inner' cannot be nested in generic function 'outerMethod()'}}
+      func innerMethod() -> Nested {}
+    }
   }
 }

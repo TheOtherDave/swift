@@ -1,8 +1,6 @@
-add_swift_library(swiftMarkup STATIC
+add_swift_host_library(swiftMarkup STATIC
   AST.cpp
   LineList.cpp
-  Markup.cpp
-  
-  LINK_LIBRARIES
-    libcmark_static)
-
+  Markup.cpp)
+target_link_libraries(swiftMarkup PRIVATE
+  libcmark-gfm)

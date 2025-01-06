@@ -29,6 +29,7 @@ namespace ide {
 enum class SyntaxNodeKind : uint8_t {
   Keyword,
   Identifier,
+  Operator,
   DollarIdent,
   Integer,
   Floating,
@@ -48,6 +49,8 @@ enum class SyntaxNodeKind : uint8_t {
   BuildConfigKeyword,
   /// An identifier in a #if condition.
   BuildConfigId,
+  /// #-keywords like #warning, #sourceLocation
+  PoundDirectiveKeyword,
   /// Any occurrence of '@<attribute-name>' anywhere.
   AttributeId,
   /// A "resolved/active" attribute. Mis-applied attributes will be AttributeId.
@@ -96,6 +99,7 @@ enum class SyntaxStructureKind : uint8_t {
   TypeAlias,
   Subscript,
   AssociatedType,
+  GenericTypeParam,
 
   ForEachStatement,
   WhileStatement,
@@ -111,7 +115,8 @@ enum class SyntaxStructureKind : uint8_t {
   ArrayExpression,
   DictionaryExpression,
   ObjectLiteralExpression,
-  TupleExpression
+  TupleExpression,
+  ClosureExpression
 };
 
 enum class SyntaxStructureElementKind : uint8_t {
@@ -134,7 +139,7 @@ struct SyntaxStructureElement {
 struct SyntaxStructureNode {
   const Decl *Dcl = nullptr;
   SyntaxStructureKind Kind;
-  DeclAttributes Attrs;
+  ParsedDeclAttributes Attrs;
   CharSourceRange Range;
   CharSourceRange BodyRange;
   CharSourceRange NameRange;
@@ -165,21 +170,21 @@ class SyntaxModelWalker {
 public:
   virtual ~SyntaxModelWalker() {}
 
-  /// \brief Called when first visiting a syntax node, before walking into its
+  /// Called when first visiting a syntax node, before walking into its
   /// children.  If it returns false, the subtree is skipped.
   ///
   virtual bool walkToNodePre(SyntaxNode Node) { return true; }
 
-  /// \brief Called after visiting the children of a syntax node. If it returns
+  /// Called after visiting the children of a syntax node. If it returns
   /// false, the remaining traversal is terminated and returns failure.
   virtual bool walkToNodePost(SyntaxNode Node) { return true; }
 
-  /// \brief Called when first visiting a sub-structure node, before walking
+  /// Called when first visiting a sub-structure node, before walking
   /// into its children. If it returns false, the subtree is skipped.
   ///
   virtual bool walkToSubStructurePre(SyntaxStructureNode Node) { return true; }
 
-  /// \brief Called after visiting the children of a sub-structure node. If it
+  /// Called after visiting the children of a sub-structure node. If it
   /// returns false, the remaining traversal is terminated and returns failure.
   ///
   virtual bool walkToSubStructurePost(SyntaxStructureNode Node) { return true; }

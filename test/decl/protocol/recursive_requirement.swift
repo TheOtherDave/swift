@@ -1,4 +1,5 @@
 // RUN: %target-typecheck-verify-swift
+// RUN: not %target-swift-frontend -typecheck %s -debug-generic-signatures 2>&1 | %FileCheck %s
 
 // -----
 
@@ -6,8 +7,8 @@ protocol Foo {
   associatedtype Bar : Foo
 }
 
-struct Oroborous : Foo {
-  typealias Bar = Oroborous
+struct Ouroboros : Foo {
+  typealias Bar = Ouroboros
 }
 
 // -----
@@ -52,8 +53,9 @@ protocol P3 {
 
 protocol P4 : P3 {}
 
-protocol DeclaredP : P3, // expected-warning{{redundant conformance constraint 'Self': 'P3'}}
-P4 {} // expected-note{{conformance constraint 'Self': 'P3' implied here}}
+// CHECK-LABEL: .DeclaredP@
+// CHECK-NEXT: Requirement signature: <Self where Self : P4>
+protocol DeclaredP : P3, P4 {}
 
 struct Y3 : DeclaredP {
 }
@@ -76,14 +78,12 @@ protocol Gamma {
   associatedtype Delta: Alpha
 }
 
-// FIXME: Redundancy diagnostics are an indication that we're getting
-// the minimization wrong. The errors prove it :D
-struct Epsilon<T: Alpha, // expected-note{{conformance constraint 'U': 'Gamma' implied here}}
-// expected-warning@-1{{redundant conformance constraint 'T': 'Alpha'}}
-               U: Gamma> // expected-warning{{redundant conformance constraint 'U': 'Gamma'}}
-// expected-note@-1{{conformance constraint 'T': 'Alpha' implied here}}
-  where T.Beta == U, // expected-error{{'Beta' is not a member type of 'T'}}
-        U.Delta == T {} // expected-error{{'Delta' is not a member type of 'U'}}
+// CHECK-LABEL: .Epsilon@
+// CHECK-NEXT: Generic signature: <T, U where T : Alpha, T == U.[Gamma]Delta, U == T.[Alpha]Beta>
+struct Epsilon<T: Alpha,
+               U: Gamma>
+  where T.Beta == U,
+        U.Delta == T {}
 
 // -----
 
@@ -95,7 +95,7 @@ protocol AsExistentialB {
 }
 
 protocol AsExistentialAssocTypeA {
-  var delegate : AsExistentialAssocTypeB? { get } // expected-error {{protocol 'AsExistentialAssocTypeB' can only be used as a generic constraint because it has Self or associated type requirements}}
+  var delegate : AsExistentialAssocTypeB? { get } // expected-error {{use of protocol 'AsExistentialAssocTypeB' as a type must be written 'any AsExistentialAssocTypeB'}}
 }
 protocol AsExistentialAssocTypeB {
   func aMethod(_ object : AsExistentialAssocTypeA)
@@ -107,10 +107,11 @@ protocol AsExistentialAssocTypeAgainA {
   associatedtype Bar
 }
 protocol AsExistentialAssocTypeAgainB {
-  func aMethod(_ object : AsExistentialAssocTypeAgainA) // expected-error {{protocol 'AsExistentialAssocTypeAgainA' can only be used as a generic constraint because it has Self or associated type requirements}}
+  func aMethod(_ object : AsExistentialAssocTypeAgainA) // expected-error {{use of protocol 'AsExistentialAssocTypeAgainA' as a type must be written 'any AsExistentialAssocTypeAgainA'}}
 }
 
-// SR-547
+// https://github.com/apple/swift/issues/43164
+
 protocol A {
     associatedtype B1: B
     associatedtype C1: C
@@ -128,5 +129,3 @@ protocol B {
     
     func observeChangeOfProperty(_ property: BC, observable: BA)
 }
-
-

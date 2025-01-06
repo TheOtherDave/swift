@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2021 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -12,20 +12,25 @@
 
 import TestsUtils
 
-public let DictionaryGroup = [
-  BenchmarkInfo(name: "DictionaryGroup", runFunction: run_DictionaryGroup, tags: [.validation, .api, .Dictionary]),
-  BenchmarkInfo(name: "DictionaryGroupOfObjects", runFunction: run_DictionaryGroupOfObjects, tags: [.validation, .api, .Dictionary]),
+public let benchmarks = [
+  BenchmarkInfo(name: "DictionaryGroup",
+    runFunction: run_DictionaryGroup,
+    tags: [.validation, .api, .Dictionary]),
+  BenchmarkInfo(name: "DictionaryGroupOfObjects",
+    runFunction: run_DictionaryGroupOfObjects,
+    tags: [.validation, .api, .Dictionary],
+    setUpFunction: { blackHole(inputObjects) },
+    tearDownFunction: { inputObjects = nil },
+    legacyFactor: 9
+  ),
 ]
 
-let count = 10_000
-let result = count / 10
-
 @inline(never)
-public func run_DictionaryGroup(_ N: Int) {
-  for _ in 1...N {
-    let dict = Dictionary(grouping: 0..<count, by: { $0 % 10 })
-    CheckResults(dict.count == 10)
-    CheckResults(dict[0]!.count == result)
+public func run_DictionaryGroup(_ n: Int) {
+  for _ in 1...n {
+    let dict = Dictionary(grouping: 0..<10_000, by: { $0 % 10 })
+    check(dict.count == 10)
+    check(dict[0]!.count == 1_000)
   }
 }
 
@@ -36,8 +41,8 @@ class Box<T : Hashable> : Hashable {
     value = v
   }
 
-  var hashValue: Int {
-    return value.hashValue
+  func hash(into hasher: inout Hasher) {
+    hasher.combine(value)
   }
 
   static func ==(lhs: Box, rhs: Box) -> Bool {
@@ -45,12 +50,14 @@ class Box<T : Hashable> : Hashable {
   }
 }
 
+var inputObjects: [Box<Int>]! = (0..<1_000).lazy.map { Box($0) }
+
 @inline(never)
-public func run_DictionaryGroupOfObjects(_ N: Int) {
-  let objects = (0..<count).map { Box($0) }
-  for _ in 1...N {
+public func run_DictionaryGroupOfObjects(_ n: Int) {
+  let objects: [Box<Int>] = inputObjects
+  for _ in 1...n {
     let dict = Dictionary(grouping: objects, by: { Box($0.value % 10) })
-    CheckResults(dict.count == 10)
-    CheckResults(dict[Box(0)]!.count == result)
+    check(dict.count == 10)
+    check(dict[Box(0)]!.count == 100)
   }
 }

@@ -4,7 +4,7 @@
 // RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=TC_VAR_4 | %FileCheck %s -check-prefix=FOO_STRUCT_COMMON
 // RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=TC_VAR_5 | %FileCheck %s -check-prefix=FOO_STRUCT_COMMON
 // RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=TC_VAR_6 | %FileCheck %s -check-prefix=FOO_STRUCT_COMMON
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=TC_VAR_7 | %FileCheck %s -check-prefix=ERROR_COMMON
+// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=TC_VAR_7 | %FileCheck %s -check-prefix=FOO_STRUCT_COMMON
 
 // RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=TC_VAR_IN_CONSTRUCTOR_1 | %FileCheck %s -check-prefix=FOO_STRUCT_COMMON
 // RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=TC_VAR_IN_CONSTRUCTOR_2 | %FileCheck %s -check-prefix=FOO_STRUCT_COMMON
@@ -39,20 +39,17 @@ struct FooStruct {
   }
 }
 
-// FOO_STRUCT_COMMON: Begin completions
-// FOO_STRUCT_COMMON-NEXT: Decl[InstanceVar]/CurrNominal:    instanceVar[#Int#]{{; name=.+$}}
-// FOO_STRUCT_COMMON-NEXT: Decl[InstanceMethod]/CurrNominal: instanceFunc0()[#Void#]{{; name=.+$}}
-// FOO_STRUCT_COMMON-NEXT: Decl[InstanceMethod]/CurrNominal: builderFunc1()[#FooStruct#]{{; name=.+$}}
-// FOO_STRUCT_COMMON-NEXT: Decl[InstanceMethod]/CurrNominal: builderFunc2({#(a): Int#})[#FooStruct#]{{; name=.+$}}
-// FOO_STRUCT_COMMON-NEXT: End completions
+// FOO_STRUCT_COMMON: Begin completions, 5 items
+// FOO_STRUCT_COMMON-DAG: Keyword[self]/CurrNominal: self[#FooStruct#]; name=self
+// FOO_STRUCT_COMMON-DAG: Decl[InstanceVar]/CurrNominal:    instanceVar[#Int#]{{; name=.+$}}
+// FOO_STRUCT_COMMON-DAG: Decl[InstanceMethod]/CurrNominal: instanceFunc0()[#Void#]{{; name=.+$}}
+// FOO_STRUCT_COMMON-DAG: Decl[InstanceMethod]/CurrNominal: builderFunc1()[#FooStruct#]{{; name=.+$}}
+// FOO_STRUCT_COMMON-DAG: Decl[InstanceMethod]/CurrNominal: builderFunc2({#(a): Int#})[#FooStruct#]{{; name=.+$}}
 
 // ERROR_COMMON: found code completion token
-// ERROR_COMMON-NOT: Begin completions
 
-// LOCALS_COMMON: Begin completions
 // LOCALS_COMMON-DAG: Decl[LocalVar]/Local: localInt[#Int#]{{; name=.+$}}
 // LOCALS_COMMON-DAG: Decl[LocalVar]/Local: localFooObject[#FooStruct#]{{; name=.+$}}
-// LOCALS_COMMON: End completions
 
 func testTypecheckVar1() {
   var localFooObject = FooStruct()
@@ -90,10 +87,6 @@ func testTypecheckVar6() {
 }
 
 func testTypecheckVar7() {
-  // FIXME: We don't display any useful completions here, although we could --
-  // it is obvious that the expression could only have type 'FooStruct'.
-  //
-  // In any case, ensure that we don't crash.
   var localInt = 42
   FooStruct(localInt).builderFunc2(unknown_var).#^TC_VAR_7^#
 }

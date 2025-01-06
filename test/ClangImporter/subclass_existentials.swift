@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -typecheck -verify -o - -primary-file %s -swift-version 4 -I %S/Inputs/custom-modules/
+// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -typecheck -verify -o - -primary-file %s -I %S/Inputs/custom-modules/
 
 // REQUIRES: objc_interop
 
@@ -21,8 +21,9 @@ class SwiftLaundryService : NSLaundry {
 
 // FIXME: Consider better diagnostics here.
 
-class OldSwiftLaundryService : NSLaundry {
+class OldSwiftLaundryService : NSLaundry { 
 // expected-error@-1 {{type 'OldSwiftLaundryService' does not conform to protocol 'NSLaundry'}}
+// expected-note@-2 {{add stubs for conformance}}
 
   var g: Coat? = nil
 

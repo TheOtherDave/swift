@@ -6,14 +6,14 @@ import Swift
 
 // Make sure the specializer can deserialize code.
 
-// CHECK-LABEL: sil @main
+// CHECK-LABEL: sil {{.*}}@main
 // CHECK: bb0({{.*}}):
-// CHECK: function_ref @_T0s9ContainerVAByxGycfCBi32__Tg5{{.*}}
-// CHECK: function_ref @_T0s9ContainerV11doSomethingyyFBi32__Tg5{{.*}} 
+// CHECK: function_ref @$ss9ContainerVAByxGycfCBi32__Ttg5{{.*}}
+// CHECK: function_ref @$ss9ContainerV11doSomethingyyFBi32__Tg5{{.*}} 
 
-// CHECK-LABEL: sil shared [noinline] @_T0s9ContainerVAByxGycfCBi32__Tg5Tf4d_n
+// CHECK-LABEL: sil shared [noinline] @$ss9ContainerVAByxGycfCBi32__Ttg5
 
-// CHECK-LABEL: sil shared [noinline] @_T0s9ContainerV11doSomethingyyFBi32__Tg5Tf4d_n
+// CHECK-LABEL: sil shared [noinline] @$ss9ContainerV11doSomethingyyFBi32__Tg5Tf4d_n
 
 var c = Container<Int>()
 c.doSomething()

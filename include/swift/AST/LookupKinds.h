@@ -26,57 +26,47 @@ enum class NLKind {
   QualifiedLookup
 };
 
+void simple_display(llvm::raw_ostream &out, NLKind kind);
+
 /// Constants used to customize name lookup.
 enum NLOptions : unsigned {
   /// Consider declarations within protocols to which the context type conforms.
-  NL_ProtocolMembers = 0x02,
+  NL_ProtocolMembers = 1 << 0,
 
   /// Remove non-visible declarations from the set of results.
-  NL_RemoveNonVisible = 0x04,
+  NL_RemoveNonVisible = 1 << 1,
 
   /// Remove overridden declarations from the set of results.
-  NL_RemoveOverridden = 0x08,
-
-  /// For existentials involving the special \c AnyObject protocol,
-  /// allow lookups to find members of all classes.
-  NL_DynamicLookup = 0x10,
+  NL_RemoveOverridden = 1 << 2,
 
   /// Don't check access when doing lookup into a type.
   ///
-  /// This option is not valid when performing lookup into a module.
-  NL_IgnoreAccessControl = 0x20,
-
-  /// This lookup is known to be a non-cascading dependency, i.e. one that does
-  /// not affect downstream files.
-  ///
-  /// \see NL_KnownDependencyMask
-  NL_KnownNonCascadingDependency = 0x40,
-
-  /// This lookup is known to be a cascading dependency, i.e. one that can
-  /// affect downstream files.
-  ///
-  /// \see NL_KnownDependencyMask
-  NL_KnownCascadingDependency = 0x80,
+  /// When performing lookup into a module, this option only applies to
+  /// declarations in the same module the lookup is coming from.
+  NL_IgnoreAccessControl = 1 << 3,
 
   /// This lookup should only return type declarations.
-  NL_OnlyTypes = 0x100,
+  NL_OnlyTypes = 1 << 4,
 
-  /// This lookup is known to not add any additional dependencies to the
-  /// primary source file.
-  ///
-  /// \see NL_KnownDependencyMask
-  NL_KnownNoDependency =
-      NL_KnownNonCascadingDependency|NL_KnownCascadingDependency,
+  /// Include synonyms declared with @_implements()
+  NL_IncludeAttributeImplements = 1 << 5,
 
-  /// A mask of all options controlling how a lookup should be recorded as a
-  /// dependency.
-  ///
-  /// This offers three possible options: NL_KnownNonCascadingDependency,
-  /// NL_KnownCascadingDependency, NL_KnownNoDependency, as well as a default
-  /// "unspecified" value (0). If the dependency kind is unspecified, the
-  /// lookup function will attempt to infer whether it is a cascading or
-  /// non-cascading dependency from the decl context.
-  NL_KnownDependencyMask = NL_KnownNoDependency,
+  // Include @usableFromInline and @inlinable
+  NL_IncludeUsableFromInline = 1 << 6,
+
+  /// Exclude names introduced by macro expansions in the top-level module.
+  NL_ExcludeMacroExpansions = 1 << 7,
+
+  /// This lookup should only return macro declarations.
+  NL_OnlyMacros = 1 << 8,
+
+  /// Include members that would otherwise be filtered out because they come
+  /// from a module that has not been imported.
+  NL_IgnoreMissingImports = 1 << 9,
+
+  /// If @abi attributes are present, return the decls representing the ABI,
+  /// not the API.
+  NL_ABIProviding = 1 << 10,
 
   /// The default set of options used for qualified name lookup.
   ///
@@ -103,6 +93,18 @@ static inline NLOptions &operator&=(NLOptions &lhs, NLOptions rhs) {
 static inline NLOptions operator~(NLOptions value) {
   return NLOptions(~(unsigned)value);
 }
+
+void simple_display(llvm::raw_ostream &out, NLOptions options);
+
+
+/// Flags affecting module-level lookup.
+enum class ModuleLookupFlags : unsigned {
+  /// Exclude names introduced by macro expansions in the top-level module.
+  ExcludeMacroExpansions = 1 << 0,
+  /// If @abi attributes are present, return the decls representing the ABI,
+  /// not the API.
+  ABIProviding = 1 << 1,
+};
 
 } // end namespace swift
 

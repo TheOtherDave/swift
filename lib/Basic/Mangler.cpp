@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Mangler.h"
 #include "swift/Demangling/Demangler.h"
 #include "swift/Demangling/Punycode.h"
@@ -59,7 +60,7 @@ static llvm::StringMap<OpStatEntry> OpStats;
 void Mangler::recordOpStatImpl(StringRef op, size_t OldPos) {
   if (PrintSwiftManglingStats) {
     OpStatEntry &E = OpStats[op];
-    E.num++;
+    ++E.num;
     E.size += Storage.size() - OldPos;
   }
 }
@@ -90,8 +91,8 @@ void Mangle::printManglingStats() {
   }
   
   llvm::outs() << "Mangling operator stats:\n";
-  
-  typedef llvm::StringMapEntry<OpStatEntry> MapEntry;
+
+  using MapEntry = llvm::StringMapEntry<OpStatEntry>;
   std::vector<const MapEntry *> SortedOpStats;
   for (const MapEntry &ME : OpStats) {
     SortedOpStats.push_back(&ME);
@@ -114,13 +115,22 @@ void Mangler::beginManglingWithoutPrefix() {
   Storage.clear();
   Substitutions.clear();
   StringSubstitutions.clear();
+  NextSubstitutionIndex = 0;
   Words.clear();
   SubstMerging.clear();
 }
 
 void Mangler::beginMangling() {
   beginManglingWithoutPrefix();
-  Buffer << MANGLING_PREFIX_STR;
+
+  switch (Flavor) {
+  case ManglingFlavor::Default:
+    Buffer << MANGLING_PREFIX_STR;
+    break;
+  case ManglingFlavor::Embedded:
+    Buffer << MANGLING_PREFIX_EMBEDDED_STR;
+    break;
+  }
 }
 
 /// Finish the mangling of the symbol and return the mangled name.
@@ -130,8 +140,16 @@ std::string Mangler::finalize() {
   Storage.clear();
 
 #ifndef NDEBUG
-  if (StringRef(result).startswith(MANGLING_PREFIX_STR))
-    verify(result);
+  switch (Flavor) {
+  case ManglingFlavor::Default:
+    if (StringRef(result).starts_with(MANGLING_PREFIX_STR))
+      verify(result, Flavor);
+    break;
+  case ManglingFlavor::Embedded:
+    if (StringRef(result).starts_with(MANGLING_PREFIX_EMBEDDED_STR))
+      verify(result, Flavor);
+    break;
+  }
 #endif
 
   return result;
@@ -144,7 +162,7 @@ void Mangler::finalize(llvm::raw_ostream &stream) {
   stream.write(result.data(), result.size());
 }
 
-
+LLVM_ATTRIBUTE_UNUSED
 static bool treeContains(Demangle::NodePointer Nd, Demangle::Node::Kind Kind) {
   if (Nd->getKind() == Kind)
     return true;
@@ -156,16 +174,25 @@ static bool treeContains(Demangle::NodePointer Nd, Demangle::Node::Kind Kind) {
   return false;
 }
 
-void Mangler::verify(StringRef nameStr) {
-#ifndef NDEBUG
+void Mangler::verify(StringRef nameStr, ManglingFlavor Flavor) {
   SmallString<128> buffer;
-  if (!nameStr.startswith(MANGLING_PREFIX_STR) &&
-      !nameStr.startswith("_Tt") &&
-      !nameStr.startswith("_S")) {
+  if (!nameStr.starts_with(MANGLING_PREFIX_STR) &&
+      !nameStr.starts_with(MANGLING_PREFIX_EMBEDDED_STR) &&
+      !nameStr.starts_with("_Tt") &&
+      !nameStr.starts_with("_S")) {
     // This list is the set of prefixes recognized by Demangler::demangleSymbol.
     // It should be kept in sync.
     assert(StringRef(MANGLING_PREFIX_STR) != "_S" && "redundant check");
-    buffer += MANGLING_PREFIX_STR;
+
+    switch (Flavor) {
+    case ManglingFlavor::Default:
+      buffer += MANGLING_PREFIX_STR;
+      break;
+    case ManglingFlavor::Embedded:
+      buffer += MANGLING_PREFIX_EMBEDDED_STR;
+      break;
+    }
+
     buffer += nameStr;
     nameStr = buffer.str();
   }
@@ -176,54 +203,19 @@ void Mangler::verify(StringRef nameStr) {
     llvm::errs() << "Can't demangle: " << nameStr << '\n';
     abort();
   }
-  std::string Remangled = mangleNode(Root);
+  auto mangling = mangleNode(Root, Flavor);
+  if (!mangling.isSuccess()) {
+    llvm::errs() << "Can't remangle: " << nameStr << '\n';
+    abort();
+  }
+  std::string Remangled = mangling.result();
   if (Remangled == nameStr)
-    return;
-
-  // There are cases (e.g. with dependent associated types) which results in
-  // different remangled names. See ASTMangler::appendAssociatedTypeName.
-  // This is no problem for the compiler, but we have to be more tolerant for
-  // those cases. Instead we try to re-de-mangle the remangled name.
-  NodePointer RootOfRemangled = Dem.demangleSymbol(Remangled);
-  std::string ReDemangled = mangleNode(RootOfRemangled);
-  if (Remangled == ReDemangled)
     return;
 
   llvm::errs() << "Remangling failed:\n"
                   "original     = " << nameStr << "\n"
-                  "remangled    = " << Remangled << "\n"
-                  "re-demangled = " << ReDemangled << '\n';
+                  "remangled    = " << Remangled << "\n";
   abort();
-#endif
-}
-
-void Mangler::verifyOld(StringRef nameStr) {
-#ifndef NDEBUG
-  Demangler Dem;
-  NodePointer Root = demangleOldSymbolAsNode(nameStr, Dem);
-  if (!Root || treeContains(Root, Node::Kind::Suffix)) {
-    llvm::errs() << "Can't demangle: " << nameStr << '\n';
-    abort();
-  }
-  std::string Remangled = mangleNodeOld(Root);
-  if (Remangled == nameStr)
-    return;
-
-  // There are cases (e.g. with dependent associated types) which results in
-  // different remangled names. See ASTMangler::appendAssociatedTypeName.
-  // This is no problem for the compiler, but we have to be more tolerant for
-  // those cases. Instead we try to re-de-mangle the remangled name.
-  NodePointer RootOfRemangled = Dem.demangleSymbol(Remangled);
-  std::string ReDemangled = mangleNode(RootOfRemangled);
-  if (Remangled == ReDemangled)
-    return;
-
-  llvm::errs() << "Remangling failed:\n"
-  "original     = " << nameStr << "\n"
-  "remangled    = " << Remangled << "\n"
-  "re-demangled = " << ReDemangled << '\n';
-  abort();
-#endif
 }
 
 void Mangler::appendIdentifier(StringRef ident) {
@@ -239,8 +231,10 @@ void Mangler::appendIdentifier(StringRef ident) {
   recordOpStat("<identifier>", OldPos);
 }
 
-void Mangler::dump() {
-  llvm::errs() << Buffer.str() << '\n';
+void Mangler::dump() const {
+  // FIXME: const_casting because llvm::raw_svector_ostream::str() is
+  // incorrectly not marked const.
+  llvm::errs() << const_cast<Mangler*>(this)->Buffer.str() << '\n';
 }
 
 bool Mangler::tryMangleSubstitution(const void *ptr) {
@@ -255,18 +249,19 @@ bool Mangler::tryMangleSubstitution(const void *ptr) {
 void Mangler::mangleSubstitution(unsigned Idx) {
   if (Idx >= 26) {
 #ifndef NDEBUG
-    numLargeSubsts++;
+    ++numLargeSubsts;
 #endif
     return appendOperator("A", Index(Idx - 26));
   }
 
-  char Subst = Idx + 'A';
+  char SubstChar = Idx + 'A';
+  StringRef Subst(&SubstChar, 1);
   if (SubstMerging.tryMergeSubst(*this, Subst, /*isStandardSubst*/ false)) {
 #ifndef NDEBUG
-    mergedSubsts++;
+    ++mergedSubsts;
 #endif
   } else {
-    appendOperator("A", StringRef(&Subst, 1));
+    appendOperator("A", Subst);
   }
 }
 

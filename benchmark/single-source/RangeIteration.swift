@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2021 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -12,7 +12,8 @@
 
 import TestsUtils
 
-public let RangeIteration = [
+#if swift(>=4.2)
+public let benchmarks = [
   BenchmarkInfo(
     name: "RangeIterationSigned",
     runFunction: run_RangeIterationSigned,
@@ -29,8 +30,15 @@ public let RangeIteration = [
     tags: [.validation, .api]
   ),
 ]
-
-public var check: UInt64 = 0
+#else
+public let benchmarks = [
+  BenchmarkInfo(
+    name: "RangeIterationSigned",
+    runFunction: run_RangeIterationSigned,
+    tags: [.validation, .api]
+  )
+]
+#endif
 
 @inline(never)
 func sum(_ x: UInt64, _ y: UInt64) -> UInt64 {
@@ -38,40 +46,44 @@ func sum(_ x: UInt64, _ y: UInt64) -> UInt64 {
 }
 
 @inline(never)
-public func run_RangeIterationSigned(_ N: Int) {
+public func run_RangeIterationSigned(_ n: Int) {
   let range = 0..<100000
-  check = 0
-  for _ in 1...N {
+  var checksum: UInt64 = 0
+  for _ in 1...n {
+    for e in range {
+      checksum = sum(checksum, UInt64(e))
+    }
+  }
+
+  check(checksum == 4999950000 * UInt64(n))
+}
+
+#if swift(>=4.2)
+
+@inline(never)
+public func run_RangeIterationSigned64(_ n: Int) {
+  let range: Range<Int64> = 0..<100000
+  var check: UInt64 = 0
+  for _ in 1...n {
     for e in range {
       check = sum(check, UInt64(e))
     }
   }
 
-  CheckResults(check == 4999950000 * UInt64(N))
+  check(check == 4999950000 * UInt64(n))
 }
 
 @inline(never)
-public func run_RangeIterationSigned64(_ N: Int) {
-  let range: CountableRange<Int64> = 0..<100000
-  check = 0
-  for _ in 1...N {
+public func run_RangeIterationUnsigned(_ n: Int) {
+  let range: Range<UInt> = 0..<100000
+  var check: UInt64 = 0
+  for _ in 1...n {
     for e in range {
       check = sum(check, UInt64(e))
     }
   }
 
-  CheckResults(check == 4999950000 * UInt64(N))
+  check(check == 4999950000 * UInt64(n))
 }
 
-@inline(never)
-public func run_RangeIterationUnsigned(_ N: Int) {
-  let range: CountableRange<UInt> = 0..<100000
-  check = 0
-  for _ in 1...N {
-    for e in range {
-      check = sum(check, UInt64(e))
-    }
-  }
-
-  CheckResults(check == 4999950000 * UInt64(N))
-}
+#endif

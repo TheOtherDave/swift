@@ -1,6 +1,6 @@
 // RUN: %target-typecheck-verify-swift
 
-protocol MyFormattedPrintable {
+protocol MyFormattedPrintable { // expected-note 3 {{declared here}}
   func myFormat() -> String
 }
 
@@ -72,7 +72,7 @@ func getFirst<R : IteratorProtocol>(_ r: R) -> R.Element {
   return r.next()!
 }
 
-func testGetFirst(ir: CountableRange<Int>) {
+func testGetFirst(ir: Range<Int>) {
   _ = getFirst(ir.makeIterator()) as Int
 }
 
@@ -189,7 +189,7 @@ var yarray : YArray = [1, 2, 3]
 var xarray : XArray = [1, 2, 3]
 
 // Type parameters can be referenced only via unqualified name lookup
-struct XParam<T> {
+struct XParam<T> { // expected-note{{'XParam' declared here}}
   func foo(_ x: T) {
     _ = x as T
   }
@@ -199,7 +199,7 @@ struct XParam<T> {
   }
 }
 
-var xp : XParam<Int>.T = Int() // expected-error{{'T' is not a member type of 'XParam<Int>'}}
+var xp : XParam<Int>.T = Int() // expected-error{{'T' is not a member type of generic struct 'generic_types.XParam<Swift.Int>'}}
 
 // Diagnose failure to meet a superclass requirement.
 class X1 { }
@@ -228,17 +228,40 @@ var y: X5<X4, Int> // expected-error{{'X5' requires the types 'X4.AssocP' (aka '
 // Recursive generic signature validation.
 class Top {}
 class Bottom<T : Bottom<Top>> {}
-// expected-error@-1 {{generic class 'Bottom' references itself}}
-// expected-note@-2 {{type declared here}}
+// expected-error@-1 {{'Bottom' requires that 'Top' inherit from 'Bottom<Top>'}}
+// expected-note@-2 {{requirement specified as 'T' : 'Bottom<Top>' [with T = Top]}}
+// expected-error@-3 *{{generic class 'Bottom' has self-referential generic requirements}}
 
 // Invalid inheritance clause
 
 struct UnsolvableInheritance1<T : T.A> {}
-// expected-error@-1 {{inheritance from non-protocol, non-class type 'T.A'}}
+// expected-error@-1 {{'A' is not a member type of type 'T'}}
+// expected-error@-2 {{type 'T' constrained to non-protocol, non-class type 'T.A'}}
 
 struct UnsolvableInheritance2<T : U.A, U : T.A> {}
-// expected-error@-1 {{inheritance from non-protocol, non-class type 'U.A'}}
-// expected-error@-2 {{inheritance from non-protocol, non-class type 'T.A'}}
+// expected-error@-1 {{'A' is not a member type of type 'U'}}
+// expected-error@-2 {{'A' is not a member type of type 'T'}}
+// expected-error@-3 {{type 'T' constrained to non-protocol, non-class type 'U.A'}}
+// expected-error@-4 {{type 'U' constrained to non-protocol, non-class type 'T.A'}}
 
-enum X7<T> where X7.X : G { case X } // expected-error{{enum element 'X' is not a member type of 'X7<T>'}}
-// expected-error@-1{{use of undeclared type 'G'}}
+enum X7<T> where X7.X : G { case X } // expected-error{{enum case 'X' is not a member type of 'X7<T>'}}
+// expected-error@-1{{cannot find type 'G' in scope}}
+
+// Test that contextual type resolution for generic metatypes is consistent
+// under a same-type constraint.
+protocol MetatypeTypeResolutionProto {}
+struct X8<T> {
+  static var property1: T.Type { T.self }
+  static func method1() -> T.Type { T.self }
+}
+extension X8 where T == MetatypeTypeResolutionProto {
+  static var property2: T.Type { property1 } // ok, still .Protocol
+  static func method2() -> T.Type { method1() } // ok, still .Protocol
+}
+
+func bogusProtocolConstraint1(_ : any MyFormattedPrintable<String>) {}
+// expected-error@-1 {{protocol 'MyFormattedPrintable' does not have primary associated types that can be constrained}}{{59-67=}}
+func bogusProtocolConstraint2(_ : some MyFormattedPrintable<String>) {}
+// expected-error@-1 {{protocol 'MyFormattedPrintable' does not have primary associated types that can be constrained}}{{60-68=}}
+func bogusProtocolConstraint3(_ : MyFormattedPrintable<String>) {}
+// expected-error@-1 {{protocol 'MyFormattedPrintable' does not have primary associated types that can be constrained}}{{55-63=}}

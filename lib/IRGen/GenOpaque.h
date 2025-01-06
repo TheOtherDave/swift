@@ -28,8 +28,8 @@ namespace irgen {
   class Address;
   class IRGenFunction;
   class IRGenModule;
+  class TypeInfo;
   enum class ValueWitness : unsigned;
-  class StackAddress;
   class WitnessIndex;
 
   /// Return the size of a fixed buffer.
@@ -38,14 +38,35 @@ namespace irgen {
   /// Return the alignment of a fixed buffer.
   Alignment getFixedBufferAlignment(IRGenModule &IGM);
 
+  /// Given a witness table (protocol or value), return the address of the slot
+  /// for one of the witnesses.
+  /// If \p areEntriesRelative is true we are emitting code for a relative
+  /// protocol witness table.
+  Address slotForLoadOfOpaqueWitness(IRGenFunction &IGF, llvm::Value *table,
+                                     WitnessIndex index,
+                                     bool areEntriesRelative = false);
+
   /// Given a witness table (protocol or value), load one of the
   /// witnesses.
   ///
   /// The load is marked invariant. This should not be used in contexts where
   /// the referenced witness table is still undergoing initialization.
   llvm::Value *emitInvariantLoadOfOpaqueWitness(IRGenFunction &IGF,
+                                                bool isProtocolWitness,
                                                 llvm::Value *table,
-                                                WitnessIndex index);
+                                                WitnessIndex index,
+                                                llvm::Value **slot = nullptr);
+
+  /// Given a witness table (protocol or value), load one of the
+  /// witnesses.
+  ///
+  /// The load is marked invariant. This should not be used in contexts where
+  /// the referenced witness table is still undergoing initialization.
+  llvm::Value *emitInvariantLoadOfOpaqueWitness(IRGenFunction &IGF,
+                                                bool isProtocolWitness,
+                                                llvm::Value *table,
+                                                llvm::Value *index,
+                                                llvm::Value **slot = nullptr);
 
   /// Emit a call to do an 'initializeBufferWithCopyOfBuffer' operation.
   llvm::Value *emitInitializeBufferWithCopyOfBufferCall(IRGenFunction &IGF,
@@ -55,18 +76,6 @@ namespace irgen {
 
   /// Emit a call to do an 'initializeBufferWithCopyOfBuffer' operation.
   llvm::Value *emitInitializeBufferWithCopyOfBufferCall(IRGenFunction &IGF,
-                                                        SILType T,
-                                                        Address destBuffer,
-                                                        Address srcBuffer);
-
-  /// Emit a call to do an 'initializeBufferWithTakeOfBuffer' operation.
-  llvm::Value *emitInitializeBufferWithTakeOfBufferCall(IRGenFunction &IGF,
-                                                        llvm::Value *metadata,
-                                                        Address destBuffer,
-                                                        Address srcBuffer);
-
-  /// Emit a call to do an 'initializeBufferWithTakeOfBuffer' operation.
-  llvm::Value *emitInitializeBufferWithTakeOfBufferCall(IRGenFunction &IGF,
                                                         SILType T,
                                                         Address destBuffer,
                                                         Address srcBuffer);
@@ -168,29 +177,16 @@ namespace irgen {
                             Address object,
                             llvm::Value *count);
 
-  /// Emit a call to the 'getExtraInhabitantIndex' operation.
-  /// The type must be dynamically known to have extra inhabitant witnesses.
-  llvm::Value *emitGetExtraInhabitantIndexCall(IRGenFunction &IGF,
-                                               SILType T,
-                                               Address srcObject);
-  
-  /// Emit a call to the 'storeExtraInhabitant' operation.
-  /// The type must be dynamically known to have extra inhabitant witnesses.
-  llvm::Value *emitStoreExtraInhabitantCall(IRGenFunction &IGF,
-                                            SILType T,
-                                            llvm::Value *index,
-                                            Address destObject);
-
   /// Emit a call to the 'getEnumTagSinglePayload' operation.
   llvm::Value *emitGetEnumTagSinglePayloadCall(IRGenFunction &IGF, SILType T,
                                                llvm::Value *numEmptyCases,
                                                Address destObject);
 
   /// Emit a call to the 'storeEnumTagSinglePayload' operation.
-  llvm::Value *emitStoreEnumTagSinglePayloadCall(IRGenFunction &IGF, SILType T,
-                                                 llvm::Value *whichCase,
-                                                 llvm::Value *numEmptyCases,
-                                                 Address destObject);
+  void emitStoreEnumTagSinglePayloadCall(IRGenFunction &IGF, SILType T,
+                                         llvm::Value *whichCase,
+                                         llvm::Value *numEmptyCases,
+                                         Address destObject);
 
   /// Emit a call to the 'getEnumTag' operation.
   llvm::Value *emitGetEnumTagCall(IRGenFunction &IGF,
@@ -207,7 +203,7 @@ namespace irgen {
   /// The type must be dynamically known to have enum witnesses.
   void emitDestructiveInjectEnumTagCall(IRGenFunction &IGF,
                                         SILType T,
-                                        unsigned tag,
+                                        llvm::Value *tag,
                                         Address srcObject);
 
   /// Emit a load of the 'size' value witness.
@@ -219,8 +215,8 @@ namespace irgen {
   /// Emit a load of the 'alignmentMask' value witness.
   llvm::Value *emitLoadOfAlignmentMask(IRGenFunction &IGF, SILType T);
 
-  /// Emit a load of the 'isPOD' value witness.
-  llvm::Value *emitLoadOfIsPOD(IRGenFunction &IGF, SILType T);
+  /// Emit a load of the 'isTriviallyDestroyable' value witness.
+  llvm::Value *emitLoadOfIsTriviallyDestroyable(IRGenFunction &IGF, SILType T);
 
   /// Emit a load of the 'isBitwiseTakable' value witness.
   llvm::Value *emitLoadOfIsBitwiseTakable(IRGenFunction &IGF, SILType T);
@@ -228,27 +224,12 @@ namespace irgen {
   /// Emit a load of the 'isInline' value witness.
   llvm::Value *emitLoadOfIsInline(IRGenFunction &IGF, SILType T);
 
-  /// Emit a load of the 'hasExtraInhabitants' value witness.
-  llvm::Value *emitLoadOfHasExtraInhabitants(IRGenFunction &IGF, SILType T);
-  
   /// Emit a load of the 'extraInhabitantCount' value witness.
-  /// The type must be dynamically known to have extra inhabitant witnesses.
   llvm::Value *emitLoadOfExtraInhabitantCount(IRGenFunction &IGF, SILType T);
 
-  /// Emit a dynamic alloca call to allocate enough memory to hold an object of
-  /// type 'T' and an optional llvm.stackrestore point if 'isInEntryBlock' is
-  /// false.
-  struct DynamicAlloca {
-    llvm::Value *Alloca;
-    llvm::Value *SavedSP;
-    DynamicAlloca(llvm::Value *A, llvm::Value *SP) : Alloca(A), SavedSP(SP) {}
-  };
-  DynamicAlloca emitDynamicAlloca(IRGenFunction &IGF, SILType T,
-                                  bool isInEntryBlock);
-
-  /// Deallocate dynamic alloca's memory if the stack address has an SP restore
-  /// point associated with it.
-  void emitDeallocateDynamicAlloca(IRGenFunction &IGF, StackAddress address);
+  /// Emit a stored to the 'extraInhabitantCount' value witness.
+  void emitStoreOfExtraInhabitantCount(IRGenFunction &IGF, llvm::Value *val,
+                                       llvm::Value *metadata);
 
   /// Returns the IsInline flag and the loaded flags value.
   std::pair<llvm::Value *, llvm::Value *>
@@ -267,9 +248,45 @@ namespace irgen {
   Address emitProjectValueInBuffer(IRGenFunction &IGF,
                               SILType type,
                               Address buffer);
-  void emitDeallocateValueInBuffer(IRGenFunction &IGF,
-                                   SILType type,
-                                   Address buffer);
+
+  using GetExtraInhabitantTagEmitter =
+    llvm::function_ref<llvm::Value*(IRGenFunction &IGF,
+                                    Address addr,
+                                    llvm::Value *xiCount)>;
+
+  llvm::Constant *
+  getOrCreateGetExtraInhabitantTagFunction(IRGenModule &IGM,
+                                           SILType objectType,
+                                           const TypeInfo &objectTI,
+                                           GetExtraInhabitantTagEmitter emit);
+
+  llvm::Value *
+  emitGetEnumTagSinglePayloadGenericCall(IRGenFunction &IGF,
+                                         SILType payloadType,
+                                         const TypeInfo &payloadTI,
+                                         llvm::Value *numExtraCases,
+                                         Address address,
+                                         GetExtraInhabitantTagEmitter emit);
+
+  using StoreExtraInhabitantTagEmitter =
+    llvm::function_ref<void(IRGenFunction &IGF,
+                            Address addr,
+                            llvm::Value *tag,
+                            llvm::Value *xiCount)>;
+
+  llvm::Constant *
+  getOrCreateStoreExtraInhabitantTagFunction(IRGenModule &IGM,
+                                             SILType objectType,
+                                             const TypeInfo &objectTI,
+                                        StoreExtraInhabitantTagEmitter emit);
+
+  void emitStoreEnumTagSinglePayloadGenericCall(IRGenFunction &IGF,
+                                                SILType payloadType,
+                                                const TypeInfo &payloadTI,
+                                                llvm::Value *index,
+                                                llvm::Value *numExtraCases,
+                                                Address address,
+                                           StoreExtraInhabitantTagEmitter emit);
 } // end namespace irgen
 } // end namespace swift
 

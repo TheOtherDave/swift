@@ -13,17 +13,13 @@ Centralized command line and file system interface for the build script.
 """
 # ----------------------------------------------------------------------------
 
-from __future__ import print_function
-
 import os
-import pipes
+import platform
+import shlex
 import shutil
 import subprocess
 import sys
 from contextlib import contextmanager
-from multiprocessing import Lock, Pool, cpu_count
-
-from . import diagnostics
 
 
 DEVNULL = getattr(subprocess, 'DEVNULL', subprocess.PIPE)
@@ -31,8 +27,15 @@ DEVNULL = getattr(subprocess, 'DEVNULL', subprocess.PIPE)
 dry_run = False
 
 
+def _fatal_error(message):
+    """Raises a SystemExit error with the given message.
+    """
+
+    raise SystemExit('ERROR: {}\n'.format(message))
+
+
 def _quote(arg):
-    return pipes.quote(str(arg))
+    return shlex.quote(str(arg))
 
 
 def quote_command(args):
@@ -84,13 +87,28 @@ def call(command, stderr=None, env=None, dry_run=None, echo=True):
     try:
         subprocess.check_call(command, env=_env, stderr=stderr)
     except subprocess.CalledProcessError as e:
-        diagnostics.fatal(
-            "command terminated with a non-zero exit status " +
-            str(e.returncode) + ", aborting")
+        _fatal_error(
+            f"command `{command}` terminated with a non-zero exit status "
+            f"{str(e.returncode)}, aborting")
     except OSError as e:
-        diagnostics.fatal(
+        _fatal_error(
             "could not execute '" + quote_command(command) +
             "': " + e.strerror)
+
+
+def call_without_sleeping(command, env=None, dry_run=False, echo=False):
+    """
+    Execute a command during which system sleep is disabled.
+
+    By default, this ignores the state of the `shell.dry_run` flag.
+    """
+
+    # Disable system sleep, if possible.
+    if platform.system() == 'Darwin':
+        # Don't mutate the caller's copy of the arguments.
+        command = ["caffeinate"] + list(command)
+
+    call(command, env=env, dry_run=dry_run, echo=echo)
 
 
 def capture(command, stderr=None, env=None, dry_run=None, echo=True,
@@ -112,21 +130,20 @@ def capture(command, stderr=None, env=None, dry_run=None, echo=True,
         _env = dict(os.environ)
         _env.update(env)
     try:
-        out = subprocess.check_output(command, env=_env, stderr=stderr)
-        # Coerce to `str` hack. not py3 `byte`, not py2 `unicode`.
-        return str(out.decode())
+        return subprocess.check_output(command, env=_env, stderr=stderr,
+                                       universal_newlines=True)
     except subprocess.CalledProcessError as e:
         if allow_non_zero_exit:
             return e.output
         if optional:
             return None
-        diagnostics.fatal(
-            "command terminated with a non-zero exit status " +
-            str(e.returncode) + ", aborting")
+        _fatal_error(
+            f"command `{command}` terminated with a non-zero exit status "
+            f"{str(e.returncode)}, aborting")
     except OSError as e:
         if optional:
             return None
-        diagnostics.fatal(
+        _fatal_error(
             "could not execute '" + quote_command(command) +
             "': " + e.strerror)
 
@@ -166,13 +183,32 @@ def rmtree(path, dry_run=None, echo=True):
         shutil.rmtree(path)
 
 
-def copytree(src, dest, dry_run=None, echo=True):
+def copytree(src, dest, dry_run=None, ignore_pattern=None, echo=True):
     dry_run = _coerce_dry_run(dry_run)
     if dry_run or echo:
         _echo_command(dry_run, ['cp', '-r', src, dest])
     if dry_run:
         return
-    shutil.copytree(src, dest)
+    ignore = shutil.ignore_patterns(ignore_pattern) if ignore_pattern else None
+    shutil.copytree(src, dest, ignore=ignore)
+
+
+def symlink(source, dest, dry_run=None, echo=True):
+    dry_run = _coerce_dry_run(dry_run)
+    if dry_run or echo:
+        _echo_command(dry_run, ['ln', '-s', source, dest])
+    if dry_run:
+        return
+    os.symlink(source, dest)
+
+
+def remove(path, dry_run=None, echo=True):
+    dry_run = _coerce_dry_run(dry_run)
+    if dry_run or echo:
+        _echo_command(dry_run, ['rm', path])
+    if dry_run:
+        return
+    os.remove(path)
 
 
 # Initialized later
@@ -183,26 +219,32 @@ def run(*args, **kwargs):
     repo_path = os.getcwd()
     echo_output = kwargs.pop('echo', False)
     dry_run = kwargs.pop('dry_run', False)
-    env = kwargs.pop('env', None)
+    env = kwargs.get('env', None)
+    prefix = kwargs.pop('prefix', '')
     if dry_run:
-        _echo_command(dry_run, *args, env=env)
-        return(None, 0, args)
+        _echo_command(dry_run, *args, env=env, prompt="{0}+ ".format(prefix))
+        return (None, 0, args)
 
     my_pipe = subprocess.Popen(
-        *args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
-    (stdout, stderr) = my_pipe.communicate()
+        *args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        encoding='utf-8',
+        **kwargs)
+    (output, _) = my_pipe.communicate()
+    output = output.encode(encoding='ascii', errors='replace')
     ret = my_pipe.wait()
 
     if lock:
         lock.acquire()
     if echo_output:
-        print(repo_path)
-        _echo_command(dry_run, *args, env=env)
-        if stdout:
-            print(stdout, end="")
-        if stderr:
-            print(stderr, end="")
-        print()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        _echo_command(dry_run, *args, env=env, prompt="{0}+ ".format(prefix))
+        if output:
+            for line in output.splitlines():
+                print("{0}{1}".format(prefix, line.decode('utf-8', errors='replace')))
+        sys.stdout.flush()
+        sys.stderr.flush()
     if lock:
         lock.release()
 
@@ -211,40 +253,6 @@ def run(*args, **kwargs):
         eout.ret = ret
         eout.args = args
         eout.repo_path = repo_path
-        eout.stderr = stderr
+        eout.stderr = output
         raise eout
-    return (stdout, 0, args)
-
-
-def init(l):
-    global lock
-    lock = l
-
-
-def run_parallel(fn, pool_args, n_processes=0):
-    if n_processes == 0:
-        n_processes = cpu_count() * 2
-
-    l = Lock()
-    print("Running ``%s`` with up to %d processes." %
-          (fn.__name__, n_processes))
-    pool = Pool(processes=n_processes, initializer=init, initargs=(l,))
-    results = pool.map_async(func=fn, iterable=pool_args).get(999999)
-    pool.close()
-    pool.join()
-    return results
-
-
-def check_parallel_results(results, op):
-    fail_count = 0
-    if results is None:
-        return 0
-    for r in results:
-        if r is not None:
-            if fail_count == 0:
-                print("======%s FAILURES======" % op)
-            print("%s failed (ret=%d): %s" % (r.repo_path, r.ret, r))
-            fail_count += 1
-            if r.stderr:
-                print(r.stderr)
-    return fail_count
+    return (output, 0, args)

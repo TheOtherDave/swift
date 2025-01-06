@@ -29,8 +29,8 @@ struct BA_DefaultStruct {
 private struct BB_PrivateStruct {
   // CHECK: internal var x
   var x = 0
-  // CHECK: internal init(x: Int)
   // CHECK: internal init()
+  // CHECK: internal init(x: Int = 0)
 } // CHECK: {{^[}]}}
 
 // CHECK-LABEL: internal{{(\*/)?}} struct BC_InternalStruct {
@@ -44,24 +44,24 @@ internal struct BC_InternalStruct {
 public struct BD_PublicStruct {
   // CHECK: internal var x
   var x = 0
-  // CHECK: internal init(x: Int)
   // CHECK: internal init()
+  // CHECK: internal init(x: Int = 0)
 } // CHECK: {{^[}]}}
 
 // CHECK-LABEL: public{{(\*/)?}} struct BE_PublicStructPrivateMembers {
 public struct BE_PublicStructPrivateMembers {
   // CHECK: private{{(\*/)?}} var x
   private var x = 0
-  // CHECK: private init(x: Int)
   // CHECK: internal init()
+  // CHECK: private init(x: Int = 0)
 } // CHECK: {{^[}]}}
 
 // CHECK-LABEL: {{^}}fileprivate{{(\*/)?}} struct BF_FilePrivateStruct {
 fileprivate struct BF_FilePrivateStruct {
   // CHECK: {{^}} internal var x
   var x = 0
-  // CHECK: {{^}} internal init(x: Int)
   // CHECK: {{^}} internal init()
+  // CHECK: {{^}} internal init(x: Int = 0)
 } // CHECK: {{^[}]}}
 
 
@@ -122,9 +122,9 @@ public enum DC_PublicEnum {
 private protocol EA_PrivateProtocol {
   // CHECK: {{^}} associatedtype Foo
   associatedtype Foo
-  // CHECK: fileprivate var Bar
+  // CHECK: {{^}} var Bar
   var Bar: Int { get }
-  // CHECK: fileprivate func baz()
+  // CHECK: {{^}} func baz()
   func baz()
 } // CHECK: {{^[}]}}
 
@@ -132,9 +132,9 @@ private protocol EA_PrivateProtocol {
 public protocol EB_PublicProtocol {
   // CHECK: {{^}} associatedtype Foo
   associatedtype Foo
-  // CHECK: public var Bar
+  // CHECK: {{^}} var Bar
   var Bar: Int { get }
-  // CHECK: public func baz()
+  // CHECK: {{^}} func baz()
   func baz()
 } // CHECK: {{^[}]}}
 
@@ -211,14 +211,14 @@ public extension FE_PublicClass {
 
 // CHECK-LABEL: internal func GA_localTypes()
 func GA_localTypes() {
-  // CHECK-SRC: private struct Local {
+  // CHECK-SRC: struct Local {
   struct Local {
     // CHECK-SRC: internal let x
     let x = 0
   }
   _ = Local()
 
-  // CHECK-SRC: private enum LocalEnum {
+  // CHECK-SRC: enum LocalEnum {
   enum LocalEnum {
     // CHECK-SRC: {{^}} case A
     case A, B
@@ -337,16 +337,16 @@ fileprivate protocol IB_FilePrivateAssocTypeProto {
 public class IC_PublicAssocTypeImpl: IA_PublicAssocTypeProto, IB_FilePrivateAssocTypeProto {
   public var publicValue: Int = 0
   public var filePrivateValue: Int = 0
-  // CHECK-DAG: {{^}} public typealias PublicValue
   // CHECK-DAG: {{^}} public typealias FilePrivateValue
+  // CHECK-DAG: {{^}} public typealias PublicValue
 } // CHECK: {{^[}]}}
 
 // CHECK-LABEL: private{{(\*/)?}} class ID_PrivateAssocTypeImpl : IA_PublicAssocTypeProto, IB_FilePrivateAssocTypeProto {
 private class ID_PrivateAssocTypeImpl: IA_PublicAssocTypeProto, IB_FilePrivateAssocTypeProto {
   public var publicValue: Int = 0
   public var filePrivateValue: Int = 0
-  // CHECK-DAG: {{^}} internal typealias PublicValue
-  // CHECK-DAG: {{^}} internal typealias FilePrivateValue
+  // CHECK-DAG: {{^}} fileprivate typealias FilePrivateValue
+  // CHECK-DAG: {{^}} fileprivate typealias PublicValue
 } // CHECK: {{^[}]}}
 
 // CHECK-LABEL: class MultipleAttributes {
@@ -365,12 +365,12 @@ public class PublicInitBase {
 
 // CHECK-LABEL: public{{(\*/)?}} class PublicInitInheritor : PublicInitBase {
 public class PublicInitInheritor : PublicInitBase {
-  // CHECK: {{^}} public init()
-  // CHECK: {{^}} fileprivate init(other: PublicInitBase)
+  // CHECK: {{^}} override public init()
+  // CHECK: {{^}} override fileprivate init(other: PublicInitBase)
 } // CHECK: {{^[}]}}
 
 // CHECK-LABEL: {{(/\*)?private(\*/)?}} class PublicInitPrivateInheritor : PublicInitBase {
 private class PublicInitPrivateInheritor : PublicInitBase {
-  // CHECK: {{^}} internal init()
-  // CHECK: {{^}} fileprivate init(other: PublicInitBase)
+  // CHECK: {{^}} override internal init()
+  // CHECK: {{^}} override fileprivate init(other: PublicInitBase)
 } // CHECK: {{^[}]}}

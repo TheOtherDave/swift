@@ -2,6 +2,7 @@
 // REQUIRES: executable_test
 
 // REQUIRES: objc_interop
+// REQUIRES: rdar80079617
 
 // Test dynamic casts that bridge value types through the runtime.
 
@@ -232,9 +233,16 @@ class Canary: NSObject {
 }
 var CanaryAssocObjectHandle = 0
 
+class ImmortalCanary: NSObject {
+  deinit {
+    print("oh noes")
+  }
+}
+var ImmortalCanaryAssocObjectHandle = 0
+
 func testValueToObjectBridgingInSwitch() {
   autoreleasepool {
-    let string = "hello"
+    let string = "hello, this is a string that won't be tagged"
     let nsString = string as NSString
     objc_setAssociatedObject(nsString, &CanaryAssocObjectHandle, Canary(),
       .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
@@ -246,8 +254,22 @@ func testValueToObjectBridgingInSwitch() {
       print("Not a string")
     }
   }
+
+#if _pointerBitWidth(_64)
+  // Small strings should be immortal on new enough 64-bit Apple platforms.
+  if #available(macOS 10.10, *) {
+    autoreleasepool {
+      let string = "hello"
+      let nsString = string as NSString
+      objc_setAssociatedObject(
+        nsString, &ImmortalCanaryAssocObjectHandle, ImmortalCanary(),
+        .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+    }
+  }
+#endif // 64-bit
   print("Done")
 }
 // CHECK: died
+// CHECK-NOT: oh noes
 // CHECK: Done
 testValueToObjectBridgingInSwitch()

@@ -1,6 +1,8 @@
 // RUN: %empty-directory(%t)
 // RUN: %target-build-swift %s -o %t/main
 // RUN: %target-build-swift %s -o %t/main-optimized
+// RUN: %target-codesign %t/main
+// RUN: %target-codesign %t/main-optimized
 // RUN: %target-run %t/main | %FileCheck %s
 // RUN: %target-run %t/main-optimized | %FileCheck %s
 // REQUIRES: executable_test
@@ -21,8 +23,8 @@ struct A : Preening, Hashable, Equatable {
     return lhs.value == rhs.value
   }
 
-  var hashValue: Int {
-    return value.hashValue
+  func hash(into hasher: inout Hasher) {
+    hasher.combine(value)
   }
 }
 
@@ -67,6 +69,12 @@ a_array_2.forEach { $0.preen() }
 
 let a_array_3 = any_array_1 as? [Preening]
 a_array_3?.forEach { $0.preen() }
+// CHECK-NEXT: A5
+// CHECK-NEXT: A10
+// CHECK-NEXT: A20
+
+let a_array_4 = preening_array_1 as! [A]
+a_array_4.forEach { $0.preen() }
 // CHECK-NEXT: A5
 // CHECK-NEXT: A10
 // CHECK-NEXT: A20

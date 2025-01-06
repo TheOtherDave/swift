@@ -1,6 +1,7 @@
-// RUN: %target-swift-frontend -assume-parsing-unqualified-ownership-sil -primary-file %s -emit-ir | %FileCheck %s
+// RUN: %target-swift-frontend -primary-file %s -emit-ir -target %target-swift-5.1-abi-triple | %FileCheck %s
 
-// REQUIRES: CPU=x86_64
+// REQUIRES: swift_in_compiler
+// REQUIRES: PTRSIZE=64
 
 var g0 : Int = 1
 var g1 : (Void, Int, Void)
@@ -39,20 +40,30 @@ extension A {
 
 // CHECK-NOT: TY8
 
-// CHECK: @_T07globals2g0Sivp = hidden global [[INT]] zeroinitializer, align 8
-// CHECK: @_T07globals2g1yt_Siyttvp = hidden global <{ [[INT]] }> zeroinitializer, align 8
-// CHECK: @_T07globals2g2yt_S2itvp = hidden global <{ [[INT]], [[INT]] }> zeroinitializer, align 8
-// CHECK: @_T07globals2g3Sbvp = hidden global [[BOOL]] zeroinitializer, align 1
-// CHECK: @_T07globals2g6Sdvp = hidden global [[DOUBLE]] zeroinitializer, align 8
-// CHECK: @_T07globals2g7Sfvp = hidden global [[FLOAT]] zeroinitializer, align 4
-// CHECK: @_T07globals1AV3fooSivpZ = hidden global [[INT]] zeroinitializer, align 8
+// CHECK: @"$s7globals2g0Sivp" = hidden global [[INT]] zeroinitializer, align 8
+// CHECK: @"$s7globals2g1yt_Siyttvp" = hidden global <{ [[INT]] }> zeroinitializer, align 8
+// CHECK: @"$s7globals2g2yt_S2itvp" = hidden global <{ [[INT]], [[INT]] }> zeroinitializer, align 8
+// CHECK: @"$s7globals2g3Sbvp" = hidden global [[BOOL]] zeroinitializer, align 1
+// CHECK: @"$s7globals2g6Sdvp" = hidden global [[DOUBLE]] zeroinitializer, align 8
+// CHECK: @"$s7globals2g7Sfvp" = hidden global [[FLOAT]] zeroinitializer, align 4
+// CHECK: @"$s7globals1AV3fooSivpZ" = hidden global [[INT]] <{ i64 5 }>, align 8
 
 // CHECK-NOT: g8
 // CHECK-NOT: g9
 
-// CHECK: define{{( protected)?}} i32 @main(i32, i8**) {{.*}} {
-// CHECK:      store  i64 {{.*}}, i64* getelementptr inbounds ([[INT]], [[INT]]* @_T07globals2g0Sivp, i32 0, i32 0), align 8
+// CHECK: define{{( dllexport)?}}{{( protected)?}} i32 @main(i32 %0, ptr %1) {{.*}} {
+// CHECK:      store  i64 {{.*}}, ptr @"$s7globals2g0Sivp", align 8
 
-// FIXME: give these initializers a real mangled name
-// CHECK: define internal swiftcc void @globalinit_{{.*}}func0() {{.*}} {
-// CHECK:      store i64 5, i64* getelementptr inbounds (%TSi, %TSi* @_T07globals1AV3fooSivpZ, i32 0, i32 0), align 8
+// CHECK:  [[BUF_PROJ:%.*]] = call {{.*}} @__swift_project_value_buffer({{.*}}s7globals1gQrvp
+// CHECK:  call void @llvm.memcpy{{.*}}({{.*}}[[BUF_PROJ]]
+
+
+public protocol Some {}
+
+public struct Implementer : Some {
+  var w = (0, 1, 2, 3, 4)
+
+  public init() { }
+}
+
+let g : some Some = Implementer()

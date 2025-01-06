@@ -16,12 +16,17 @@
 ///
 //===----------------------------------------------------------------------===//
 
+#include "swift/AST/ASTContext.h"
 #include "swift/AST/Comment.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/FileUnit.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/Types.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/RawComment.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Markup/Markup.h"
+#include <queue>
 
 using namespace swift;
 
@@ -30,31 +35,32 @@ void *DocComment::operator new(size_t Bytes, swift::markup::MarkupContext &MC,
   return MC.allocate(Bytes, Alignment);
 }
 
-Optional<swift::markup::ParamField *> extractParamOutlineItem(
-    swift::markup::MarkupContext &MC,
-    swift::markup::MarkupASTNode *Node) {
+namespace {
+std::optional<swift::markup::ParamField *>
+extractParamOutlineItem(swift::markup::MarkupContext &MC,
+                        swift::markup::MarkupASTNode *Node) {
 
   auto Item = dyn_cast<swift::markup::Item>(Node);
   if (!Item)
-    return None;
+    return std::nullopt;
 
   auto Children = Item->getChildren();
   if (Children.empty())
-    return None;
+    return std::nullopt;
 
   auto FirstChild = Children.front();
   auto FirstParagraph = dyn_cast<swift::markup::Paragraph>(FirstChild);
   if (!FirstParagraph)
-    return None;
+    return std::nullopt;
 
   auto FirstParagraphChildren = FirstParagraph->getChildren();
   if (FirstParagraphChildren.empty())
-    return None;
+    return std::nullopt;
 
   auto ParagraphText =
       dyn_cast<swift::markup::Text>(FirstParagraphChildren.front());
   if (!ParagraphText)
-    return None;
+    return std::nullopt;
 
   StringRef Name;
   StringRef Remainder;
@@ -62,7 +68,7 @@ Optional<swift::markup::ParamField *> extractParamOutlineItem(
   Name = Name.rtrim();
 
   if (Name.empty())
-    return None;
+    return std::nullopt;
 
   ParagraphText->setLiteralContent(Remainder.ltrim());
 
@@ -111,7 +117,7 @@ bool extractParameterOutline(
     }
 
     auto HeadingContent = HeadingText->getLiteralContent();
-    if (!HeadingContent.rtrim().equals_lower("parameters:")) {
+    if (!HeadingContent.rtrim().equals_insensitive("parameters:")) {
       NormalItems.push_back(Child);
       continue;
     }
@@ -130,8 +136,8 @@ bool extractParameterOutline(
 
       for (auto SubListChild : SubList->getChildren()) {
         auto Param = extractParamOutlineItem(MC, SubListChild);
-        if (Param.hasValue()) {
-          ParamFields.push_back(Param.getValue());
+        if (Param.has_value()) {
+          ParamFields.push_back(Param.value());
         }
       }
     }
@@ -141,7 +147,7 @@ bool extractParameterOutline(
     L->setChildren(NormalItems);
   }
 
-  return NormalItems.size() == 0;
+  return NormalItems.empty();
 }
 
 bool extractSeparatedParams(
@@ -187,7 +193,7 @@ bool extractSeparatedParams(
     auto ParagraphContent = ParagraphText->getLiteralContent();
     auto PotentialMatch = ParagraphContent.substr(0, ParameterPrefix.size());
 
-    if (!PotentialMatch.startswith_lower(ParameterPrefix)) {
+    if (!PotentialMatch.starts_with_insensitive(ParameterPrefix)) {
       NormalItems.push_back(Child);
       continue;
     }
@@ -196,8 +202,8 @@ bool extractSeparatedParams(
     ParagraphText->setLiteralContent(ParagraphContent.ltrim());
 
     auto ParamField = extractParamOutlineItem(MC, I);
-    if (ParamField.hasValue())
-      ParamFields.push_back(ParamField.getValue());
+    if (ParamField.has_value())
+      ParamFields.push_back(ParamField.value());
     else
       NormalItems.push_back(Child);
   }
@@ -205,7 +211,7 @@ bool extractSeparatedParams(
   if (NormalItems.size() != Children.size())
     L->setChildren(NormalItems);
 
-  return NormalItems.size() == 0;
+  return NormalItems.empty();
 }
 
 bool extractSimpleField(
@@ -280,7 +286,22 @@ bool extractSimpleField(
   if (NormalItems.size() != Children.size())
     L->setChildren(NormalItems);
 
-  return NormalItems.size() == 0;
+  return NormalItems.empty();
+}
+} // namespace
+
+void swift::printBriefComment(RawComment RC, llvm::raw_ostream &OS) {
+  markup::MarkupContext MC;
+  markup::LineList LL = MC.getLineList(RC);
+  auto *markupDoc = markup::parseDocument(MC, LL);
+
+  auto children = markupDoc->getChildren();
+  if (children.empty())
+    return;
+  auto FirstParagraph = dyn_cast<swift::markup::Paragraph>(children.front());
+  if (!FirstParagraph)
+    return;
+  swift::markup::printInlinesUnder(FirstParagraph, OS);
 }
 
 swift::markup::CommentParts
@@ -323,8 +344,8 @@ swift::extractCommentParts(swift::markup::MarkupContext &MC,
   }
 
   // Copy BodyNodes and ParamFields into the MarkupContext.
-  Parts.BodyNodes = MC.allocateCopy(llvm::makeArrayRef(BodyNodes));
-  Parts.ParamFields = MC.allocateCopy(llvm::makeArrayRef(ParamFields));
+  Parts.BodyNodes = MC.allocateCopy(llvm::ArrayRef(BodyNodes));
+  Parts.ParamFields = MC.allocateCopy(llvm::ArrayRef(ParamFields));
 
   for (auto Param : Parts.ParamFields) {
     auto ParamParts = extractCommentParts(MC, Param);
@@ -334,126 +355,53 @@ swift::extractCommentParts(swift::markup::MarkupContext &MC,
   return Parts;
 }
 
-Optional<DocComment *>
-swift::getSingleDocComment(swift::markup::MarkupContext &MC, const Decl *D) {
-  PrettyStackTraceDecl StackTrace("parsing comment for", D);
-
-  auto RC = D->getRawComment();
-  if (RC.isEmpty())
-    return None;
-
+DocComment *DocComment::create(const Decl *D, markup::MarkupContext &MC,
+                               RawComment RC) {
+  assert(!RC.isEmpty());
   swift::markup::LineList LL = MC.getLineList(RC);
   auto *Doc = swift::markup::parseDocument(MC, LL);
   auto Parts = extractCommentParts(MC, Doc);
   return new (MC) DocComment(D, Doc, Parts);
 }
 
-static Optional<DocComment *>
-getAnyBaseClassDocComment(swift::markup::MarkupContext &MC,
-                          const ClassDecl *CD,
-                          const Decl *D) {
-  RawComment RC;
+void DocComment::addInheritanceNote(swift::markup::MarkupContext &MC,
+                                    TypeDecl *base) {
+  auto text = MC.allocateCopy("This documentation comment was inherited from ");
+  auto name = MC.allocateCopy(base->getNameStr());
+  auto period = MC.allocateCopy(".");
+  auto paragraph = markup::Paragraph::create(MC, {
+    markup::Text::create(MC, text),
+    markup::Code::create(MC, name),
+    markup::Text::create(MC, period)});
 
-  if (const auto *VD = dyn_cast<ValueDecl>(D)) {
-    const auto *BaseDecl = VD->getOverriddenDecl();
-    while (BaseDecl) {
-      RC = BaseDecl->getRawComment();
-      if (!RC.isEmpty()) {
-        swift::markup::LineList LL = MC.getLineList(RC);
-        auto *Doc = swift::markup::parseDocument(MC, LL);
-        auto Parts = extractCommentParts(MC, Doc);
+  auto note = markup::NoteField::create(MC, {paragraph});
 
-        SmallString<48> RawCascadeText;
-        llvm::raw_svector_ostream OS(RawCascadeText);
-        OS << "This documentation comment was inherited from ";
-
-
-        auto *Text = swift::markup::Text::create(MC, MC.allocateCopy(OS.str()));
-
-        auto BaseClass =
-          BaseDecl->getDeclContext()->getAsClassOrClassExtensionContext();
-
-        auto *BaseClassMonospace =
-          swift::markup::Code::create(MC,
-                                      MC.allocateCopy(BaseClass->getNameStr()));
-
-        auto *Period = swift::markup::Text::create(MC, ".");
-
-        auto *Para = swift::markup::Paragraph::create(MC, {
-          Text, BaseClassMonospace, Period
-        });
-        auto CascadeNote = swift::markup::NoteField::create(MC, {Para});
-
-        SmallVector<const swift::markup::MarkupASTNode *, 8> BodyNodes {
-          Parts.BodyNodes.begin(),
-          Parts.BodyNodes.end()
-        };
-        BodyNodes.push_back(CascadeNote);
-        Parts.BodyNodes = MC.allocateCopy(llvm::makeArrayRef(BodyNodes));
-
-        return new (MC) DocComment(D, Doc, Parts);
-      }
-
-      BaseDecl = BaseDecl->getOverriddenDecl();
-    }
-  }
-  
-  return None;
+  SmallVector<const markup::MarkupASTNode *, 8> BodyNodes{
+    Parts.BodyNodes.begin(), Parts.BodyNodes.end()};
+  BodyNodes.push_back(note);
+  Parts.BodyNodes = MC.allocateCopy(llvm::ArrayRef(BodyNodes));
 }
 
-static Optional<DocComment *>
-getProtocolRequirementDocComment(swift::markup::MarkupContext &MC,
-                                 const ProtocolDecl *ProtoExt,
-                                 const Decl *D) {
+DocComment *swift::getSingleDocComment(swift::markup::MarkupContext &MC,
+                                       const Decl *D) {
+  PrettyStackTraceDecl StackTrace("parsing comment for", D);
 
-  auto getSingleRequirementWithNonemptyDoc = [](const ProtocolDecl *P,
-                                                const ValueDecl *VD)
-    -> const ValueDecl * {
-      SmallVector<ValueDecl *, 2> Members;
-      P->lookupQualified(P->getDeclaredType(), VD->getFullName(),
-                         NLOptions::NL_ProtocolMembers,
-                         /*typeResolver=*/nullptr, Members);
-    SmallVector<const ValueDecl *, 1> ProtocolRequirements;
-    for (auto Member : Members)
-      if (isa<ProtocolDecl>(Member->getDeclContext()) &&
-          Member->isProtocolRequirement())
-        ProtocolRequirements.push_back(Member);
-
-    if (ProtocolRequirements.size() == 1) {
-      auto Requirement = ProtocolRequirements.front();
-      if (!Requirement->getRawComment().isEmpty())
-        return Requirement;
-    }
-
+  auto RC = D->getRawComment();
+  if (RC.isEmpty())
     return nullptr;
-  };
-
-  if (const auto *VD = dyn_cast<ValueDecl>(D)) {
-    SmallVector<const ValueDecl *, 4> RequirementsWithDocs;
-    if (auto Requirement = getSingleRequirementWithNonemptyDoc(ProtoExt, VD))
-      RequirementsWithDocs.push_back(Requirement);
-
-    if (RequirementsWithDocs.size() == 1)
-      return getSingleDocComment(MC, RequirementsWithDocs.front());
-  }
-  return None;
+  return DocComment::create(D, MC, RC);
 }
 
-Optional<DocComment *>
-swift::getCascadingDocComment(swift::markup::MarkupContext &MC, const Decl *D) {
-  auto Doc = getSingleDocComment(MC, D);
-  if (Doc.hasValue())
-    return Doc;
+const Decl *Decl::getDocCommentProvidingDecl() const {
+  return evaluateOrDefault(getASTContext().evaluator,
+                           DocCommentProvidingDeclRequest{this}, nullptr);
+}
 
-  // If this refers to a class member, check to see if any
-  // base classes have a doc comment and cascade it to here.
-  if (const auto *CD = D->getDeclContext()->getAsClassOrClassExtensionContext())
-    if (auto BaseClassDoc = getAnyBaseClassDocComment(MC, CD, D))
-      return BaseClassDoc;
+StringRef Decl::getSemanticBriefComment() const {
+  if (!canHaveComment())
+    return StringRef();
 
-  if (const auto *PE = D->getDeclContext()->getAsProtocolExtensionContext())
-    if (auto ReqDoc = getProtocolRequirementDocComment(MC, PE, D))
-      return ReqDoc;
-
-  return None;
+  auto &eval = getASTContext().evaluator;
+  return evaluateOrDefault(eval, SemanticBriefCommentRequest{this},
+                           StringRef());
 }

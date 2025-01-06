@@ -14,16 +14,21 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/ABI/MetadataValues.h"
-#include "swift/Demangling/Demangle.h"
 #include "swift/Basic/LLVMInitialize.h"
-#include "swift/Reflection/TypeRef.h"
-#include "swift/Reflection/TypeRefBuilder.h"
+#include "swift/Demangling/Demangle.h"
+#include "swift/RemoteInspection/ReflectionContext.h"
+#include "swift/RemoteInspection/TypeRef.h"
+#include "swift/RemoteInspection/TypeRefBuilder.h"
+#include "swift/StaticMirror/ObjectFileContext.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Object/Archive.h"
-#include "llvm/Object/MachO.h"
-#include "llvm/Object/MachOUniversal.h"
+#include "llvm/Object/COFF.h"
 #include "llvm/Object/ELF.h"
 #include "llvm/Object/ELFObjectFile.h"
+#include "llvm/Object/MachOUniversal.h"
+#include "llvm/Object/RelocationResolver.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Error.h"
 
 #if defined(_WIN32)
 #include <io.h>
@@ -31,181 +36,149 @@
 #include <unistd.h>
 #endif
 
-#include <algorithm>
-#include <iostream>
-#include <csignal>
+#if defined(__APPLE__) && defined(__MACH__)
+#include <TargetConditionals.h>
+#endif
 
+#include <algorithm>
+#include <csignal>
+#include <iostream>
+
+using llvm::ArrayRef;
 using llvm::dyn_cast;
 using llvm::StringRef;
-using llvm::ArrayRef;
 using namespace llvm::object;
 
 using namespace swift;
 using namespace swift::reflection;
+using namespace swift::static_mirror;
 using namespace swift::remote;
 using namespace Demangle;
 
-enum class ActionType {
-  DumpReflectionSections,
-  DumpTypeLowering
-};
+enum class ActionType { DumpReflectionSections, DumpTypeLowering };
 
 namespace options {
-static llvm::cl::opt<ActionType>
-Action(llvm::cl::desc("Mode:"),
-       llvm::cl::values(
-         clEnumValN(ActionType::DumpReflectionSections,
-                    "dump-reflection-sections",
-                    "Dump the field reflection section"),
-         clEnumValN(ActionType::DumpTypeLowering,
-                    "dump-type-lowering",
-                    "Dump the field layout for typeref strings read from stdin")),
-       llvm::cl::init(ActionType::DumpReflectionSections));
+static llvm::cl::opt<ActionType> Action(
+    llvm::cl::desc("Mode:"),
+    llvm::cl::values(
+        clEnumValN(ActionType::DumpReflectionSections,
+                   "dump-reflection-sections",
+                   "Dump the field reflection section"),
+        clEnumValN(
+            ActionType::DumpTypeLowering, "dump-type-lowering",
+            "Dump the field layout for typeref strings read from stdin")),
+    llvm::cl::init(ActionType::DumpReflectionSections));
 
 static llvm::cl::list<std::string>
-BinaryFilename("binary-filename", llvm::cl::desc("Filenames of the binary files"),
-               llvm::cl::OneOrMore);
+BinaryFilename(llvm::cl::Positional,
+                   llvm::cl::desc("Filenames of the binary files"),
+                   llvm::cl::OneOrMore);
 
 static llvm::cl::opt<std::string>
-Architecture("arch", llvm::cl::desc("Architecture to inspect in the binary"),
-             llvm::cl::Required);
+    Architecture("arch",
+                 llvm::cl::desc("Architecture to inspect in the binary"),
+                 llvm::cl::Required);
+
+#if SWIFT_OBJC_INTEROP
+static llvm::cl::opt<bool> DisableObjCInterop(
+    "no-objc-interop",
+    llvm::cl::desc("Disable Objective-C interoperability support"));
+#endif
 } // end namespace options
 
-template<typename T>
-static T unwrap(llvm::Expected<T> value) {
-  if (value)
-    return std::move(value.get());
-  std::cerr << "swift-reflection-test error: " << toString(value.takeError()) << "\n";
-  exit(EXIT_FAILURE);
-}
-
-static SectionRef getSectionRef(const ObjectFile *objectFile,
-                                ArrayRef<StringRef> anySectionNames) {
-  for (auto section : objectFile->sections()) {
-    StringRef sectionName;
-    section.getName(sectionName);
-    for (auto desiredName : anySectionNames) {
-      if (sectionName.equals(desiredName)) {
-        return section;
-      }
-    }
-  }
-  return SectionRef();
-}
-
-template <typename Section>
-static std::pair<Section, uintptr_t>
-findReflectionSection(const ObjectFile *objectFile,
-                      ArrayRef<StringRef> anySectionNames) {
-  auto sectionRef = getSectionRef(objectFile, anySectionNames);
-
-  if (sectionRef.getObject() == nullptr)
-    return {{nullptr, nullptr}, 0};
-
-  StringRef sectionContents;
-  sectionRef.getContents(sectionContents);
-
-  uintptr_t Offset = 0;
-  if (isa<ELFObjectFileBase>(sectionRef.getObject())) {
-    ELFSectionRef S{sectionRef};
-    Offset = sectionRef.getAddress() - S.getOffset();
-  }
-
-  return {{reinterpret_cast<const void *>(sectionContents.begin()),
-           reinterpret_cast<const void *>(sectionContents.end())},
-          Offset};
-}
-
-static ReflectionInfo findReflectionInfo(const ObjectFile *objectFile) {
-  auto fieldSection = findReflectionSection<FieldSection>(
-      objectFile, {"__swift3_fieldmd", ".swift3_fieldmd", "swift3_fieldmd"});
-  auto associatedTypeSection = findReflectionSection<AssociatedTypeSection>(
-      objectFile, {"__swift3_assocty", ".swift3_assocty", "swift3_assocty"});
-  auto builtinTypeSection = findReflectionSection<BuiltinTypeSection>(
-      objectFile, {"__swift3_builtin", ".swift3_builtin", "swift3_builtin"});
-  auto captureSection = findReflectionSection<CaptureSection>(
-      objectFile, {"__swift3_capture", ".swift3_capture", "swift3_capture"});
-  auto typeRefSection = findReflectionSection<GenericSection>(
-      objectFile, {"__swift3_typeref", ".swift3_typeref", "swift3_typeref"});
-  auto reflectionStringsSection = findReflectionSection<GenericSection>(
-      objectFile, {"__swift3_reflstr", ".swift3_reflstr", "swift3_reflstr"});
-
-  return {
-      {fieldSection.first, fieldSection.second},
-      {associatedTypeSection.first, associatedTypeSection.second},
-      {builtinTypeSection.first, builtinTypeSection.second},
-      {captureSection.first, captureSection.second},
-      {typeRefSection.first, typeRefSection.second},
-      {reflectionStringsSection.first, reflectionStringsSection.second},
-      /*LocalStartAddress*/ 0,
-      /*RemoteStartAddress*/ 0,
-  };
-}
-
-static int doDumpReflectionSections(ArrayRef<std::string> binaryFilenames,
-                                    StringRef arch,
-                                    ActionType action,
-                                    std::ostream &OS) {
+static int doDumpReflectionSections(ArrayRef<std::string> BinaryFilenames,
+                                    StringRef Arch, ActionType Action,
+                                    std::ostream &stream) {
   // Note: binaryOrError and objectOrError own the memory for our ObjectFile;
   // once they go out of scope, we can no longer do anything.
-  std::vector<OwningBinary<Binary>> binaryOwners;
-  std::vector<std::unique_ptr<ObjectFile>> objectOwners;
+  std::vector<OwningBinary<Binary>> BinaryOwners;
+  std::vector<std::unique_ptr<ObjectFile>> ObjectOwners;
+  std::vector<const ObjectFile *> ObjectFiles;
 
-  // Construct the TypeRefBuilder
-  TypeRefBuilder builder;
-
-  for (auto binaryFilename : binaryFilenames) {
-    auto binaryOwner = unwrap(createBinary(binaryFilename));
-    Binary *binaryFile = binaryOwner.getBinary();
+  for (const std::string &BinaryFilename : BinaryFilenames) {
+    auto BinaryOwner = unwrap(createBinary(BinaryFilename));
+    Binary *BinaryFile = BinaryOwner.getBinary();
 
     // The object file we are doing lookups in -- either the binary itself, or
     // a particular slice of a universal binary.
-    std::unique_ptr<ObjectFile> objectOwner;
-    const ObjectFile *objectFile;
-
-    if (auto o = dyn_cast<ObjectFile>(binaryFile)) {
-      objectFile = o;
-    } else {
-      auto universal = cast<MachOUniversalBinary>(binaryFile);
-      objectOwner = unwrap(universal->getObjectForArch(arch));
-      objectFile = objectOwner.get();
+    std::unique_ptr<ObjectFile> ObjectOwner;
+    const ObjectFile *O = dyn_cast<ObjectFile>(BinaryFile);
+    if (!O) {
+      auto Universal = cast<MachOUniversalBinary>(BinaryFile);
+      ObjectOwner = unwrap(Universal->getMachOObjectForArch(Arch));
+      O = ObjectOwner.get();
     }
 
-    builder.addReflectionInfo(findReflectionInfo(objectFile));
-
     // Retain the objects that own section memory
-    binaryOwners.push_back(std::move(binaryOwner));
-    objectOwners.push_back(std::move(objectOwner));
+    BinaryOwners.push_back(std::move(BinaryOwner));
+    ObjectOwners.push_back(std::move(ObjectOwner));
+    ObjectFiles.push_back(O);
   }
 
-  switch (action) {
+#if SWIFT_OBJC_INTEROP
+  bool ObjCInterop = !options::DisableObjCInterop;
+#else
+  bool ObjCInterop = false;
+#endif
+  auto context = makeReflectionContextForObjectFiles(ObjectFiles, ObjCInterop);
+  auto &builder = context->Builder;
+
+  switch (Action) {
   case ActionType::DumpReflectionSections:
     // Dump everything
-    builder.dumpAllSections(OS);
+    switch (context->PointerSize) {
+    case 4:
+#if SWIFT_OBJC_INTEROP
+      if (!options::DisableObjCInterop)
+        builder.dumpAllSections<WithObjCInterop, 4>(stream);
+      else
+        builder.dumpAllSections<NoObjCInterop, 4>(stream);
+#else
+      builder.dumpAllSections<NoObjCInterop, 4>(stream);
+#endif
+      break;
+    case 8:
+#if SWIFT_OBJC_INTEROP
+      if (!options::DisableObjCInterop)
+        builder.dumpAllSections<WithObjCInterop, 8>(stream);
+      else
+        builder.dumpAllSections<NoObjCInterop, 8>(stream);
+#else
+      builder.dumpAllSections<NoObjCInterop, 8>(stream);
+#endif
+      break;
+    default:
+      fputs("unsupported word size in object file\n", stderr);
+      abort();
+    }
     break;
   case ActionType::DumpTypeLowering: {
-    for (std::string line; std::getline(std::cin, line); ) {
-      if (line.empty())
+    for (std::string Line; std::getline(std::cin, Line);) {
+      if (Line.empty())
         continue;
 
-      if (StringRef(line).startswith("//"))
+      if (StringRef(Line).starts_with("//"))
         continue;
 
       Demangle::Demangler Dem;
-      auto demangled = Dem.demangleType(line);
-      auto *typeRef = swift::remote::decodeMangledType(builder, demangled);
-      if (typeRef == nullptr) {
-        OS << "Invalid typeref: " << line << "\n";
+      auto Demangled = Dem.demangleType(Line);
+      auto Result = swift::Demangle::decodeMangledType(builder, Demangled);
+      if (Result.isError()) {
+        auto *error = Result.getError();
+        char *str = error->copyErrorString();
+        stream << "Invalid typeref:" << Line << " - " << str << "\n";
+        error->freeErrorString(str);
         continue;
       }
+      auto TypeRef = Result.getType();
 
-      typeRef->dump(OS);
-      auto *typeInfo = builder.getTypeConverter().getTypeInfo(typeRef);
-      if (typeInfo == nullptr) {
-        OS << "Invalid lowering\n";
+      TypeRef->dump(stream);
+      auto *TypeInfo = builder.getTypeConverter().getTypeInfo(TypeRef, nullptr);
+      if (TypeInfo == nullptr) {
+        stream << "Invalid lowering\n";
         continue;
       }
-      typeInfo->dump(OS);
+      TypeInfo->dump(stream);
     }
     break;
   }
@@ -215,10 +188,9 @@ static int doDumpReflectionSections(ArrayRef<std::string> binaryFilenames,
 }
 
 int main(int argc, char *argv[]) {
+  PROGRAM_START(argc, argv);
   llvm::cl::ParseCommandLineOptions(argc, argv, "Swift Reflection Dump\n");
   return doDumpReflectionSections(options::BinaryFilename,
-                                  options::Architecture,
-                                  options::Action,
+                                  options::Architecture, options::Action,
                                   std::cout);
 }
-

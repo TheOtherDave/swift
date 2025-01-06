@@ -8,8 +8,7 @@ import ImportAsMember.A
 import AppKit
 
 func testOldTypeNames() {
-  var ps: NSPostingStyle? // expected-error{{'NSPostingStyle' has been renamed to 'NotificationQueue.PostingStyle'}}{{11-25=NotificationQueue.PostingStyle}}
-
+  let _: NSPostingStyle? // expected-error{{'NSPostingStyle' has been renamed to 'NotificationQueue.PostingStyle'}}{{10-24=NotificationQueue.PostingStyle}}
 
   _ = NSPostingStyle(rawValue: 1) // expected-error{{'NSPostingStyle' has been renamed to 'NotificationQueue.PostingStyle'}}{{7-21=NotificationQueue.PostingStyle}}
 
@@ -102,6 +101,7 @@ func useLowercasedEnumCase(x: NSRuncingMode) {
   switch x { // expected-error {{switch must be exhaustive}}
     // expected-note@-1 {{add missing case: '.mince'}}
     // expected-note@-2 {{add missing case: '.quince'}}
+    // expected-note@-3 {{add missing cases}}
     case .Mince: return // expected-error {{'Mince' has been renamed to 'mince'}} {{11-16=mince}}
     case .Quince: return // expected-error {{'Quince' has been renamed to 'quince'}} {{11-17=quince}}
   }

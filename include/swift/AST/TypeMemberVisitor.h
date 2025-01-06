@@ -37,21 +37,43 @@ public:
   }
   BAD_MEMBER(Extension)
   BAD_MEMBER(Import)
-  BAD_MEMBER(Protocol)
   BAD_MEMBER(TopLevelCode)
   BAD_MEMBER(Operator)
   BAD_MEMBER(PrecedenceGroup)
+  BAD_MEMBER(Macro)
 
-  // The children of these are automatically inserted into the
-  // surrounding context.
-  RetTy visitIfConfigDecl(IfConfigDecl *D) {
+  // These decls are disregarded.
+  RetTy visitPoundDiagnosticDecl(PoundDiagnosticDecl *D) {
+    return RetTy();
+  }
+
+  RetTy visitMacroExpansionDecl(MacroExpansionDecl *D) {
+    // Expansion already visited as auxiliary decls.
     return RetTy();
   }
 
   /// A convenience method to visit all the members.
   void visitMembers(NominalTypeDecl *D) {
-    for (Decl *member : D->getMembers()) {
+    for (Decl *member : D->getAllMembers()) {
       asImpl().visit(member);
+    }
+  }
+
+  /// A convenience method to visit all the members in the implementation
+  /// context.
+  ///
+  /// \seealso IterableDeclContext::getImplementationContext()
+  void visitImplementationMembers(NominalTypeDecl *D) {
+    for (Decl *member : D->getImplementationContext()->getAllMembers()) {
+      asImpl().visit(member);
+    }
+    
+    // If this is a main-interface @_objcImplementation extension and the class
+    // has a synthesized destructor, visit it now.
+    if (auto cd = dyn_cast_or_null<ClassDecl>(D)) {
+      auto dd = cd->getDestructor();
+      if (dd->getDeclContext() == cd && cd->getImplementationContext() != cd)
+        asImpl().visit(dd);
     }
   }
 };
@@ -64,6 +86,10 @@ public:
 
   void visitMembers(ClassDecl *D) {
     TypeMemberVisitor<ImplClass, RetTy>::visitMembers(D);
+  }
+
+  void visitImplementationMembers(ClassDecl *D) {
+    TypeMemberVisitor<ImplClass, RetTy>::visitImplementationMembers(D);
   }
 };
 

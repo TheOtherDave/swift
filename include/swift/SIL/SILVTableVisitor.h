@@ -18,10 +18,8 @@
 #ifndef SWIFT_SIL_SILVTABLEVISITOR_H
 #define SWIFT_SIL_SILVTABLEVISITOR_H
 
-#include "swift/AST/Attr.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Types.h"
-#include "swift/SIL/TypeLowering.h"
 
 namespace swift {
 
@@ -35,63 +33,119 @@ namespace swift {
 /// - addMethodOverride(SILDeclRef baseRef, SILDeclRef derivedRef):
 ///   update vtable entry for baseRef to call derivedRef
 ///
+/// - addPlaceholder(MissingMemberDecl *);
+///   introduce an entry for a method that could not be deserialized
+///
 template <class T> class SILVTableVisitor {
-  Lowering::TypeConverter &Types;
-
   T &asDerived() { return *static_cast<T*>(this); }
 
   void maybeAddMethod(FuncDecl *fd) {
     assert(!fd->hasClangNode());
 
     SILDeclRef constant(fd, SILDeclRef::Kind::Func);
-    maybeAddEntry(constant, constant.requiresNewVTableEntry());
+    maybeAddEntry(constant);
+
+    maybeAddAutoDiffDerivativeMethods(constant);
   }
 
   void maybeAddConstructor(ConstructorDecl *cd) {
     assert(!cd->hasClangNode());
 
-    // Required constructors (or overrides thereof) have their allocating entry
-    // point in the vtable.
-    if (cd->isRequired()) {
-      SILDeclRef constant(cd, SILDeclRef::Kind::Allocator);
-      maybeAddEntry(constant, constant.requiresNewVTableEntry());
-    }
+    // The allocating entry point is what is used for dynamic dispatch.
+    // The initializing entry point for designated initializers is only
+    // necessary for super.init chaining, which is sufficiently constrained
+    // to never need dynamic dispatch.
+    SILDeclRef constant(cd, SILDeclRef::Kind::Allocator);
+    maybeAddEntry(constant);
 
-    // All constructors have their initializing constructor in the
-    // vtable, which can be used by a convenience initializer.
-    SILDeclRef constant(cd, SILDeclRef::Kind::Initializer);
-    maybeAddEntry(constant, constant.requiresNewVTableEntry());
+    maybeAddAutoDiffDerivativeMethods(constant);
   }
 
-  void maybeAddEntry(SILDeclRef declRef, bool needsNewEntry) {
+  void maybeAddAccessors(AbstractStorageDecl *asd) {
+    asd->visitOpaqueAccessors([&](AccessorDecl *accessor) {
+      maybeAddMethod(accessor);
+    });
+  }
+
+  void maybeAddEntry(SILDeclRef declRef) {
     // Introduce a new entry if required.
-    if (needsNewEntry)
+    if (declRef.requiresNewVTableEntry())
       asDerived().addMethod(declRef);
 
     // Update any existing entries that it overrides.
     auto nextRef = declRef;
     while ((nextRef = nextRef.getNextOverriddenVTableEntry())) {
-      auto baseRef = Types.getOverriddenVTableEntry(nextRef);
+      auto baseRef = nextRef.getOverriddenVTableEntry();
+
+      // If A.f() is overridden by B.f() which is overridden by
+      // C.f(), it's possible that C.f() is not visible from C.
+      // In this case, we pretend that B.f() is the least derived
+      // method with a vtable entry in the override chain.
+      //
+      // This works because we detect the possibility of this
+      // happening when we emit B.f() and do two things:
+      // - B.f() always gets a new vtable entry, even if it is
+      //   ABI compatible with A.f()
+      // - The vtable thunk for the override of A.f() in B does a
+      //   vtable dispatch to the implementation of B.f() for the
+      //   concrete subclass, so a subclass of B only needs to
+      //   replace the vtable entry for B.f(); a call to A.f()
+      //   will correctly dispatch to the implementation of B.f()
+      //   in the subclass.
+      auto *UseDC = declRef.getDecl()->getDeclContext();
+      if (!baseRef.getDecl()->isAccessibleFrom(
+            UseDC,
+            /*forConformance=*/false,
+            /*allowUsableFromInline=*/true))
+        break;
+
       asDerived().addMethodOverride(baseRef, declRef);
       nextRef = baseRef;
     }
   }
 
-protected:
-  SILVTableVisitor(Lowering::TypeConverter &Types) : Types(Types) {}
+  void maybeAddMember(Decl *member) {
+    if (!member->isAvailableDuringLowering())
+      return;
 
+    if (isa<AccessorDecl>(member))
+      /* handled as part of its storage */;
+    else if (auto *fd = dyn_cast<FuncDecl>(member))
+      maybeAddMethod(fd);
+    else if (auto *cd = dyn_cast<ConstructorDecl>(member))
+      maybeAddConstructor(cd);
+    else if (auto *asd = dyn_cast<AbstractStorageDecl>(member))
+      maybeAddAccessors(asd);
+    else if (auto *placeholder = dyn_cast<MissingMemberDecl>(member))
+      asDerived().addPlaceholder(placeholder);
+  }
+
+  void maybeAddAutoDiffDerivativeMethods(SILDeclRef constant) {
+    auto *D = constant.getDecl();
+    for (auto *diffAttr : D->getAttrs().getAttributes<DifferentiableAttr>()) {
+      maybeAddEntry(constant.asAutoDiffDerivativeFunction(
+          AutoDiffDerivativeFunctionIdentifier::get(
+              AutoDiffDerivativeFunctionKind::JVP,
+              diffAttr->getParameterIndices(),
+              diffAttr->getDerivativeGenericSignature(),
+              D->getASTContext())));
+      maybeAddEntry(constant.asAutoDiffDerivativeFunction(
+          AutoDiffDerivativeFunctionIdentifier::get(
+              AutoDiffDerivativeFunctionKind::VJP,
+              diffAttr->getParameterIndices(),
+              diffAttr->getDerivativeGenericSignature(),
+              D->getASTContext())));
+    }
+  }
+
+protected:
   void addVTableEntries(ClassDecl *theClass) {
     // Imported classes do not have a vtable.
     if (!theClass->hasKnownSwiftImplementation())
       return;
 
-    for (auto member : theClass->getMembers()) {
-      if (auto *fd = dyn_cast<FuncDecl>(member))
-        maybeAddMethod(fd);
-      else if (auto *cd = dyn_cast<ConstructorDecl>(member))
-        maybeAddConstructor(cd);
-      else if (auto *placeholder = dyn_cast<MissingMemberDecl>(member))
-        asDerived().addPlaceholder(placeholder);
+    for (Decl *member : theClass->getABIMembers()) {
+      maybeAddMember(member);
     }
   }
 };

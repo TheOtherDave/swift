@@ -1,13 +1,17 @@
-add_swift_library(swiftImmediate STATIC
+add_swift_host_library(swiftImmediate STATIC
+  SwiftMaterializationUnit.cpp
   Immediate.cpp
-  REPL.cpp
-  DEPENDS swift-syntax-generated-headers
-  LINK_LIBRARIES
-    swiftIDE
-    swiftFrontend
-    swiftSILGen
-    swiftSILOptimizer
-    swiftIRGen
-  LLVM_COMPONENT_DEPENDS
-    linker mcjit)
-
+  LLVM_LINK_COMPONENTS
+    executionengine
+    linker
+    mcjit
+    orcjit
+    orctargetprocess
+    jitlink
+    transformutils)
+target_link_libraries(swiftImmediate PRIVATE
+  swiftFrontend
+  swiftIDE
+  swiftIRGen
+  swiftSILGen
+  swiftSILOptimizer)

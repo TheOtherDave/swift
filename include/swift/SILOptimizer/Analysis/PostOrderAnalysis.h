@@ -19,10 +19,8 @@
 #include "swift/SIL/SILBasicBlock.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SILOptimizer/Analysis/Analysis.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/iterator_range.h"
-#include <vector>
 
 namespace swift {
 
@@ -34,8 +32,9 @@ class SILFunction;
 /// reform the post order over and over again (it can be expensive).
 class PostOrderAnalysis : public FunctionAnalysisBase<PostOrderFunctionInfo> {
 protected:
-  virtual PostOrderFunctionInfo *newFunctionAnalysis(SILFunction *F) override {
-    return new PostOrderFunctionInfo(F);
+  virtual std::unique_ptr<PostOrderFunctionInfo>
+  newFunctionAnalysis(SILFunction *F) override {
+    return std::make_unique<PostOrderFunctionInfo>(F);
   }
 
   virtual bool shouldInvalidate(SILAnalysis::InvalidationKind K) override {
@@ -44,14 +43,15 @@ protected:
 
 public:
   PostOrderAnalysis()
-      : FunctionAnalysisBase<PostOrderFunctionInfo>(AnalysisKind::PostOrder) {}
+      : FunctionAnalysisBase<PostOrderFunctionInfo>(
+            SILAnalysisKind::PostOrder) {}
 
   // This is a cache and shouldn't be copied around.
   PostOrderAnalysis(const PostOrderAnalysis &) = delete;
   PostOrderAnalysis &operator=(const PostOrderAnalysis &) = delete;
 
   static bool classof(const SILAnalysis *S) {
-    return S->getKind() == AnalysisKind::PostOrder;
+    return S->getKind() == SILAnalysisKind::PostOrder;
   }
 };
 

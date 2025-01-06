@@ -1,5 +1,6 @@
 // RUN: %target-run-simple-swift
 // REQUIRES: executable_test
+// REQUIRES: reflection
 
 import StdlibUnittest
 
@@ -33,7 +34,12 @@ PrintTests.test("CustomStringConvertible") {
   hasDescription(CInt(42))
   hasDescription(CLong(42))
   hasDescription(CLongLong(42))
+#if os(Windows)
+  hasDescription(CWideChar(exactly: 42)!)
+#else
   hasDescription(CWideChar(42)!)
+#endif
+  hasDescription(CChar8(42))
   hasDescription(CChar16(42))
   hasDescription(CChar32(42)!)
 }
@@ -50,7 +56,12 @@ PrintTests.test("Printable") {
   expectPrinted("42", CInt(42))
   expectPrinted("42", CLong(42))
   expectPrinted("42", CLongLong(42))
+#if os(Windows)
+  expectPrinted("42", CWideChar(exactly: 42)!)
+#else
   expectPrinted("*", CWideChar(42)!)
+#endif
+  expectPrinted("42", CChar8(42))
   expectPrinted("42", CChar16(42))
   expectPrinted("*", CChar32(42)!)
 
@@ -141,7 +152,12 @@ PrintTests.test("Printable") {
   expectPrinted("42", CLong(42))
   expectPrinted("42", CLongLong(42))
 
+#if os(Windows)
+  expectPrinted("42", CWideChar(exactly: 42)!)
+#else
   expectPrinted("*", CWideChar(42)!)
+#endif
+  expectPrinted("42", CChar8(42))
   expectPrinted("42", CChar16(42))
   expectPrinted("*", CChar32(42)!)
 }

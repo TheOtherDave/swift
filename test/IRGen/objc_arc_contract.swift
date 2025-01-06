@@ -4,6 +4,8 @@
 
 // RUN: %target-swift-frontend -import-objc-header %S/Inputs/StaticInline.h %s -emit-ir -Xllvm -disable-objc-arc-contract -parse-as-library -O | %FileCheck --check-prefix=CHECK-WITHOUT-PASS %s
 // RUN: %target-swift-frontend -import-objc-header %S/Inputs/StaticInline.h %s -emit-bc -Xllvm -disable-objc-arc-contract -parse-as-library -O -o %t/test1.bc && %llvm-dis -o - %t/test1.bc | %FileCheck --check-prefix=CHECK-WITHOUT-PASS %s
+// RUN: %target-swift-frontend -import-objc-header %S/Inputs/StaticInline.h %s -emit-ir -disable-llvm-optzns -parse-as-library -O | %FileCheck --check-prefix=CHECK-WITHOUT-PASS %s
+// RUN: %target-swift-frontend -import-objc-header %S/Inputs/StaticInline.h %s -emit-bc -disable-llvm-optzns -parse-as-library -O -o %t/test1.bc && %llvm-dis -o - %t/test1.bc | %FileCheck --check-prefix=CHECK-WITHOUT-PASS %s
 
 // RUN: %target-swift-frontend -import-objc-header %S/Inputs/StaticInline.h %s -emit-ir -parse-as-library -O | %FileCheck --check-prefix=CHECK-WITH-PASS %s
 // RUN: %target-swift-frontend -import-objc-header %S/Inputs/StaticInline.h %s -emit-bc -parse-as-library -O -o %t/test2.bc && %llvm-dis -o - %t/test2.bc | %FileCheck --check-prefix=CHECK-WITH-PASS %s
@@ -12,8 +14,8 @@
 // REQUIRES: objc_interop
 // REQUIRES: asserts
 
-// CHECK-WITHOUT-PASS: call void (...) @clang.arc.use
-// CHECK-WITH-PASS-NOT: call void (...) @clang.arc.use
+// CHECK-WITHOUT-PASS: call void (...) @llvm.objc.clang.arc.use
+// CHECK-WITH-PASS-NOT: call void (...) @llvm.objc.clang.arc.use
 
 import Foundation
 

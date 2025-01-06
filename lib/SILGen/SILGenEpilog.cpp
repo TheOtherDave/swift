@@ -10,93 +10,210 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "ASTVisitor.h"
 #include "SILGen.h"
 #include "SILGenFunction.h"
-#include "ASTVisitor.h"
+#include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILArgument.h"
+#include "llvm/ADT/STLExtras.h"
 
 using namespace swift;
 using namespace Lowering;
 
-void SILGenFunction::prepareEpilog(Type resultType, bool isThrowing,
-                                   CleanupLocation CleanupL) {
+void SILGenFunction::prepareEpilog(
+    DeclContext *DC, std::optional<Type> directResultType,
+    std::optional<Type> errorType, CleanupLocation CleanupL) {
   auto *epilogBB = createBasicBlock();
 
   // If we have any direct results, receive them via BB arguments.
-  // But callers can disable this by passing a null result type.
-  if (resultType) {
+  if (directResultType) {
     auto fnConv = F.getConventions();
     // Set NeedsReturn for indirect or direct results. This ensures that SILGen
     // emits unreachable if there is no source level return.
-    NeedsReturn = (fnConv.funcTy->getNumResults() != 0);
-    for (auto directResult : fnConv.getDirectSILResults()) {
-      SILType resultType =
-          F.mapTypeIntoContext(fnConv.getSILType(directResult));
-      epilogBB->createPHIArgument(resultType, ValueOwnershipKind::Owned);
+    NeedsReturn = !(*directResultType)->isEqual(TupleType::getEmpty(getASTContext()));
+    if (NeedsReturn) {
+      for (auto directResult : fnConv.getDirectSILResults()) {
+        SILType resultType = F.getLoweredType(F.mapTypeIntoContext(
+            fnConv.getSILType(directResult, getTypeExpansionContext())));
+        // @out tuples do not get flattened in the function's return type, but
+        // the epilog block expects (recursively) flattened arguments. Flatten
+        // the type now.
+        SmallVector<SILType, 4> worklist;
+        worklist.push_back(resultType);
+        while (!worklist.empty()) {
+          auto ty = worklist.pop_back_val();
+          if (auto tupleType = ty.getASTType()->getAs<TupleType>()) {
+            assert(!fnConv.useLoweredAddresses() &&
+                   "expanding tuple in non-opaque-values exit block?!");
+            // Push tuple elements in reverse order (resulting in later tuple
+            // elements appearing earlier in worklist) so that as the worklist
+            // is drained by popping the back, arguments are created for the
+            // earlier types first.
+            for (auto index :
+                 llvm::reverse(indices(tupleType->getElementTypes()))) {
+              worklist.push_back(ty.getTupleElementType(index));
+            }
+          } else {
+            epilogBB->createPhiArgument(ty, OwnershipKind::Owned);
+          }
+        }
+      }
     }
   }
 
   ReturnDest = JumpDest(epilogBB, getCleanupsDepth(), CleanupL);
 
-  if (isThrowing) {
-    prepareRethrowEpilog(CleanupL);
+  if (errorType) {
+    auto genericSig = DC->getGenericSignatureOfContext();
+    errorType = (*errorType)->getReducedType(genericSig);
+    AbstractionPattern origErrorType = TypeContext
+      ? *TypeContext->OrigType.getFunctionThrownErrorType()
+      : AbstractionPattern(genericSig.getCanonicalSignature(),
+                           (*errorType)->getCanonicalType());
+
+    prepareRethrowEpilog(DC, origErrorType, *errorType, CleanupL);
+  }
+
+  if (F.getLoweredFunctionType()->isCoroutine()) {
+    prepareCoroutineUnwindEpilog(CleanupL);
   }
 }
 
-void SILGenFunction::prepareRethrowEpilog(CleanupLocation cleanupLoc) {
-  auto exnType = SILType::getExceptionType(getASTContext());
+void SILGenFunction::prepareRethrowEpilog(
+    DeclContext *dc, AbstractionPattern origErrorType, Type errorType,
+    CleanupLocation cleanupLoc) {
+
   SILBasicBlock *rethrowBB = createBasicBlock(FunctionSection::Postmatter);
-  rethrowBB->createPHIArgument(exnType, ValueOwnershipKind::Owned);
-  ThrowDest = JumpDest(rethrowBB, getCleanupsDepth(), cleanupLoc);
+  if (!IndirectErrorResult) {
+    SILType loweredErrorType = getLoweredType(origErrorType, errorType);
+    rethrowBB->createPhiArgument(loweredErrorType, OwnershipKind::Owned);
+  }
+
+  ThrowDest = JumpDest(rethrowBB, getCleanupsDepth(), cleanupLoc,
+                       ThrownErrorInfo(IndirectErrorResult));
+}
+
+void SILGenFunction::prepareCoroutineUnwindEpilog(CleanupLocation cleanupLoc) {
+  SILBasicBlock *unwindBB = createBasicBlock(FunctionSection::Postmatter);
+  CoroutineUnwindDest = JumpDest(unwindBB, getCleanupsDepth(), cleanupLoc);
+}
+
+/// View a given SILType as a type-tree under the operation of tupling and visit
+/// its nodes (tuple elements) in post-order.
+///
+/// For convenience, the index of the type in the flattened tuple is passed to
+/// the visitor.
+template <typename Visit>
+void visitTupleTypeTreeInPostOrder(SILType root, Visit visit) {
+  struct Node {
+    SILType ty;
+    unsigned index;
+  };
+  SmallVector<std::pair<Node, unsigned>, 32> stack;
+  auto tupleElementCount = [](SILType ty) -> unsigned {
+    if (auto tupleType = ty.getASTType()->getAs<TupleType>())
+      return tupleType->getNumElements();
+    return 0;
+  };
+  auto tupleElement = [](SILType ty, unsigned index) -> SILType {
+    return ty.getTupleElementType(index);
+  };
+  unsigned flattenedIndex = 0;
+  stack.push_back({{root, flattenedIndex}, 0});
+  while (!stack.empty()) {
+    while (stack.back().second != tupleElementCount(stack.back().first.ty)) {
+      auto index = stack.back().second;
+      stack.back().second++;
+      stack.push_back(
+          {{tupleElement(stack.back().first.ty, index), flattenedIndex}, 0});
+    }
+    auto node = stack.pop_back_val().first;
+    visit(node.ty, node.index);
+    if (!node.ty.getASTType()->template is<TupleType>())
+      flattenedIndex += 1;
+  }
 }
 
 /// Given a list of direct results, form the direct result value.
 ///
 /// Note that this intentionally loses any tuple sub-structure of the
-/// formal result type.
+/// formal result type, except in the case of @out tuples where it must be
+/// preserved.
 static SILValue buildReturnValue(SILGenFunction &SGF, SILLocation loc,
                                  ArrayRef<SILValue> directResults) {
   if (directResults.size() == 1)
     return directResults[0];
 
+  auto fnConv = SGF.F.getConventions();
+  if (!fnConv.useLoweredAddresses()) {
+    // In opaque-values code, nested @out tuples are not flattened.  Reconstruct
+    // nested tuples.
+    auto resultType = SGF.F.getLoweredType(SGF.F.mapTypeIntoContext(
+        fnConv.getSILResultType(SGF.getTypeExpansionContext())));
+    SmallVector<std::optional<SILValue>, 4> mutableDirectResult;
+    for (auto result : directResults) {
+      mutableDirectResult.push_back({result});
+    }
+    visitTupleTypeTreeInPostOrder(resultType, [&](SILType ty, unsigned index) {
+      if (auto tupleTy = ty.getASTType()->getAs<TupleType>()) {
+        SmallVector<SILValue, 4> elements;
+        unsigned offset = 0;
+        auto elementCount = tupleTy->getNumElements();
+        while (elements.size() < elementCount) {
+          if (mutableDirectResult[index + offset].has_value()) {
+            auto val = mutableDirectResult[index + offset].value();
+            elements.push_back(val);
+            mutableDirectResult[index + offset].reset();
+          }
+          ++offset;
+        }
+        assert(!mutableDirectResult[index].has_value());
+        auto tuple = SGF.B.createTuple(loc, ty, elements);
+        mutableDirectResult[index] = tuple;
+      }
+    });
+    assert(mutableDirectResult[0].has_value());
+    return mutableDirectResult[0].value();
+  }
+
   SmallVector<TupleTypeElt, 4> eltTypes;
   for (auto elt : directResults)
-    eltTypes.push_back(elt->getType().getSwiftRValueType());
+    eltTypes.push_back(elt->getType().getASTType());
   auto resultType = SILType::getPrimitiveObjectType(
     CanType(TupleType::get(eltTypes, SGF.getASTContext())));
   return SGF.B.createTuple(loc, resultType, directResults);
 }
 
-std::pair<Optional<SILValue>, SILLocation>
-SILGenFunction::emitEpilogBB(SILLocation TopLevel) {
-  assert(ReturnDest.getBlock() && "no epilog bb prepared?!");
-  SILBasicBlock *epilogBB = ReturnDest.getBlock();
-  SILLocation ImplicitReturnFromTopLevel =
-    ImplicitReturnLocation::getImplicitReturnLoc(TopLevel);
-  SmallVector<SILValue, 4> directResults;
-  Optional<SILLocation> returnLoc = None;
+static std::optional<SILLocation>
+prepareForEpilogBlockEmission(SILGenFunction &SGF, SILLocation topLevel,
+                              SILBasicBlock *epilogBB,
+                              SmallVectorImpl<SILValue> &directResults) {
+  ImplicitReturnLocation implicitReturnFromTopLevel(topLevel);
 
-  // If the current BB isn't terminated, and we require a return, then we
+  // If the current BB we are inserting into isn't terminated, and we require a
+  // return, then we
   // are not allowed to fall off the end of the function and can't reach here.
-  if (NeedsReturn && B.hasValidInsertionPoint())
-    B.createUnreachable(ImplicitReturnFromTopLevel);
+  if (SGF.NeedsReturn && SGF.B.hasValidInsertionPoint())
+    SGF.B.createUnreachable(implicitReturnFromTopLevel);
 
   if (epilogBB->pred_empty()) {
     // If the epilog was not branched to at all, kill the BB and
     // just emit the epilog into the current BB.
     while (!epilogBB->empty())
       epilogBB->back().eraseFromParent();
-    eraseBasicBlock(epilogBB);
+    SGF.eraseBasicBlock(epilogBB);
 
     // If the current bb is terminated then the epilog is just unreachable.
-    if (!B.hasValidInsertionPoint())
-      return { None, TopLevel };
+    if (!SGF.B.hasValidInsertionPoint())
+      return std::nullopt;
 
     // We emit the epilog at the current insertion point.
-    returnLoc = ImplicitReturnFromTopLevel;
+    return implicitReturnFromTopLevel;
+  }
 
-  } else if (std::next(epilogBB->pred_begin()) == epilogBB->pred_end()
-             && !B.hasValidInsertionPoint()) {
+  if (std::next(epilogBB->pred_begin()) == epilogBB->pred_end() &&
+      !SGF.B.hasValidInsertionPoint()) {
     // If the epilog has a single predecessor and there's no current insertion
     // point to fall through from, then we can weld the epilog to that
     // predecessor BB.
@@ -113,14 +230,15 @@ SILGenFunction::emitEpilogBB(SILLocation TopLevel) {
       epilogBB->getArgument(index)->replaceAllUsesWith(result);
     }
 
+    std::optional<SILLocation> returnLoc;
     // If we are optimizing, we should use the return location from the single,
     // previously processed, return statement if any.
     if (predBranch->getLoc().is<ReturnLocation>()) {
       returnLoc = predBranch->getLoc();
     } else {
-      returnLoc = ImplicitReturnFromTopLevel;
+      returnLoc = implicitReturnFromTopLevel;
     }
-    
+
     // Kill the branch to the now-dead epilog BB.
     pred->erase(predBranch);
 
@@ -128,37 +246,55 @@ SILGenFunction::emitEpilogBB(SILLocation TopLevel) {
     pred->spliceAtEnd(epilogBB);
 
     // Finally we can erase the epilog BB.
-    eraseBasicBlock(epilogBB);
+    SGF.eraseBasicBlock(epilogBB);
 
     // Emit the epilog into its former predecessor.
-    B.setInsertionPoint(pred);
-  } else {
-    // Move the epilog block to the end of the ordinary section.
-    auto endOfOrdinarySection = StartOfPostmatter;
-    B.moveBlockTo(epilogBB, endOfOrdinarySection);
-
-    // Emit the epilog into the epilog bb. Its arguments are the
-    // direct results.
-    directResults.append(epilogBB->args_begin(), epilogBB->args_end());
-
-    // If we are falling through from the current block, the return is implicit.
-    B.emitBlock(epilogBB, ImplicitReturnFromTopLevel);
+    SGF.B.setInsertionPoint(pred);
+    return returnLoc;
   }
-  
-  // Emit top-level cleanups into the epilog block.
-  assert(!Cleanups.hasAnyActiveCleanups(getCleanupsDepth(),
-                                        ReturnDest.getDepth()) &&
-         "emitting epilog in wrong scope");
 
-  auto cleanupLoc = CleanupLocation::get(TopLevel);
-  Cleanups.emitCleanupsForReturn(cleanupLoc);
+  // Move the epilog block to the end of the ordinary section.
+  auto endOfOrdinarySection = SGF.StartOfPostmatter;
+  SGF.F.moveBlockBefore(epilogBB, endOfOrdinarySection);
+
+  // Emit the epilog into the epilog bb. Its arguments are the
+  // direct results.
+  directResults.append(epilogBB->args_begin(), epilogBB->args_end());
+
+  // If we are falling through from the current block, the return is implicit.
+  SGF.B.emitBlock(epilogBB, implicitReturnFromTopLevel);
 
   // If the return location is known to be that of an already
   // processed return, use it. (This will get triggered when the
   // epilog logic is simplified.)
   //
   // Otherwise make the ret instruction part of the cleanups.
-  if (!returnLoc) returnLoc = cleanupLoc;
+  auto cleanupLoc = CleanupLocation(topLevel);
+  return cleanupLoc;
+}
+
+std::pair<std::optional<SILValue>, SILLocation>
+SILGenFunction::emitEpilogBB(SILLocation topLevel) {
+  assert(ReturnDest.getBlock() && "no epilog bb prepared?!");
+  SILBasicBlock *epilogBB = ReturnDest.getBlock();
+  SmallVector<SILValue, 8> directResults;
+
+  // Prepare the epilog block for emission. If we need to actually emit the
+  // block, we return a real SILLocation. Otherwise, the epilog block is
+  // actually unreachable and we can just return early.
+  auto returnLoc =
+      prepareForEpilogBlockEmission(*this, topLevel, epilogBB, directResults);
+  if (!returnLoc.has_value()) {
+    return {std::nullopt, topLevel};
+  }
+
+  // Emit top-level cleanups into the epilog block.
+  assert(!Cleanups.hasAnyActiveCleanups(getCleanupsDepth(),
+                                        ReturnDest.getDepth()) &&
+         "emitting epilog in wrong scope");
+
+  auto cleanupLoc = CleanupLocation(topLevel);
+  Cleanups.emitCleanupsForReturn(cleanupLoc, NotForUnwind);
 
   // Build the return value.  We don't do this if there are no direct
   // results; this can happen for void functions, but also happens when
@@ -166,16 +302,18 @@ SILGenFunction::emitEpilogBB(SILLocation TopLevel) {
   // block.
   SILValue returnValue;
   if (!directResults.empty()) {
-    assert(directResults.size() == F.getConventions().getNumDirectSILResults());
-    returnValue = buildReturnValue(*this, TopLevel, directResults);
+    assert(directResults.size() ==
+           F.getConventions().getNumExpandedDirectSILResults(
+               getTypeExpansionContext()));
+    returnValue = buildReturnValue(*this, cleanupLoc, directResults);
   }
 
-  return { returnValue, *returnLoc };
+  return {returnValue, *returnLoc};
 }
 
 SILLocation SILGenFunction::
 emitEpilog(SILLocation TopLevel, bool UsesCustomEpilog) {
-  Optional<SILValue> maybeReturnValue;
+  std::optional<SILValue> maybeReturnValue;
   SILLocation returnLoc(TopLevel);
   std::tie(maybeReturnValue, returnLoc) = emitEpilogBB(TopLevel);
 
@@ -195,12 +333,13 @@ emitEpilog(SILLocation TopLevel, bool UsesCustomEpilog) {
 
     // Return () if no return value was given.
     if (!returnValue)
-      returnValue = emitEmptyTuple(CleanupLocation::get(TopLevel));
+      returnValue = emitEmptyTuple(CleanupLocation(TopLevel));
 
     B.createReturn(returnLoc, returnValue);
   }
   
   emitRethrowEpilog(TopLevel);
+  emitCoroutineUnwindEpilog(TopLevel);
   
   if (ResultBB)
     B.setInsertionPoint(ResultBB);
@@ -208,55 +347,91 @@ emitEpilog(SILLocation TopLevel, bool UsesCustomEpilog) {
   return returnLoc;
 }
 
-void SILGenFunction::emitRethrowEpilog(SILLocation topLevel) {
-  assert(!B.hasValidInsertionPoint());
+static bool prepareExtraEpilog(SILGenFunction &SGF, JumpDest &dest,
+                               SILLocation &loc, SILValue *arg) {
+  assert(!SGF.B.hasValidInsertionPoint());
 
-  // If we don't have a rethrow destination, we're done.
-  if (!ThrowDest.isValid())
-    return;
+  // If we don't have a destination, we don't need to emit the epilog.
+  if (!dest.isValid())
+    return false;
 
-  // If the rethrow destination isn't used, we're done.
-  SILBasicBlock *rethrowBB = ThrowDest.getBlock();
-  if (rethrowBB->pred_empty()) {
-    ThrowDest = JumpDest::invalid();
-    eraseBasicBlock(rethrowBB);
-    return;
+  // If the destination isn't used, we don't need to emit the epilog.
+  SILBasicBlock *epilogBB = dest.getBlock();
+  auto pi = epilogBB->pred_begin(), pe = epilogBB->pred_end();
+  if (pi == pe) {
+    dest = JumpDest::invalid();
+    SGF.eraseBasicBlock(epilogBB);
+    return false;
   }
 
-  SILLocation throwLoc = topLevel;
-  SILValue exn = rethrowBB->args_begin()[0];
+  assert(epilogBB->getNumArguments() <= 1);
+  assert((epilogBB->getNumArguments() == 1) == (arg != nullptr));
+  if (arg) *arg = epilogBB->args_begin()[0];
+
   bool reposition = true;
 
-  // If the rethrow destination has a single branch predecessor,
-  // consider emitting the rethrow into it.
-  SILBasicBlock *predBB = *rethrowBB->pred_begin();
-  if (std::next(rethrowBB->pred_begin()) == rethrowBB->pred_end()) {
+  // If the destination has a single branch predecessor,
+  // consider emitting the epilog into it.
+  SILBasicBlock *predBB = *pi;
+  if (++pi == pe) {
     if (auto branch = dyn_cast<BranchInst>(predBB->getTerminator())) {
-      assert(branch->getArgs().size() == 1);
+      assert(branch->getArgs().size() == epilogBB->getNumArguments());
 
       // Save the location and operand information from the branch,
       // then destroy it.
-      throwLoc = branch->getLoc();
-      exn = branch->getArgs()[0];
+      loc = branch->getLoc();
+      if (arg) *arg = branch->getArgs()[0];
       predBB->erase(branch);
 
       // Erase the rethrow block.
-      eraseBasicBlock(rethrowBB);
-      rethrowBB = predBB;
+      SGF.eraseBasicBlock(epilogBB);
+      epilogBB = predBB;
       reposition = false;
     }
   }
 
-  // Reposition the rethrow block to the end of the postmatter section
+  // Reposition the block to the end of the postmatter section
   // unless we're emitting into a single predecessor.
   if (reposition) {
-    B.moveBlockTo(rethrowBB, F.end());
+    SGF.F.moveBlockBefore(epilogBB, SGF.F.end());
   }
 
-  B.setInsertionPoint(rethrowBB);
-  Cleanups.emitCleanupsForReturn(ThrowDest.getCleanupLocation());
+  SGF.B.setInsertionPoint(epilogBB);
 
-  B.createThrow(throwLoc, exn);
+  return true;
+}
+
+void SILGenFunction::emitRethrowEpilog(SILLocation topLevel) {
+  SILValue exn;
+  SILLocation throwLoc = topLevel;
+
+  if (!prepareExtraEpilog(*this, ThrowDest, throwLoc,
+                          !IndirectErrorResult ? &exn : nullptr)) {
+    return;
+  }
+
+  Cleanups.emitCleanupsForReturn(ThrowDest.getCleanupLocation(), IsForUnwind);
+
+  // FIXME: opaque values
+  if (!IndirectErrorResult) {
+    B.createThrow(CleanupLocation(throwLoc), exn);
+  } else {
+    assert(IndirectErrorResult);
+    B.createThrowAddr(CleanupLocation(throwLoc));
+  }
 
   ThrowDest = JumpDest::invalid();
+}
+
+void SILGenFunction::emitCoroutineUnwindEpilog(SILLocation topLevel) {
+  SILLocation unwindLoc = topLevel;
+  if (!prepareExtraEpilog(*this, CoroutineUnwindDest, unwindLoc, nullptr))
+    return;
+
+  Cleanups.emitCleanupsForReturn(CoroutineUnwindDest.getCleanupLocation(),
+                                 IsForUnwind);
+
+  B.createUnwind(unwindLoc);
+
+  CoroutineUnwindDest = JumpDest::invalid();
 }

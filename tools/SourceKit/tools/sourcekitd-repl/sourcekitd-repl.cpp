@@ -14,14 +14,15 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/Support/Signals.h"
-#include "llvm/Support/FileSystem.h"
-#include "llvm/Support/Process.h"
 #include "llvm/Support/ConvertUTF.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/Mutex.h"
-#include <unistd.h>
+#include "llvm/Support/Process.h"
+#include "llvm/Support/Signals.h"
+#include "llvm/Support/raw_ostream.h"
 #include <histedit.h>
+#include <unistd.h>
 using namespace llvm;
 
 
@@ -89,30 +90,32 @@ using Convert = ConvertForWcharSize<sizeof(wchar_t)>;
 
 static void convertFromUTF8(llvm::StringRef utf8,
                             llvm::SmallVectorImpl<wchar_t> &out) {
+  size_t original_out_size = out.size();
   size_t reserve = out.size() + utf8.size();
-  out.reserve(reserve);
+  out.resize_for_overwrite(reserve);
   const char *utf8_begin = utf8.begin();
-  wchar_t *wide_begin = out.end();
+  wchar_t *wide_begin = out.begin() + original_out_size;
   auto res = Convert::ConvertFromUTF8(&utf8_begin, utf8.end(),
                                       &wide_begin, out.data() + reserve,
                                       lenientConversion);
   assert(res == conversionOK && "utf8-to-wide conversion failed!");
   (void)res;
-  out.set_size(wide_begin - out.begin());
+  out.truncate(wide_begin - out.begin());
 }
 
 static void convertToUTF8(llvm::ArrayRef<wchar_t> wide,
                           llvm::SmallVectorImpl<char> &out) {
+  size_t original_out_size = out.size();
   size_t reserve = out.size() + wide.size()*4;
-  out.reserve(reserve);
+  out.resize_for_overwrite(reserve);
   const wchar_t *wide_begin = wide.begin();
-  char *utf8_begin = out.end();
+  char *utf8_begin = out.begin() + original_out_size;
   auto res = Convert::ConvertToUTF8(&wide_begin, wide.end(),
                                     &utf8_begin, out.data() + reserve,
                                     lenientConversion);
   assert(res == conversionOK && "wide-to-utf8 conversion failed!");
   (void)res;
-  out.set_size(utf8_begin - out.begin());
+  out.truncate(utf8_begin - out.begin());
 }
 } // end anonymous namespace
 
@@ -265,8 +268,7 @@ public:
         CurrentLines.append(indent, ' ');
       }
 
-      convertToUTF8(llvm::makeArrayRef(WLine, WLine + wcslen(WLine)),
-                    CurrentLines);
+      convertToUTF8(llvm::ArrayRef(WLine, WLine + wcslen(WLine)), CurrentLines);
 
       // Special-case backslash for line continuations in the REPL.
       if (CurrentLines.size() > 2 &&
@@ -353,9 +355,8 @@ private:
     PromptString.clear();
 
     if (ShowColors) {
-      const char *colorCode =
-        llvm::sys::Process::OutputColor(llvm::raw_ostream::YELLOW,
-                                        false, false);
+      const char *colorCode = llvm::sys::Process::OutputColor(
+          static_cast<char>(llvm::raw_ostream::YELLOW), false, false);
       if (colorCode)
         appendEscapeSequence(PromptString, colorCode);
     }
@@ -409,8 +410,8 @@ private:
   }
 
   bool isAtStartOfLine(const LineInfoW *line) {
-    for (wchar_t c : llvm::makeArrayRef(line->buffer,
-                                        line->cursor - line->buffer)) {
+    for (wchar_t c :
+         llvm::ArrayRef(line->buffer, line->cursor - line->buffer)) {
       if (!iswspace(c))
         return false;
     }
@@ -602,15 +603,25 @@ static bool printResponse(sourcekitd_response_t Resp) {
 
   sourcekitd_response_dispose(Resp);
   return IsError;
-};
+}
 
 static bool handleRequest(StringRef ReqStr, std::string &ErrorMessage) {
   bool UseAsync = false;
-  ReqStr = ReqStr.ltrim();
-  if (ReqStr.startswith("async")) {
-    UseAsync = true;
-    ReqStr = ReqStr.substr(strlen("async"));
-  }
+  bool UseTimer = false;
+  while (true) {
+    ReqStr = ReqStr.ltrim();
+    if (ReqStr.starts_with("async")) {
+      UseAsync = true;
+      ReqStr = ReqStr.substr(strlen("async"));
+      continue;
+    }
+    if (ReqStr.starts_with("time")) {
+      UseTimer = true;
+      ReqStr = ReqStr.substr(strlen("time"));
+      continue;
+    }
+    break;
+  };
 
   SmallString<64> Str(ReqStr);
   char *Err = nullptr;
@@ -627,22 +638,33 @@ static bool handleRequest(StringRef ReqStr, std::string &ErrorMessage) {
 
   bool IsError = false;
 
+  auto startTime = std::chrono::steady_clock::now();
+  auto printRequestTime = [UseTimer, startTime](llvm::raw_ostream &OS) {
+    if (!UseTimer)
+      return;
+    std::chrono::duration<float, std::milli> delta(
+        std::chrono::steady_clock::now() - startTime);
+    OS << "request time: " << llvm::formatv("{0:ms+f3}", delta) << "\n";
+  };
+
+  llvm::raw_fd_ostream OS(STDOUT_FILENO, /*shouldClose=*/false);
   if (UseAsync) {
     static unsigned AsyncReqCount = 0;
     static llvm::sys::Mutex AsynRespPrintMtx;
 
     unsigned CurrReqCount = ++AsyncReqCount;
-    llvm::raw_fd_ostream OS(STDOUT_FILENO, /*shouldClose=*/false);
     OS << "send async request #" << CurrReqCount << '\n';
     sourcekitd_send_request(Req, nullptr, ^(sourcekitd_response_t Resp) {
       llvm::sys::ScopedLock L(AsynRespPrintMtx);
       llvm::raw_fd_ostream OS(STDOUT_FILENO, /*shouldClose=*/false);
       OS << "received async response #" << CurrReqCount << '\n';
+      printRequestTime(OS);
       printResponse(Resp);
     });
 
   } else {
     sourcekitd_response_t Resp = sourcekitd_send_request_sync(Req);
+    printRequestTime(OS);
     IsError = printResponse(Resp);
   }
 

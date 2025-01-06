@@ -1,6 +1,5 @@
-// RUN: %target-swift-frontend -emit-ir -disable-objc-attr-requires-foundation-module %s | %FileCheck %s
-
-// REQUIRES: objc_interop
+// RUN: %target-swift-frontend -emit-ir -enable-objc-interop -disable-objc-attr-requires-foundation-module %s | %FileCheck %s
+// REQUIRES: objc_codegen
 
 struct WrapperStruct {
   subscript() -> Void {

@@ -16,3 +16,19 @@ typedef CF_OPTIONS(int, CFOptionsWithAttr) {
 typedef CF_OPTIONS(int, UnknownOptionsThanksToAPINotes) {
   UnknownOptionsThanksToAPINotesFirst = 1,
 };
+
+enum EnumByTag {
+  EnumByTagX
+};
+typedef enum {
+  EnumByTypedefX
+} EnumByTypedef;
+typedef enum EnumByBoth {
+  EnumByBothX
+} EnumByBoth;
+
+
+typedef enum {
+  kEventInit,
+  kEventReset
+} SystemEvent;

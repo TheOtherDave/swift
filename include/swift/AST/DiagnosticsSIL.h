@@ -11,7 +11,7 @@
 //===----------------------------------------------------------------------===//
 //
 /// \file
-/// \brief This file defines diagnostics for SIL generation and analysis.
+/// This file defines diagnostics for SIL generation and analysis.
 //
 //===----------------------------------------------------------------------===//
 
@@ -23,8 +23,8 @@
 namespace swift {
   namespace diag {
   // Declare common diagnostics objects with their appropriate types.
-#define DIAG(KIND,ID,Options,Text,Signature) \
-  extern detail::DiagWithArguments<void Signature>::type ID;
+#define DIAG(KIND, ID, Group, Options, Text, Signature)                      \
+    extern detail::DiagWithArguments<void Signature>::type ID;
 #include "DiagnosticsSIL.def"
   }
 }

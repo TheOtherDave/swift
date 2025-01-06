@@ -11,13 +11,14 @@ enum MyError : Error {
 // thrown error we create a shadow stack location holding the address of the
 // location that holds the pointer to the error instead.
 func simple(_ placeholder: Int64) throws -> () {
-  // CHECK: define {{.*}}void @_T08ErrorVar6simpleys5Int64VKF(i64, %swift.refcounted* swiftself, %swift.error**)
-  // CHECK: call void @llvm.dbg.declare
-  // CHECK: call void @llvm.dbg.declare({{.*}}, metadata ![[ERROR:[0-9]+]], metadata !DIExpression(DW_OP_deref))
-  // CHECK: ![[ERRTY:.*]] = !DICompositeType({{.*}}identifier: "_T0s5Error_pD"
-  // CHECK: ![[ERROR]] = !DILocalVariable(name: "$error", arg: 2,
-  // CHECK-SAME:                          type: ![[ERRTY]],
-  // CHECK-SAME:                          flags: DIFlagArtificial)
+  // CHECK: define {{.*}}void @"$s8ErrorVar6simpleyys5Int64VKF"(
+  // CHECK-SAME: i64
+  // CHECK-SAME: %swift.refcounted* {{.*}}swiftself
+  // CHECK-SAME: %swift.error** noalias nocapture dereferenceable(4)
+  // CHECK: #dbg_declare
+  // CHECK: #dbg_declare({{.*}}, ![[ERROR:[0-9]+]], !DIExpression(DW_OP_deref)
+  // CHECK-DAG: ![[ERRTY:.*]] = !DICompositeType({{.*}}identifier: "$ss5Error_pD"
+  // CHECK-DAG: ![[ERROR]] = !DILocalVariable(name: "$error", arg: 2, {{.*}}, type: ![[ERRTY]], flags: DIFlagArtificial)
   throw MyError.Simple
 }
 

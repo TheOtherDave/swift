@@ -232,7 +232,7 @@ class Variant(Structure):
         elif var_ty == VariantType.UID:
             return UIdent(conf.lib.sourcekitd_variant_uid_get_value(self))
         else:
-            assert(var_ty == VariantType.BOOL)
+            assert var_ty == VariantType.BOOL
             return conf.lib.sourcekitd_variant_bool_get_value(self)
 
     def to_python_array(self):
@@ -314,6 +314,8 @@ callbacks['dictionary_applier'] = CFUNCTYPE(
 # Functions strictly alphabetical order.
 functionList = [
     ("sourcekitd_cancel_request",
+     [c_void_p]),
+    ("sourcekitd_request_handle_dispose",
      [c_void_p]),
 
     ("sourcekitd_initialize",
@@ -569,7 +571,7 @@ class Config(object):
     def set_library_path(path):
         """Set the path in which to search for sourcekitd"""
         if Config.loaded:
-            raise Exception("library path must be set before before using "
+            raise Exception("library path must be set before using "
                             "any other functionalities in sourcekitd.")
 
         Config.library_path = path
@@ -578,7 +580,7 @@ class Config(object):
     def set_library_file(filename):
         """Set the exact location of sourcekitd"""
         if Config.loaded:
-            raise Exception("library file must be set before before using "
+            raise Exception("library file must be set before using "
                             "any other functionalities in sourcekitd.")
 
         Config.library_file = filename

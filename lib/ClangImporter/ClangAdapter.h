@@ -19,10 +19,9 @@
 #define CLANG_ADAPTER_H
 
 #include "swift/Basic/StringExtras.h"
-#include "swift/Serialization/ModuleFormat.h"
-#include "llvm/ADT/Optional.h"
-#include "llvm/ADT/SmallBitVector.h"
 #include "clang/Basic/Specifiers.h"
+#include "llvm/ADT/SmallBitVector.h"
+#include <optional>
 
 #include "ImportName.h"
 
@@ -39,7 +38,7 @@ class ObjCPropertyDecl;
 class ParmVarDecl;
 class QualType;
 class Sema;
-class SwiftNewtypeAttr;
+class SwiftNewTypeAttr;
 class Type;
 class TypedefNameDecl;
 }
@@ -47,6 +46,8 @@ class TypedefNameDecl;
 // TODO: pull more off of the ImportImpl
 
 namespace swift {
+enum OptionalTypeKind : unsigned;
+
 namespace importer {
 struct PlatformAvailability;
 
@@ -56,15 +57,43 @@ struct PlatformAvailability;
 /// Returns \c None if \p D is not a redeclarable type declaration.
 /// Returns null if \p D is a redeclarable type, but it does not have a
 /// definition yet.
-Optional<const clang::Decl *>
+std::optional<const clang::Decl *>
 getDefinitionForClangTypeDecl(const clang::Decl *D);
+
+/// Returns the first redeclaration of \p D outside of a function.
+///
+/// C allows redeclaring most declarations in function bodies, as so:
+///
+///     void usefulPublicFunction(void) {
+///       extern void importantInternalFunction(int code);
+///       importantInternalFunction(42);
+///     }
+///
+/// This should allow clients to call \c usefulPublicFunction without exposing
+/// \c importantInternalFunction . However, if there is another declaration of
+/// \c importantInternalFunction later, Clang still needs to treat them as the
+/// same function. This is normally fine...except that if the local declaration
+/// is the \e first declaration, it'll also get used as the "canonical"
+/// declaration that Clang (and Swift) use for uniquing purposes.
+///
+/// Every imported declaration gets assigned to a module in Swift, and for
+/// declarations without definitions that choice is somewhat arbitrary. But it
+/// would be better not to pick a local declaration like the one above, and
+/// therefore this method should be used instead of
+/// clang::Decl::getCanonicalDecl when the containing module is important.
+///
+/// If there are no non-local redeclarations, returns null.
+/// If \p D is not a kind of declaration that supports being redeclared, just
+/// returns \p D itself.
+const clang::Decl *
+getFirstNonLocalDecl(const clang::Decl *D);
 
 /// Returns the module \p D comes from, or \c None if \p D does not have
 /// a valid associated module.
 ///
 /// The returned module may be null (but not \c None) if \p D comes from
 /// an imported header.
-Optional<clang::Module *>
+std::optional<clang::Module *>
 getClangSubmoduleForDecl(const clang::Decl *D,
                          bool allowForwardDeclaration = false);
 
@@ -78,12 +107,12 @@ OmissionTypeName getClangTypeNameForOmission(clang::ASTContext &ctx,
                                              clang::QualType type);
 
 /// Find the swift_newtype attribute on the given typedef, if present.
-clang::SwiftNewtypeAttr *getSwiftNewtypeAttr(const clang::TypedefNameDecl *decl,
+clang::SwiftNewTypeAttr *getSwiftNewtypeAttr(const clang::TypedefNameDecl *decl,
                                              ImportNameVersion version);
 
 /// Retrieve a bit vector containing the non-null argument
 /// annotations for the given declaration.
-llvm::SmallBitVector
+SmallBitVector
 getNonNullArgs(const clang::Decl *decl,
                ArrayRef<const clang::ParmVarDecl *> params);
 
@@ -100,6 +129,9 @@ clang::TypedefNameDecl *findSwiftNewtype(const clang::NamedDecl *decl,
 bool isNSString(const clang::Type *);
 bool isNSString(clang::QualType);
 
+/// Wehther the passed type is `NSNotificationName` typealias
+bool isNSNotificationName(clang::QualType);
+
 /// Whether the given declaration was exported from Swift.
 ///
 /// Note that this only checks the immediate declaration being passed.
@@ -108,16 +140,11 @@ bool isNSString(clang::QualType);
 bool hasNativeSwiftDecl(const clang::Decl *decl);
 
 /// Translation API nullability from an API note into an optional kind.
-OptionalTypeKind translateNullability(clang::NullabilityKind kind);
-
-/// Determine whether the given class has designated initializers,
-/// consulting
-bool hasDesignatedInitializers(const clang::ObjCInterfaceDecl *classDecl);
-
-/// Determine whether the given method is a designated initializer
-/// of the given class.
-bool isDesignatedInitializer(const clang::ObjCInterfaceDecl *classDecl,
-                             const clang::ObjCMethodDecl *method);
+///
+/// \param stripNonResultOptionality Whether strip optionality from
+/// \c _Nullable but not \c _Nullable_result.
+OptionalTypeKind translateNullability(
+    clang::NullabilityKind kind, bool stripNonResultOptionality = false);
 
 /// Determine whether the given method is a required initializer
 /// of the given class.
@@ -136,20 +163,16 @@ bool isObjCId(const clang::Decl *decl);
 
 /// Determine whether the given declaration is considered
 /// 'unavailable' in Swift.
-bool isUnavailableInSwift(const clang::Decl *decl, const PlatformAvailability &,
+bool isUnavailableInSwift(const clang::Decl *decl, const PlatformAvailability *,
                           bool enableObjCInterop);
 
 /// Determine the optionality of the given Clang parameter.
-///
-/// \param swiftLanguageVersion What version of Swift we're using, which affects
-/// how optionality is inferred.
 ///
 /// \param param The Clang parameter.
 ///
 /// \param knownNonNull Whether a function- or method-level "nonnull" attribute
 /// applies to this parameter.
-OptionalTypeKind getParamOptionality(version::Version swiftLanguageVersion,
-                                     const clang::ParmVarDecl *param,
+OptionalTypeKind getParamOptionality(const clang::ParmVarDecl *param,
                                      bool knownNonNull);
 }
 }

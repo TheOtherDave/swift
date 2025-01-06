@@ -13,16 +13,21 @@
 #ifndef SWIFT_BASIC_MANGLER_H
 #define SWIFT_BASIC_MANGLER_H
 
+#include "swift/Demangling/ManglingFlavor.h"
 #include "swift/Demangling/ManglingUtils.h"
+#include "swift/Demangling/NamespaceMacros.h"
+#include "swift/Basic/Debug.h"
 #include "swift/Basic/LLVM.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace swift {
 namespace Mangle {
+SWIFT_BEGIN_INLINE_NAMESPACE
 
 void printManglingStats();
 
@@ -51,6 +56,12 @@ protected:
 
   /// Identifier substitutions.
   llvm::StringMap<unsigned> StringSubstitutions;
+  
+  /// Index to use for the next added substitution.
+  /// Note that this is not simply the sum of the size of the \c Substitutions
+  /// and \c StringSubstitutions maps above, since in some circumstances the
+  /// same entity may be registered for multiple substitution indexes.
+  unsigned NextSubstitutionIndex = 0;
 
   /// Word substitutions in mangled identifiers.
   llvm::SmallVector<SubstitutionWord, 26> Words;
@@ -59,6 +70,8 @@ protected:
   SubstitutionMerging SubstMerging;
 
   size_t MaxNumWords = 26;
+
+  ManglingFlavor Flavor = ManglingFlavor::Default;
 
   /// If enabled, non-ASCII names are encoded in modified Punycode.
   bool UsePunycode = true;
@@ -78,19 +91,36 @@ protected:
     }
   };
 
+  void addSubstWordsInIdent(const WordReplacement &repl) {
+    SubstWordsInIdent.push_back(repl);
+  }
+
+  void addWord(const SubstitutionWord &word) {
+    Words.push_back(word);
+  }
+
   /// Returns the buffer as a StringRef, needed by mangleIdentifier().
   StringRef getBufferStr() const {
     return StringRef(Storage.data(), Storage.size());
   }
 
+  void print(llvm::raw_ostream &os) const {
+    os << getBufferStr() << '\n';
+  }
+
+public:
+  /// Dump the current stored state in the Mangler. Only for use in the debugger!
+  SWIFT_DEBUG_DUMPER(dumpBufferStr()) {
+    print(llvm::dbgs());
+  }
+
+protected:
   /// Removes the last characters of the buffer by setting it's size to a
   /// smaller value.
   void resetBuffer(size_t toPos) {
     assert(toPos <= Storage.size());
     Storage.resize(toPos);
   }
-
-protected:
 
   Mangler() : Buffer(Storage) { }
 
@@ -108,21 +138,31 @@ protected:
   void finalize(llvm::raw_ostream &stream);
 
   /// Verify that demangling and remangling works.
-  static void verify(StringRef mangledName);
-  static void verifyOld(StringRef mangledName);
+  static void verify(StringRef mangledName, ManglingFlavor Flavor);
 
-  void dump();
+  SWIFT_DEBUG_DUMP;
 
   /// Appends a mangled identifier string.
   void appendIdentifier(StringRef ident);
 
+  // NOTE: the addSubstitution functions perform the value computation before
+  // the assignment because there is no sequence point synchronising the
+  // computation of the value before the insertion of the new key, resulting in
+  // the computed value being off-by-one causing an undecoration failure during
+  // round-tripping.
   void addSubstitution(const void *ptr) {
-    if (UseSubstitutions)
-      Substitutions[ptr] = Substitutions.size() + StringSubstitutions.size();
+    if (!UseSubstitutions)
+      return;
+    
+    auto value = NextSubstitutionIndex++;
+    Substitutions[ptr] = value;
   }
   void addSubstitution(StringRef Str) {
-    if (UseSubstitutions)
-      StringSubstitutions[Str] = Substitutions.size() + StringSubstitutions.size();
+    if (!UseSubstitutions)
+      return;
+
+    auto value = NextSubstitutionIndex++;
+    StringSubstitutions[Str] = value;
   }
 
   bool tryMangleSubstitution(const void *ptr);
@@ -142,11 +182,6 @@ protected:
   void appendOperator(StringRef op) {
     size_t OldPos = Storage.size();
     Buffer << op;
-    recordOpStat(op, OldPos);
-  }
-  void appendOperator(StringRef op, int natural) {
-    size_t OldPos = Storage.size();
-    Buffer << op << natural << '_';
     recordOpStat(op, OldPos);
   }
   void appendOperator(StringRef op, Index index) {
@@ -190,6 +225,7 @@ protected:
   }
 };
 
+SWIFT_END_INLINE_NAMESPACE
 } // end namespace Mangle
 } // end namespace swift
 

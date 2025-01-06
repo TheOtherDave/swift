@@ -8,7 +8,7 @@ var x = 0
 var y = 0
 #endif
 
-#if foo(BAR) // expected-error {{unexpected platform condition (expected 'os', 'arch', or 'swift')}}
+#if foo(BAR) // expected-error {{invalid conditional compilation expression}}
 var z = 0
 #endif
 
@@ -27,8 +27,8 @@ func h() {}
 #else /* aaa */
 #endif /* bbb */
 
-#if foo.bar() 
-      .baz() // expected-error {{unexpected platform condition (expected 'os', 'arch', or 'swift')}}
+#if foo.bar() // expected-error {{invalid conditional compilation expression}}
+      .baz()
 
 #endif
 
@@ -67,23 +67,23 @@ struct S {
 #else
 #endif
 
-#if os(ios) // expected-warning {{unknown operating system for build configuration 'os'}} expected-note{{did you mean 'iOS'?}} {{8-11=iOS}}
+#if os(ios)
 #endif
 
-#if os(uOS) // expected-warning {{unknown operating system for build configuration 'os'}} expected-note{{did you mean 'iOS'?}} {{8-11=iOS}}
+#if os(uOS)
 #endif
 
-#if os(xxxxxxd) // expected-warning {{unknown operating system for build configuration 'os'}}
-// expected-note@-1{{did you mean 'Linux'?}} {{8-15=Linux}}
-// expected-note@-2{{did you mean 'FreeBSD'?}} {{8-15=FreeBSD}}
-// expected-note@-3{{did you mean 'Android'?}} {{8-15=Android}}
-// expected-note@-4{{did you mean 'OSX'?}} {{8-15=OSX}}
+#if os(xxxxxxd)
 #endif
 
-#if arch(leg) // expected-warning {{unknown architecture for build configuration 'arch'}} expected-note{{did you mean 'arm'?}} {{10-13=arm}}
+#if os(bisionos)
+
 #endif
 
-#if _endian(mid) // expected-warning {{unknown endianness for build configuration '_endian'}} expected-note{{did you mean 'big'?}} {{13-16=big}}
+#if arch(arn)
+#endif
+
+#if _endian(mid) // expected-warning {{unknown endianness for build configuration '_endian'}}
 #endif
 
 LABEL: #if true // expected-error {{expected statement}}
@@ -97,14 +97,14 @@ func fn_j() {}
 #endif
 fn_j() // OK
 
-#if foo || bar || nonExistent() // expected-error {{expected only one argument to platform condition}}
+#if foo || bar || nonExistent() // expected-error {{invalid conditional compilation expression}}
 #endif
 
 #if FOO = false
 // expected-error @-1 {{invalid conditional compilation expression}}
 undefinedFunc() // ignored.
 #else
-undefinedFunc() // expected-error {{use of unresolved identifier 'undefinedFunc'}}
+undefinedFunc() // expected-error {{cannot find 'undefinedFunc' in scope}}
 #endif
 
 #if false
@@ -112,29 +112,51 @@ undefinedFunc() // expected-error {{use of unresolved identifier 'undefinedFunc'
 // expected-error @-1 {{invalid conditional compilation expression}}
 undefinedFunc() // ignored.
 #else
-undefinedFunc() // expected-error {{use of unresolved identifier 'undefinedFunc'}}
+undefinedFunc() // expected-error {{cannot find 'undefinedFunc' in scope}}
 #endif
 
 /// Invalid platform condition arguments don't invalidate the whole condition.
-#if !arch(tecture) && !os(ystem) && !_endian(ness)
-// expected-warning@-1 {{unknown architecture for build configuration 'arch'}}
-// expected-note@-2 {{did you mean 'arm'?}} {{11-18=arm}}
-// expected-warning@-3 {{unknown operating system for build configuration 'os'}}
-// expected-note@-4 {{did you mean 'OSX'?}} {{27-32=OSX}}
-// expected-note@-5 {{did you mean 'PS4'?}} {{27-32=PS4}}
-// expected-warning@-6 {{unknown endianness for build configuration '_endian'}}
-// expected-note@-7 {{did you mean 'big'?}} {{46-50=big}}
+// expected-warning@+1{{unknown endianness}}
+#if !arch(arn) && !os(ystem) && !_endian(ness)
 func fn_k() {}
 #endif
 fn_k()
 
-#if os(cillator) || arch(ive)
-// expected-warning@-1 {{unknown operating system for build configuration 'os'}}
-// expected-note@-2 {{did you mean 'macOS'?}} {{8-16=macOS}}
-// expected-note@-3 {{did you mean 'iOS'?}} {{8-16=iOS}}
-// expected-warning@-4 {{unknown architecture for build configuration 'arch'}}
-// expected-note@-5 {{did you mean 'arm'?}} {{26-29=arm}}
-// expected-note@-6 {{did you mean 'i386'?}} {{26-29=i386}}
+#if os(cillator) || arch(i3rm)
 func undefinedFunc() // ignored.
 #endif
-undefinedFunc() // expected-error {{use of unresolved identifier 'undefinedFunc'}}
+undefinedFunc() // expected-error {{cannot find 'undefinedFunc' in scope}}
+
+#if os(simulator)
+#endif
+
+#if arch(iOS)
+#endif
+
+#if _endian(arm64) // expected-warning {{unknown endianness for build configuration '_endian'}}
+#endif
+
+#if targetEnvironment(_ObjC)
+#endif
+
+#if os(iOS) || os(simulator)
+#endif
+
+#if arch(ios)
+#endif
+
+#if FOO
+#else if BAR
+// expected-error@-1 {{unexpected 'if' keyword following '#else' conditional compilation directive; did you mean '#elseif'?}} {{1-9=#elseif}}
+#else
+#endif
+
+#if FOO
+#else
+if true {}
+#endif // OK
+
+// rdar://83017601 Make sure we don't crash
+#if canImport()
+// expected-error@-1 {{'canImport' requires a module name}}
+#endif

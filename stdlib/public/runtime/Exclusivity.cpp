@@ -14,45 +14,33 @@
 //
 //===----------------------------------------------------------------------===//
 
+// NOTE: This should really be applied in the CMakeLists.txt.  However, we do
+// not have a way to currently specify that at the target specific level yet.
+
+#if defined(_WIN32)
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#define VCEXTRALEAN
+#endif
+
+#include "swift/Runtime/Exclusivity.h"
+#include "swift/shims/Visibility.h"
+#include "SwiftTLSContext.h"
+#include "swift/Basic/Lazy.h"
 #include "swift/Runtime/Config.h"
 #include "swift/Runtime/Debug.h"
-#include "swift/Runtime/Exclusivity.h"
+#include "swift/Runtime/EnvironmentVariables.h"
 #include "swift/Runtime/Metadata.h"
+#include "swift/Threading/ThreadLocalStorage.h"
+#include <cinttypes>
+#include <cstdio>
 #include <memory>
-#include <stdio.h>
-
-// Pick an implementation strategy.
-#ifndef SWIFT_EXCLUSIVITY_USE_THREADLOCAL
-
-// If we're using Clang, and Clang claims not to support thread_local,
-// it must be because we're on a platform that doesn't support it.
-// Use pthreads.
-// Workaround: has_feature(cxx_thread_local) is wrong on two old Apple
-// simulators. clang thinks thread_local works there, but it doesn't.
-#if TARGET_OS_SIMULATOR && !TARGET_RT_64_BIT &&                      \
-  ((TARGET_OS_IOS && __IPHONE_OS_VERSION_MIN_REQUIRED__ < 100000) || \
-   (TARGET_OS_WATCH && __WATCHOS_OS_VERSION_MIN_REQUIRED__ < 30000))
-// 32-bit iOS 9 simulator or 32-bit watchOS 2 simulator - use pthreads
-# define SWIFT_EXCLUSIVITY_USE_THREADLOCAL 0
-# define SWIFT_EXCLUSIVITY_USE_PTHREAD_SPECIFIC 1
-#elif __clang__ && !__has_feature(cxx_thread_local)
-// clang without thread_local support - use pthreads
-# define SWIFT_EXCLUSIVITY_USE_THREADLOCAL 0
-# define SWIFT_EXCLUSIVITY_USE_PTHREAD_SPECIFIC 1
-#else
-// Use thread_local
-# define SWIFT_EXCLUSIVITY_USE_THREADLOCAL 1
-# define SWIFT_EXCLUSIVITY_USE_PTHREAD_SPECIFIC 0
-#endif
-
-#endif
-
-#if SWIFT_EXCLUSIVITY_USE_PTHREAD_SPECIFIC
-#include <pthread.h>
-#endif
 
 // Pick a return-address strategy
-#if __GNUC__
+#if defined(__wasm__)
+// Wasm can't access call frame for security purposes
+#define get_return_address() ((void*) 0)
+#elif __GNUC__
 #define get_return_address() __builtin_return_address(0)
 #elif _MSC_VER
 #include <intrin.h>
@@ -63,6 +51,7 @@
 #endif
 
 using namespace swift;
+using namespace swift::runtime;
 
 bool swift::_swift_disableExclusivityChecking = false;
 
@@ -74,24 +63,56 @@ static const char *getAccessName(ExclusivityFlags flags) {
   }
 }
 
-LLVM_ATTRIBUTE_ALWAYS_INLINE
+// In asserts builds if the environment variable
+// SWIFT_DEBUG_RUNTIME_EXCLUSIVITY_LOGGING is set, emit logging information.
+#ifndef NDEBUG
+
+static inline bool isExclusivityLoggingEnabled() {
+  return runtime::environment::SWIFT_DEBUG_RUNTIME_EXCLUSIVITY_LOGGING();
+}
+
+static inline void _flockfile_stderr() {
+#if defined(_WIN32)
+  _lock_file(stderr);
+#elif defined(__wasi__)
+  // FIXME: WebAssembly/WASI doesn't support file locking yet (https://github.com/apple/swift/issues/54533).
+#else
+  flockfile(stderr);
+#endif
+}
+
+static inline void _funlockfile_stderr() {
+#if defined(_WIN32)
+  _unlock_file(stderr);
+#elif defined(__wasi__)
+  // FIXME: WebAssembly/WASI doesn't support file locking yet (https://github.com/apple/swift/issues/54533).
+#else
+  funlockfile(stderr);
+#endif
+}
+
+/// Used to ensure that logging printfs are deterministic.
+static inline void withLoggingLock(std::function<void()> func) {
+  assert(isExclusivityLoggingEnabled() &&
+         "Should only be called if exclusivity logging is enabled!");
+
+  _flockfile_stderr();
+  func();
+  fflush(stderr);
+  _funlockfile_stderr();
+}
+
+#endif
+
+SWIFT_ALWAYS_INLINE
 static void reportExclusivityConflict(ExclusivityFlags oldAction, void *oldPC,
                                       ExclusivityFlags newFlags, void *newPC,
                                       void *pointer) {
-  static std::atomic<long> reportedConflicts{0};
-  constexpr long maxReportedConflicts = 100;
-  // Don't report more that 100 conflicts. Hopefully, this will improve
-  // performance in case there are conflicts inside a tight loop.
-  if (reportedConflicts.fetch_add(1, std::memory_order_relaxed) >=
-      maxReportedConflicts) {
-    return;
-  }
-
   constexpr unsigned maxMessageLength = 100;
   constexpr unsigned maxAccessDescriptionLength = 50;
   char message[maxMessageLength];
   snprintf(message, sizeof(message),
-           "Simultaneous accesses to 0x%tx, but modification requires "
+           "Simultaneous accesses to 0x%" PRIxPTR ", but modification requires "
            "exclusive access",
            reinterpret_cast<uintptr_t>(pointer));
   fprintf(stderr, "%s.\n", message);
@@ -102,7 +123,7 @@ static void reportExclusivityConflict(ExclusivityFlags oldAction, void *oldPC,
   fprintf(stderr, "%s ", oldAccess);
   if (oldPC) {
     dumpStackTraceEntry(0, oldPC, /*shortOutput=*/true);
-    fprintf(stderr, " (0x%tx).\n", reinterpret_cast<uintptr_t>(oldPC));
+    fprintf(stderr, " (0x%" PRIxPTR ").\n", reinterpret_cast<uintptr_t>(oldPC));
   } else {
     fprintf(stderr, "<unknown>.\n");
   }
@@ -115,10 +136,9 @@ static void reportExclusivityConflict(ExclusivityFlags oldAction, void *oldPC,
   constexpr unsigned framesToSkip = 1;
   printCurrentBacktrace(framesToSkip);
 
-  bool keepGoing = isWarningOnly(newFlags);
-
   RuntimeErrorDetails::Thread secondaryThread = {
     .description = oldAccess,
+    .threadID = 0,
     .numFrames = 1,
     .frames = &oldPC
   };
@@ -129,159 +149,103 @@ static void reportExclusivityConflict(ExclusivityFlags oldAction, void *oldPC,
     .framesToSkip = framesToSkip,
     .memoryAddress = pointer,
     .numExtraThreads = 1,
-    .threads = &secondaryThread
+    .threads = &secondaryThread,
+    .numFixIts = 0,
+    .fixIts = nullptr,
+    .numNotes = 0,
+    .notes = nullptr,
   };
-  uintptr_t flags = RuntimeErrorFlagNone;
-  if (!keepGoing)
-    flags = RuntimeErrorFlagFatal;
-  _swift_reportToDebugger(flags, message, &details);
+  _swift_reportToDebugger(RuntimeErrorFlagFatal, message, &details);
+}
 
-  if (keepGoing) {
+bool AccessSet::insert(Access *access, void *pc, void *pointer,
+                       ExclusivityFlags flags) {
+#ifndef NDEBUG
+  if (isExclusivityLoggingEnabled()) {
+    withLoggingLock(
+        [&]() { fprintf(stderr, "Inserting new access: %p\n", access); });
+  }
+#endif
+  auto action = getAccessAction(flags);
+
+  for (Access *cur = Head; cur != nullptr; cur = cur->getNext()) {
+    // Ignore accesses to different values.
+    if (cur->Pointer != pointer)
+      continue;
+
+    // If both accesses are reads, it's not a conflict.
+    if (action == ExclusivityFlags::Read && action == cur->getAccessAction())
+      continue;
+
+    // Otherwise, it's a conflict.
+    reportExclusivityConflict(cur->getAccessAction(), cur->PC, flags, pc,
+                              pointer);
+
+    // 0 means no backtrace will be printed.
+    fatalError(0, "Fatal access conflict detected.\n");
+  }
+  if (!isTracking(flags)) {
+#ifndef NDEBUG
+    if (isExclusivityLoggingEnabled()) {
+      withLoggingLock([&]() { fprintf(stderr, "  Not tracking!\n"); });
+    }
+#endif
+    return false;
+  }
+
+  // Insert to the front of the array so that remove tends to find it faster.
+  access->initialize(pc, pointer, Head, action);
+  Head = access;
+#ifndef NDEBUG
+  if (isExclusivityLoggingEnabled()) {
+    withLoggingLock([&]() {
+      fprintf(stderr, "  Tracking!\n");
+      swift_dumpTrackedAccesses();
+    });
+  }
+#endif
+  return true;
+}
+
+void AccessSet::remove(Access *access) {
+  assert(Head && "removal from empty AccessSet");
+#ifndef NDEBUG
+  if (isExclusivityLoggingEnabled()) {
+    withLoggingLock(
+        [&]() { fprintf(stderr, "Removing access: %p\n", access); });
+  }
+#endif
+  auto cur = Head;
+  // Fast path: stack discipline.
+  if (cur == access) {
+    Head = cur->getNext();
     return;
   }
 
-  // 0 means no backtrace will be printed.
-  fatalError(0, "Fatal access conflict detected.\n");
-}
-
-namespace {
-
-/// A single access that we're tracking.
-struct Access {
-  void *Pointer;
-  void *PC;
-  uintptr_t NextAndAction;
-
-  enum : uintptr_t {
-    ActionMask = (uintptr_t)ExclusivityFlags::ActionMask,
-    NextMask = ~ActionMask
-  };
-
-  Access *getNext() const {
-    return reinterpret_cast<Access*>(NextAndAction & NextMask);
-  }
-
-  void setNext(Access *next) {
-    NextAndAction =
-      reinterpret_cast<uintptr_t>(next) | (NextAndAction & ActionMask);
-  }
-
-  ExclusivityFlags getAccessAction() const {
-    return ExclusivityFlags(NextAndAction & ActionMask);
-  }
-
-  void initialize(void *pc, void *pointer, Access *next,
-                  ExclusivityFlags action) {
-    Pointer = pointer;
-    PC = pc;
-    NextAndAction = reinterpret_cast<uintptr_t>(next) | uintptr_t(action);
-  }
-};
-
-static_assert(sizeof(Access) <= sizeof(ValueBuffer) &&
-              alignof(Access) <= alignof(ValueBuffer),
-              "Access doesn't fit in a value buffer!");
-
-/// A set of accesses that we're tracking.  Just a singly-linked list.
-class AccessSet {
-  Access *Head = nullptr;
-public:
-  constexpr AccessSet() {}
-
-  void insert(Access *access, void *pc, void *pointer, ExclusivityFlags flags) {
-    auto action = getAccessAction(flags);
-
-    for (Access *cur = Head; cur != nullptr; cur = cur->getNext()) {
-      // Ignore accesses to different values.
-      if (cur->Pointer != pointer)
-        continue;
-
-      // If both accesses are reads, it's not a conflict.
-      if (action == ExclusivityFlags::Read &&
-          action == cur->getAccessAction())
-        continue;
-
-      // Otherwise, it's a conflict.
-      reportExclusivityConflict(cur->getAccessAction(), cur->PC,
-                                flags, pc, pointer);
-
-      // If we're only warning, don't report multiple conflicts.
-      break;
-    }
-
-    // Insert to the front of the array so that remove tends to find it faster.
-    access->initialize(pc, pointer, Head, action);
-    Head = access;
-  }
-
-  void remove(Access *access) {
-    auto cur = Head;
-    // Fast path: stack discipline.
+  Access *last = cur;
+  for (cur = cur->getNext(); cur != nullptr; last = cur, cur = cur->getNext()) {
+    assert(last->getNext() == cur);
     if (cur == access) {
-      Head = cur->getNext();
+      last->setNext(cur->getNext());
       return;
     }
-
-    Access *last = cur;
-    for (cur = cur->getNext(); cur != nullptr;
-         last = cur, cur = cur->getNext()) {
-      assert(last->getNext() == cur);
-      if (cur == access) {
-        last->setNext(cur->getNext());
-        return;
-      }
-    }
-
-    swift_runtime_unreachable("access not found in set");
   }
-};
 
-} // end anonymous namespace
+  swift_unreachable("access not found in set");
+}
+
+#ifndef NDEBUG
+/// Only available with asserts. Intended to be used with
+/// swift_dumpTrackedAccess().
+void AccessSet::forEach(std::function<void(Access *)> action) {
+  for (auto *iter = Head; iter != nullptr; iter = iter->getNext()) {
+    action(iter);
+  }
+}
+#endif
 
 // Each of these cases should define a function with this prototype:
 //   AccessSets &getAllSets();
-
-#if SWIFT_EXCLUSIVITY_USE_THREADLOCAL
-// Use direct language support for thread-locals.
-
-static_assert(LLVM_ENABLE_THREADS, "LLVM_THREAD_LOCAL will use a global?");
-static LLVM_THREAD_LOCAL AccessSet ExclusivityAccessSet;
-
-static AccessSet &getAccessSet() {
-  return ExclusivityAccessSet;
-}
-
-#elif SWIFT_EXCLUSIVITY_USE_PTHREAD_SPECIFIC
-// Use pthread_getspecific.
-
-static pthread_key_t createAccessSetPthreadKey() {
-  pthread_key_t key;
-  int result = pthread_key_create(&key, [](void *pointer) {
-    delete static_cast<AccessSet*>(pointer);
-  });
-
-  if (result != 0) {
-    fatalError(0, "couldn't create pthread key for exclusivity: %s\n",
-               strerror(result));
-  }
-  return key;
-}
-
-static AccessSet &getAccessSet() {
-  static pthread_key_t key = createAccessSetPthreadKey();
-
-  AccessSet *set = static_cast<AccessSet*>(pthread_getspecific(key));
-  if (!set) {
-    set = new AccessSet();
-    pthread_setspecific(key, set);
-  }
-  return *set;
-}
-
-/** An access set accessed via pthread_get_specific. *************************/
-#else
-#error No implementation chosen for exclusivity!
-#endif
 
 /// Begin tracking a dynamic access.
 ///
@@ -293,16 +257,20 @@ void swift::swift_beginAccess(void *pointer, ValueBuffer *buffer,
 
   Access *access = reinterpret_cast<Access*>(buffer);
 
-  // If exclusivity checking is disabled, record in the access
-  // buffer that we didn't track anything.
+  // If exclusivity checking is disabled, record in the access buffer that we
+  // didn't track anything. pc is currently undefined in this case.
   if (_swift_disableExclusivityChecking) {
     access->Pointer = nullptr;
     return;
   }
 
-  if (!pc) pc = get_return_address();
+  // If the provided `pc` is null, then the runtime may override it for
+  // diagnostics.
+  if (!pc)
+    pc = get_return_address();
 
-  getAccessSet().insert(access, pc, pointer, flags);
+  if (!SwiftTLSContext::get().accessSet.insert(access, pc, pointer, flags))
+    access->Pointer = nullptr;
 }
 
 /// End tracking a dynamic access.
@@ -316,5 +284,27 @@ void swift::swift_endAccess(ValueBuffer *buffer) {
     return;
   }
 
-  getAccessSet().remove(access);
+  SwiftTLSContext::get().accessSet.remove(access);
 }
+
+#ifndef NDEBUG
+
+// Dump the accesses that are currently being tracked by the runtime.
+//
+// This is only intended to be used in the debugger.
+void swift::swift_dumpTrackedAccesses() {
+  auto &accessSet = SwiftTLSContext::get().accessSet;
+  if (!accessSet) {
+    fprintf(stderr, "        No Accesses.\n");
+    return;
+  }
+  accessSet.forEach([](Access *a) {
+    fprintf(stderr, "        Access. Pointer: %p. PC: %p. AccessAction: %s\n",
+            a->Pointer, a->PC, getAccessName(a->getAccessAction()));
+  });
+}
+
+#endif
+
+// Bring in the concurrency-specific exclusivity code.
+#include "ConcurrencyExclusivity.inc"

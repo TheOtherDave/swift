@@ -20,18 +20,7 @@
 using namespace swift;
 using namespace importer;
 
-/// The maximum length of any particular string in the list of known CF types.
-const size_t MaxCFTypeNameLength = 38;
 namespace {
-  // FIXME: This is only needed because llvm::StringRef doesn't have a constexpr
-  // constructor.
-  struct CFTypeListEntry {
-    unsigned char Length;
-    char Data[MaxCFTypeNameLength + 1];
-
-    operator StringRef() const { return StringRef(Data, Length); }
-  };
-
   // Quasi-lexicographic order: string length first, then string data.
   // Since we don't care about the actual length, we can use this, which
   // lets us ignore the string data a larger proportion of the time.
@@ -43,23 +32,18 @@ namespace {
   };
 } // end anonymous namespace
 
-template <size_t Len>
-static constexpr size_t string_lengthof(const char (&data)[Len]) {
-  return Len - 1;
-}
-
 /// The list of known CF types.  We use 'constexpr' to verify that this is
 /// emitted as a constant.  Note that this is expected to be sorted in
 /// quasi-lexicographic order.
-static constexpr const CFTypeListEntry KnownCFTypes[] = {
-#define CF_TYPE(NAME) { string_lengthof(#NAME), #NAME },
+static constexpr const llvm::StringLiteral KnownCFTypes[] = {
+#define CF_TYPE(NAME) #NAME,
 #define NON_CF_TYPE(NAME)
 #include "SortedCFDatabase.def"
 };
 const size_t NumKnownCFTypes = sizeof(KnownCFTypes) / sizeof(*KnownCFTypes);
 
 /// Maintain a set of known CF types.
-static bool isKnownCFTypeName(StringRef name) {
+bool CFPointeeInfo::isKnownCFTypeName(StringRef name) {
   return std::binary_search(KnownCFTypes, KnownCFTypes + NumKnownCFTypes,
                             name, SortByLengthComparator());
 }
@@ -68,6 +52,9 @@ static bool isKnownCFTypeName(StringRef name) {
 CFPointeeInfo
 CFPointeeInfo::classifyTypedef(const clang::TypedefNameDecl *typedefDecl) {
   clang::QualType type = typedefDecl->getUnderlyingType();
+
+  if (auto elaborated = type->getAs<clang::ElaboratedType>())
+    type = elaborated->desugar();
 
   if (auto subTypedef = type->getAs<clang::TypedefType>()) {
     if (classifyTypedef(subTypedef->getDecl()))
@@ -115,7 +102,7 @@ StringRef importer::getCFTypeName(
   if (auto pointee = CFPointeeInfo::classifyTypedef(decl)) {
     auto name = decl->getName();
     if (pointee.isRecord() || pointee.isTypedef())
-      if (name.endswith(SWIFT_CFTYPE_SUFFIX))
+      if (name.ends_with(SWIFT_CFTYPE_SUFFIX))
         return name.drop_back(strlen(SWIFT_CFTYPE_SUFFIX));
 
     return name;

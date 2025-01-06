@@ -23,7 +23,7 @@ class LoopRegionFunctionInfo;
 class AliasAnalysis;
 class RCIdentityFunctionInfo;
 
-/// \brief Per-Region state.
+/// Per-Region state.
 class ARCRegionState {
 public:
   // TODO: These are relatively expensive, find something else to use here.
@@ -121,11 +121,11 @@ public:
 
   /// Blot \p Ptr.
   void clearBottomUpRefCountState(SILValue Ptr) {
-    PtrToBottomUpState.blot(Ptr);
+    PtrToBottomUpState.erase(Ptr);
   }
 
   /// Blot \p Ptr.
-  void clearTopDownRefCountState(SILValue Ptr) { PtrToTopDownState.blot(Ptr); }
+  void clearTopDownRefCountState(SILValue Ptr) { PtrToTopDownState.erase(Ptr); }
 
   void clearTopDownState() { PtrToTopDownState.clear(); }
   void clearBottomUpState() { PtrToBottomUpState.clear(); }
@@ -188,9 +188,10 @@ public:
   bool processTopDown(
       AliasAnalysis *AA, RCIdentityFunctionInfo *RCIA,
       LoopRegionFunctionInfo *LRFI,
+      llvm::DenseSet<SILInstruction *> &UnmatchedRefCountInsts,
       BlotMapVector<SILInstruction *, TopDownRefCountState> &DecToIncStateMap,
       llvm::DenseMap<const LoopRegion *, ARCRegionState *> &LoopRegionState,
-      ImmutablePointerSetFactory<SILInstruction> &SetFactory);
+      ImmutablePointerSetFactory<SILInstruction *> &SetFactory);
 
   /// If this region is a block, process all instructions bottom up. Otherwise,
   /// apply the summarized bottom up information to the merged bottom up
@@ -200,9 +201,10 @@ public:
       AliasAnalysis *AA, RCIdentityFunctionInfo *RCIA,
       EpilogueARCFunctionInfo *EAFI, LoopRegionFunctionInfo *LRFI,
       bool FreezeOwnedArgEpilogueReleases,
+      llvm::DenseSet<SILInstruction *> &UnmatchedRefCountInsts,
       BlotMapVector<SILInstruction *, BottomUpRefCountState> &IncToDecStateMap,
       llvm::DenseMap<const LoopRegion *, ARCRegionState *> &RegionStateInfo,
-      ImmutablePointerSetFactory<SILInstruction> &SetFactory);
+      ImmutablePointerSetFactory<SILInstruction *> &SetFactory);
 
   void summarizeBlock(SILBasicBlock *BB);
 
@@ -219,28 +221,26 @@ public:
   void removeInterestingInst(SILInstruction *I);
 
 private:
-  void processBlockBottomUpPredTerminators(
-      const LoopRegion *R, AliasAnalysis *AA, LoopRegionFunctionInfo *LRFI,
-      ImmutablePointerSetFactory<SILInstruction> &SetFactory);
   bool processBlockBottomUp(
       const LoopRegion *R, AliasAnalysis *AA, RCIdentityFunctionInfo *RCIA,
-      EpilogueARCFunctionInfo *EAFI,
-      LoopRegionFunctionInfo *LRFI, bool FreezeOwnedArgEpilogueReleases,
+      EpilogueARCFunctionInfo *EAFI, LoopRegionFunctionInfo *LRFI,
+      bool FreezeOwnedArgEpilogueReleases,
       BlotMapVector<SILInstruction *, BottomUpRefCountState> &IncToDecStateMap,
-      ImmutablePointerSetFactory<SILInstruction> &SetFactory);
+      ImmutablePointerSetFactory<SILInstruction *> &SetFactory);
   bool processLoopBottomUp(
       const LoopRegion *R, AliasAnalysis *AA, LoopRegionFunctionInfo *LRFI,
+      RCIdentityFunctionInfo *RCIA,
       llvm::DenseMap<const LoopRegion *, ARCRegionState *> &RegionStateInfo,
-      ImmutablePointerSetFactory<SILInstruction> &SetFactory);
+      llvm::DenseSet<SILInstruction *> &UnmatchedRefCountInsts);
 
   bool processBlockTopDown(
       SILBasicBlock &BB, AliasAnalysis *AA, RCIdentityFunctionInfo *RCIA,
       BlotMapVector<SILInstruction *, TopDownRefCountState> &DecToIncStateMap,
-      ImmutablePointerSetFactory<SILInstruction> &SetFactory);
-  bool
-  processLoopTopDown(const LoopRegion *R, ARCRegionState *State,
-                     AliasAnalysis *AA, LoopRegionFunctionInfo *LRFI,
-                     ImmutablePointerSetFactory<SILInstruction> &SetFactory);
+      ImmutablePointerSetFactory<SILInstruction *> &SetFactory);
+  bool processLoopTopDown(
+      const LoopRegion *R, ARCRegionState *State, AliasAnalysis *AA,
+      LoopRegionFunctionInfo *LRFI, RCIdentityFunctionInfo *RCIA,
+      llvm::DenseSet<SILInstruction *> &UnmatchedRefCountInsts);
 
   void summarizeLoop(
       const LoopRegion *R, LoopRegionFunctionInfo *LRFI,

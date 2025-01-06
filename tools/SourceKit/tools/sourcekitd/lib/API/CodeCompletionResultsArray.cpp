@@ -12,9 +12,9 @@
 
 #include "sourcekitd/CodeCompletionResultsArray.h"
 #include "sourcekitd/CompactArray.h"
+#include "sourcekitd/DictionaryKeys.h"
 #include "SourceKit/Core/LLVM.h"
 #include "SourceKit/Support/UIdent.h"
-#include "DictionaryKeys.h"
 
 #include "llvm/Support/MemoryBuffer.h"
 
@@ -22,16 +22,11 @@ using namespace SourceKit;
 using namespace sourcekitd;
 
 struct CodeCompletionResultsArrayBuilder::Implementation {
-  CompactArrayBuilder<UIdent,
-                      StringRef,
-                      StringRef,
-                      StringRef,
-                      StringRef,
-                      Optional<StringRef>,
-                      Optional<StringRef>,
-                      Optional<StringRef>,
-                      UIdent,
-                      uint8_t> Builder;
+  CompactArrayBuilder<UIdent, StringRef, StringRef, StringRef, StringRef,
+                      std::optional<StringRef>, std::optional<StringRef>,
+                      std::optional<StringRef>, UIdent, UIdent, uint8_t,
+                      uint8_t>
+      Builder;
 };
 
 CodeCompletionResultsArrayBuilder::CodeCompletionResultsArrayBuilder()
@@ -44,20 +39,18 @@ CodeCompletionResultsArrayBuilder::~CodeCompletionResultsArrayBuilder() {
 }
 
 void CodeCompletionResultsArrayBuilder::add(
-    UIdent Kind,
-    StringRef Name,
-    StringRef Description,
-    StringRef SourceText,
-    StringRef TypeName,
-    Optional<StringRef> ModuleName,
-    Optional<StringRef> DocBrief,
-    Optional<StringRef> AssocUSRs,
-    UIdent SemanticContext,
-    bool NotRecommended,
-    unsigned NumBytesToErase) {
+    UIdent Kind, StringRef Name, StringRef Description, StringRef SourceText,
+    StringRef TypeName, std::optional<StringRef> ModuleName,
+    std::optional<StringRef> DocBrief, std::optional<StringRef> AssocUSRs,
+    UIdent SemanticContext, UIdent TypeRelation, bool NotRecommended,
+    bool IsSystem, unsigned NumBytesToErase) {
 
-  assert(NumBytesToErase <= (uint8_t(-1) >> 1));
-  uint8_t BytesAndNotRecommended = (NumBytesToErase << 1) | NotRecommended;
+  uint8_t Flags = 0;
+  Flags |= NotRecommended << 1;
+  Flags |= IsSystem << 0;
+
+  assert(NumBytesToErase <= uint8_t(-1));
+
   Impl.Builder.addEntry(Kind,
                         Name,
                         Description,
@@ -67,12 +60,15 @@ void CodeCompletionResultsArrayBuilder::add(
                         DocBrief,
                         AssocUSRs,
                         SemanticContext,
-                        BytesAndNotRecommended);
+                        TypeRelation,
+                        Flags,
+                        uint8_t(NumBytesToErase));
 }
 
 std::unique_ptr<llvm::MemoryBuffer>
 CodeCompletionResultsArrayBuilder::createBuffer() {
-  return Impl.Builder.createBuffer();
+  return Impl.Builder.createBuffer(
+      CustomBufferKind::CodeCompletionResultsArray);
 }
 
 namespace {
@@ -88,6 +84,8 @@ public:
                              const char *,
                              const char *,
                              sourcekitd_uid_t,
+                             sourcekitd_uid_t,
+                             uint8_t,
                              uint8_t> CompactArrayReaderTy;
 
   static bool
@@ -105,7 +103,9 @@ public:
     const char *DocBrief;
     const char *AssocUSRs;
     sourcekitd_uid_t SemanticContext;
-    uint8_t BytesAndNotRecommended;
+    sourcekitd_uid_t TypeRelation;
+    uint8_t Flags;
+    uint8_t NumBytesToErase;
 
     Reader.readEntries(Index,
                   Kind,
@@ -117,10 +117,12 @@ public:
                   DocBrief,
                   AssocUSRs,
                   SemanticContext,
-                  BytesAndNotRecommended);
+                  TypeRelation,
+                  Flags,
+                  NumBytesToErase);
 
-    unsigned NumBytesToErase = BytesAndNotRecommended >> 1;
-    bool NotRecommended = BytesAndNotRecommended & 0x1;
+    bool NotRecommended = Flags & 0x2;
+    bool IsSystem = Flags & 0x1;
 
 #define APPLY(K, Ty, Field)                              \
   do {                                                   \
@@ -144,9 +146,13 @@ public:
       APPLY(KeyAssociatedUSRs, String, AssocUSRs);
     }
     APPLY(KeyContext, UID, SemanticContext);
+    APPLY(KeyTypeRelation, UID, TypeRelation);
     APPLY(KeyNumBytesToErase, Int, NumBytesToErase);
     if (NotRecommended) {
       APPLY(KeyNotRecommended, Bool, NotRecommended);
+    }
+    if (IsSystem) {
+      APPLY(KeyIsSystem, Bool, IsSystem);
     }
 
     return true;

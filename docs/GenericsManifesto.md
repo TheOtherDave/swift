@@ -8,7 +8,7 @@ The "Complete Generics" goal for Swift 3 has been fairly ill-defined thus far, w
 
 This message expands upon the notion of "completing generics". It is not a plan for Swift 3, nor an official core team communication, but it collects the results of numerous discussions among the core team and Swift developers, both of the compiler and the standard library. I hope to achieve several things:
 
-* **Communicate a vision for Swift generics**, building on the [original generics design document](https://github.com/apple/swift/blob/master/docs/Generics.rst), so we have something concrete and comprehensive to discuss.
+* **Communicate a vision for Swift generics**, building on the [original generics design document](https://github.com/swiftlang/swift/blob/main/docs/archive/Generics.rst), so we have something concrete and comprehensive to discuss.
 
 * **Establish some terminology** that the Swift developers have been using for these features, so our discussions can be more productive ("oh, you're proposing what we refer to as 'conditional conformances'; go look over at this thread").
 
@@ -27,7 +27,7 @@ There are a number of restrictions to the use of generics that fall out of the i
 
 ### Recursive protocol constraints (*)
 
-*This feature has been accepted in [SE-0157](https://github.com/apple/swift-evolution/blob/master/proposals/0157-recursive-protocol-constraints.md) and is tracked by [SR-1445](https://bugs.swift.org/browse/SR-1445).*
+*This feature has been accepted in [SE-0157](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0157-recursive-protocol-constraints.md) and was released with Swift 4.1.*
 
 Currently, an associated type cannot be required to conform to its enclosing protocol (or any protocol that inherits that protocol). For example, in the standard library `SubSequence` type of a `Sequence` should itself be a `Sequence`:
 
@@ -43,7 +43,7 @@ The compiler currently rejects this protocol, which is unfortunate: it effective
 
 ### Nested generics
 
-*This feature was tracked by [SR-1446](https://bugs.swift.org/browse/SR-1446) and was released with Swift 3.1.*
+*This feature was tracked by [#44055](https://github.com/swiftlang/swift/issues/44055) and was released with Swift 3.1.*
 
 Currently, a generic type cannot be nested within another generic type, e.g.
 
@@ -57,7 +57,7 @@ There isn't much to say about this: the compiler simply needs to be improved to 
 
 ### Concrete same-type requirements
 
-*This feature was tracked by [SR-1009](https://bugs.swift.org/browse/SR-1009) and was released with Swift 3.1.*
+*This feature was tracked by [#43621](https://github.com/swiftlang/swift/issues/43621) and was released with Swift 3.1.*
 
 Currently, a constrained extension cannot use a same-type constraint to make a type parameter equivalent to a concrete type. For example:
 
@@ -77,7 +77,7 @@ There are a number of Swift declarations that currently cannot have generic para
 
 ### Generic typealiases
 
-*This feature has been accepted in [SE-0048](https://github.com/apple/swift-evolution/blob/master/proposals/0048-generic-typealias.md) and was released with Swift 3.*
+*This feature has been accepted in [SE-0048](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0048-generic-typealias.md) and was released with Swift 3.*
 
 Typealiases could be allowed to carry generic parameters. They would still be aliases (i.e., they would not introduce new types). For example:
 
@@ -88,9 +88,33 @@ var d1 = StringDictionary<Int>()
 var d2: Dictionary<String, Int> = d1 // okay: d1 and d2 have the same type, Dictionary<String, Int>
 ```
 
+### Generic associatedtypes
+
+Associatedtypes could be allowed to carry generic parameters. 
+
+```Swift
+    protocol Wrapper {
+      associatedtype Wrapped<T>
+      
+      static func wrap<T>(_ t: T) -> Wrapped<T>
+    }
+```
+
+Generic associatedtypes would support all constraints supported by the language including where clauses.  As with non-generic associatedtypes conforming types would be required to provide a nested type or typealias matching the name of the associatedtype.  However, in this case the nested type or typealias would be generic.  
+
+```Swift
+    enum OptionalWrapper {
+      typealias Wrapped<T> = Optional<T>
+      
+      static func wrap<T>(_ t: T) -> Optional<T>
+    }
+```
+
+Note: generic associatedtypes address many use cases also addressed by higher-kinded types but with lower implementation complexity.
+
 ### Generic subscripts
 
-*This feature has been accepted in [SE-0148](https://github.com/apple/swift-evolution/blob/master/proposals/0148-generic-subscripts.md), was tracked by [SR-115](https://bugs.swift.org/browse/SR-115) and was released with Swift 4.*
+*This feature has been accepted in [SE-0148](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0148-generic-subscripts.md), was tracked by [#42737](https://github.com/swiftlang/swift/issues/42737) and was released with Swift 4.*
 
 Subscripts could be allowed to have generic parameters. For example, we could introduce a generic subscript on a `Collection` that allows us to pull out the values at an arbitrary set of indices:
 
@@ -186,7 +210,7 @@ There are a number of minor extensions we can make to the generics system that d
 
 ### Arbitrary requirements in protocols (*)
 
-*This feature has been accepted in [SE-0142](https://github.com/apple/swift-evolution/blob/master/proposals/0142-associated-types-constraints.md) and was released with Swift 4.*
+*This feature has been accepted in [SE-0142](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0142-associated-types-constraints.md) and was released with Swift 4.*
 
 Currently, a new protocol can inherit from other protocols, introduce new associated types, and add new conformance constraints to associated types (by redeclaring an associated type from an inherited protocol). However, one cannot express more general constraints. Building on the example from "Recursive protocol constraints", we really want the element type of a `Sequence`'s `SubSequence` to be the same as the element type of the `Sequence`, e.g.,
 
@@ -202,7 +226,7 @@ Hanging the `where` clause off the associated type protocol is not ideal, but th
 
 ### Typealiases in protocols and protocol extensions (*)
 
-*This feature has been accepted in [SE-0092](https://github.com/apple/swift-evolution/blob/master/proposals/0092-typealiases-in-protocols.md) and was released with Swift 3.*
+*This feature has been accepted in [SE-0092](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0092-typealiases-in-protocols.md) and was released with Swift 3.*
 
 Now that associated types have their own keyword (thanks!), it's reasonable to bring back `typealias`. Again with the `Sequence` protocol:
 
@@ -229,7 +253,7 @@ var p3: Promise = getRandomPromise() // p3 has type Promise<Int, Error> due to t
 
 ### Generalized `class` constraints
 
-*This feature is a consequence of proposal [SE-0156](https://github.com/apple/swift-evolution/blob/master/proposals/0156-subclass-existentials.md) and was released with Swift 4.*
+*This feature is a consequence of proposal [SE-0156](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0156-subclass-existentials.md) and was released with Swift 4.*
 
 The `class` constraint can currently only be used for defining protocols. We could generalize it to associated type and type parameter declarations, e.g.,
 
@@ -248,6 +272,21 @@ typealias AnyObject = protocol<class>
 ```
 
 See the "Existentials" section, particularly "Generalized existentials", for more information.
+
+### Generalized supertype constraints
+
+Currently, supertype constraints may only be specified using a concrete class or protocol type.  This prevents us from abstracting over the supertype.
+
+```Swift
+protocol P {
+  associatedtype Base
+  associatedtype Derived: Base
+}
+```
+
+In the above example `Base` may be any type.  `Derived` may be the same as `Base` or may be _any_ subtype of `Base`.  All subtype relationships supported by Swift should be supported in this context including (but not limited to) classes and subclasses, existentials and conforming concrete types or refining existentials, `T?` and  `T`, `((Base) -> Void)` and `((Derived) -> Void)`, etc.
+
+Generalized supertype constraints would be accepted in all syntactic locations where generic constraints are accepted.
 
 ### Allowing subclasses to override requirements satisfied by defaults (*)
 
@@ -283,7 +322,7 @@ Unlike the minor extensions, major extensions to the generics model provide more
 
 ### Conditional conformances (*)
 
-*This feature has been accepted in [SE-0143](https://github.com/apple/swift-evolution/blob/master/proposals/0143-conditional-conformances.md) and is under development.*
+*This feature has been accepted in [SE-0143](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0143-conditional-conformances.md) and is implemented in Swift 4.2.*
 
 Conditional conformances express the notion that a generic type will conform to a particular protocol only under certain circumstances. For example, `Array` is `Equatable` only when its elements are `Equatable`:
 
@@ -346,7 +385,7 @@ public struct ZipIterator<... Iterators : IteratorProtocol> : Iterator {  // zer
   public mutating func next() -> Element? {
     if reachedEnd { return nil }
 
-    guard let values = (iterators.next()...) {   // call "next" on each of the iterators, put the results into a tuple named "values"
+    guard let values = (iterators.next()...) else {   // call "next" on each of the iterators, put the results into a tuple named "values"
       reachedEnd = true
       return nil
     }
@@ -457,7 +496,7 @@ extension Bag {
 
 ### Moving the `where` clause outside of the angle brackets (*)
 
-*Accepted in [SE-0081](https://github.com/apple/swift-evolution/blob/master/proposals/0081-move-where-expression.md) and  implemented in Swift 3.*
+*Accepted in [SE-0081](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0081-move-where-expression.md) and  implemented in Swift 3.*
 
 The `where` clause of generic functions comes very early in the declaration, although it is generally of much less concern to the client than the function parameters and result type that follow it. This is one of the things that contributes to "angle bracket blindness". For example, consider the `containsAll` signature above:
 
@@ -474,7 +513,7 @@ func containsAll<S: Sequence>(elements: S) -> Bool
 
 ### Renaming `protocol<...>` to `Any<...>` (*)
 
-*Accepted in [SE-0095](https://github.com/apple/swift-evolution/blob/master/proposals/0095-any-as-existential.md) as "Replace `protocol<P1,P2>` syntax with `P1 & P2` syntax" and implemented in Swift 3.*
+*Accepted in [SE-0095](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0095-any-as-existential.md) as "Replace `protocol<P1,P2>` syntax with `P1 & P2` syntax" and implemented in Swift 3.*
 
 The `protocol<...>` syntax is a bit of an oddity in Swift. It is used to compose protocols together, mostly to create values of existential type, e.g.,
 
@@ -655,9 +694,9 @@ foo(X())
 
 Under what circumstances should it print "P"? If `foo()` is defined within the same module as the conformance of `X` to `P`? If the call is defined within the same module as the conformance of `X` to `P`? Never? Either of the first two answers requires significant complications in the dynamic casting infrastructure to take into account the module in which a particular dynamic cast occurred (the first option) or where an existential was formed (the second option), while the third answer breaks the link between the static and dynamic type systems--none of which is an acceptable result.
 
-### Conditional conformances via protocol extensions
+### Retroactive protocol refinement
 
-We often get requests to make a protocol conform to another protocol. This is, effectively, the expansion of the notion of "Conditional conformances" to protocol extensions. For example:
+We often get requests to make protocols retroactively refine other protocols. For example:
 
 ```Swift
 protocol P {
@@ -668,8 +707,8 @@ protocol Q {
   func bar()
 }
 
-extension Q : P { // every type that conforms to Q also conforms to P
-  func foo() {    // implement "foo" requirement in terms of "bar"
+extension Q : P { // Make every type that conforms to Q also conforms to P
+  func foo() {    // Implement `P.foo` requirement in terms of `Q.bar`
     bar()
   }
 }
@@ -691,7 +730,7 @@ The generics system doesn't seem like a good candidate for a reduction in scope;
 
 ### Associated type inference
 
-*[SE-0108](https://github.com/apple/swift-evolution/blob/master/proposals/0108-remove-assoctype-inference.md), a proposal to remove this feature, was rejected.*
+*[SE-0108](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0108-remove-assoctype-inference.md), a proposal to remove this feature, was rejected.*
 
 Associated type inference is the process by which we infer the type bindings for associated types from other requirements. For example:
 
@@ -757,9 +796,9 @@ if e1 == e2 { ... } // error: e1 and e2 don't necessarily have the same dynamic 
 One explicit way to allow such operations in a type-safe manner is to introduce an "open existential" operation of some sort, which extracts and gives a name to the dynamic type stored inside an existential. For example:
 
 ```Swift
-if let storedInE1 = e1 openas T {     // T is a the type of storedInE1, a copy of the value stored in e1
-  if let storedInE2 = e2 as? T {      // is e2 also a T?
-    if storedInE1 == storedInE2 { ... } // okay: storedInT1 and storedInE2 are both of type T, which we know is Equatable
+if let storedInE1 = e1 openas T { // T is the type of storedInE1, a copy of the value stored in e1
+  if let storedInE2 = e2 as? T {  // Does e2 have type T? If so, copy its value to storedInE2
+    if storedInE1 == storedInE2 { ... } // Okay: storedInT1 and storedInE2 are both of type T, which we know is Equatable
   }
 }
 ```

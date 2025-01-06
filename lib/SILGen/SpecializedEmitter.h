@@ -20,19 +20,20 @@
 #include "swift/Basic/LLVM.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 
 namespace swift {
 class Expr;
 struct SILDeclRef;
 class SILLocation;
 class SILModule;
-class Substitution;
   
 namespace Lowering {
 class ManagedValue;
 class SGFContext;
 class SILGenFunction;
 class SILGenModule;
+class PreparedArguments;
 
 /// Some kind of specialized emitter for a builtin function.
 class SpecializedEmitter {
@@ -41,15 +42,15 @@ public:
   /// have already been emitted.
   using EarlyEmitter = ManagedValue (SILGenFunction &,
                                      SILLocation,
-                                     SubstitutionList,
-                                     Expr *argument,
+                                     SubstitutionMap,
+                                     PreparedArguments &&args,
                                      SGFContext);
 
   /// A special function for emitting a call after the arguments
   /// have already been emitted.
   using LateEmitter = ManagedValue (SILGenFunction &,
                                     SILLocation,
-                                    SubstitutionList,
+                                    SubstitutionMap,
                                     ArrayRef<ManagedValue>,
                                     SGFContext);
 
@@ -89,8 +90,8 @@ public:
     : TheKind(Kind::LateEmitter), TheLateEmitter(emitter) {}
 
   /// Try to find an appropriate emitter for the given declaration.
-  static Optional<SpecializedEmitter>
-  forDecl(SILGenModule &SGM, SILDeclRef decl);
+  static std::optional<SpecializedEmitter> forDecl(SILGenModule &SGM,
+                                                   SILDeclRef decl);
 
   bool isEarlyEmitter() const { return TheKind == Kind::EarlyEmitter; }
   EarlyEmitter *getEarlyEmitter() const {

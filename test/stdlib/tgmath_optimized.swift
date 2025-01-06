@@ -1,12 +1,21 @@
 // RUN: %empty-directory(%t)
 // RUN: %target-build-swift %s -o %t/a.out -Ounchecked
+// RUN: %target-codesign %t/a.out
 // RUN: %target-run %t/a.out
 // REQUIRES: executable_test
 
-#if os(Linux) || os(FreeBSD) || os(PS4) || os(Android)
-  import Glibc
-#else
+#if canImport(Darwin)
   import Darwin
+#elseif canImport(Glibc)
+  import Glibc
+#elseif os(WASI)
+  import WASILibc
+#elseif canImport(Android)
+  import Android
+#elseif os(Windows)
+  import CRT
+#else
+#error("Unsupported platform")
 #endif
 import StdlibUnittest
 

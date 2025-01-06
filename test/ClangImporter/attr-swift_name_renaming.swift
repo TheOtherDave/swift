@@ -9,18 +9,18 @@ func test() {
 
   // Enum name remapping.
   var color: ColorKind = CT_red
-  var color2: ColorType = CT_Red // expected-error{{'ColorType' has been renamed to 'ColorKind'}}{{15-24=ColorKind}}
+  var color2: ColorType = CT_red // expected-error{{'ColorType' has been renamed to 'ColorKind'}}{{15-24=ColorKind}}
 
   // Enumerator remapping.
   var excuse: HomeworkExcuse = .dogAteIt
-  excuse = .overslept // FIXME: should provide Fix-It  expected-error{{type 'HomeworkExcuse' has no member 'overslept'}} {{none}}
+  excuse = .overslept // expected-error{{type 'HomeworkExcuse' has no member 'overslept'; did you mean 'Overslept'?}} {{13-22=Overslept}}
   excuse = .tired
-  excuse = .tooHard // FIXME: should provide Fix-It expected-error{{type 'HomeworkExcuse' has no member 'tooHard'}} {{none}}
+  excuse = .tooHard // expected-error{{type 'HomeworkExcuse' has no member 'tooHard'; did you mean 'TooHard'?}} {{13-20=TooHard}}
   excuse = .challenging
 
   // Typedef-of-anonymous-type-name renaming
   var p = Point()
-  var p2 = PointType() // FIXME: should provide Fix-It expected-error{{use of unresolved identifier 'PointType'}} {{none}}
+  var p2 = PointType() // FIXME: should provide Fix-It expected-error{{cannot find 'PointType' in scope}} {{none}}
 
   // Field name remapping
   p.x = 7

@@ -69,7 +69,7 @@ namespace irgen {
   OwnedAddress emitBoxedExistentialContainerAllocation(IRGenFunction &IGF,
                                   SILType destType,
                                   CanType formalSrcType,
-                                 ArrayRef<ProtocolConformanceRef> conformances);
+                                  ArrayRef<ProtocolConformanceRef> conformances);
   
   /// Deallocate a boxed existential container with uninitialized space to hold
   /// a value of a given type.
@@ -95,9 +95,24 @@ namespace irgen {
   void emitDeallocateBoxedOpaqueExistentialBuffer(IRGenFunction &IGF,
                                                   SILType existentialType,
                                                   Address existentialContainer);
+
+  
+   /// Free the storage for an opaque existential in the existential
+   /// container.
+   /// If the value is not stored inline, this will free the box for the
+   /// value.
+   void emitDestroyBoxedOpaqueExistentialBuffer(IRGenFunction &IGF,
+                                                SILType existentialType,
+                                                Address existentialContainer);
+
   Address emitOpaqueBoxedExistentialProjection(
       IRGenFunction &IGF, OpenedExistentialAccess accessKind, Address base,
       SILType existentialType, CanArchetypeType openedArchetype);
+
+  /// Return the address of the reference values within a class existential.
+  Address emitClassExistentialValueAddress(IRGenFunction &IGF,
+                                           Address existential,
+                                           SILType baseTy);
 
   /// Extract the instance pointer from a class existential value.
   ///
@@ -137,7 +152,8 @@ namespace irgen {
   /// Emit the existential metatype of a class existential value.
   void emitMetatypeOfClassExistential(IRGenFunction &IGF,
                                       Explosion &value, SILType metatypeType,
-                                      SILType existentialType, Explosion &out);
+                                      SILType existentialType,
+                                      Explosion &out);
 
   /// Emit the existential metatype of a boxed existential value.
   void emitMetatypeOfBoxedExistential(IRGenFunction &IGF, Explosion &value,

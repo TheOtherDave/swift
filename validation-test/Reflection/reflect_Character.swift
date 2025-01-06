@@ -1,11 +1,13 @@
 // RUN: %empty-directory(%t)
 // RUN: %target-build-swift -lswiftSwiftReflectionTest %s -o %t/reflect_Character
-// RUN: %target-run %target-swift-reflection-test %t/reflect_Character 2>&1 | %FileCheck %s --check-prefix=CHECK-%target-ptrsize
-// REQUIRES: objc_interop
-// REQUIRES: executable_test
+// RUN: %target-codesign %t/reflect_Character
 
-// FIXME: https://bugs.swift.org/browse/SR-2808
-// XFAIL: resilient_stdlib
+// RUN: %target-run %target-swift-reflection-test %t/reflect_Character | %FileCheck %s --check-prefix=CHECK-%target-ptrsize %add_num_extra_inhabitants
+
+// REQUIRES: reflection_test_support
+// REQUIRES: executable_test
+// UNSUPPORTED: use_os_stdlib
+// UNSUPPORTED: asan
 
 import SwiftReflectionTest
 
@@ -24,35 +26,33 @@ reflect(object: obj)
 // CHECK-64: Type reference:
 // CHECK-64: (class reflect_Character.TestClass)
 
-// CHECK-64: Type info:
-// CHECK-64: (class_instance size=24 alignment=8 stride=24 num_extra_inhabitants=0
-// CHECK-64-NEXT:  (field name=t offset=16
-// CHECK-64-NEXT:    (struct size=8 alignment=8 stride=8 num_extra_inhabitants=0
-// CHECK-64-NEXT:      (field name=_representation offset=0
-// CHECK-64-NEXT:        (multi_payload_enum size=8 alignment=8 stride=8 num_extra_inhabitants=0
-// CHECK-64-NEXT:          (field name=smallUTF16 offset=0
-// CHECK-64-NEXT:            (builtin size=8 alignment=8 stride=8 num_extra_inhabitants=2147483647))
-// CHECK-64-NEXT:          (field name=large offset=0
-// CHECK-64-NEXT:            (struct size=8 alignment=8 stride=8 num_extra_inhabitants=2147483647
-// CHECK-64-NEXT:              (field name=_nativeBuffer offset=0
-// CHECK-64-NEXT:                (reference kind=strong refcounting=native)))))))))
+// CHECK-64-LABEL: Type info:
+// CHECK-64: (class_instance size=32 alignment=8 stride=32 num_extra_inhabitants=0 bitwise_takable=1
+// CHECK-64-NEXT: (field name=t offset=16
+// CHECK-64-NEXT:   (struct size=16 alignment=8 stride=16 num_extra_inhabitants=[[#num_extra_inhabitants_64bit]] bitwise_takable=1
+// CHECK-64-NEXT:     (field name=_str offset=0
+// CHECK-64-NEXT:       (struct size=16 alignment=8 stride=16 num_extra_inhabitants=[[#num_extra_inhabitants_64bit]] bitwise_takable=1
+// CHECK-64-NEXT:         (field name=_guts offset=0
+// CHECK-64-NEXT:           (struct size=16 alignment=8 stride=16 num_extra_inhabitants=[[#num_extra_inhabitants_64bit]] bitwise_takable=1
+// CHECK-64-NEXT:             (field name=_object offset=0
+// CHECK-64-NEXT:               (struct size=16 alignment=8 stride=16 num_extra_inhabitants=[[#num_extra_inhabitants_64bit]] bitwise_takable=1
+// CHECK-64-NEXT:                 (field name=_countAndFlagsBits offset=0
+// CHECK-64-NEXT:                   (struct size=8 alignment=8 stride=8 num_extra_inhabitants=0 bitwise_takable=1
+// CHECK-64-NEXT:                     (field name=_value offset=0
+// CHECK-64-NEXT:                       (builtin size=8 alignment=8 stride=8 num_extra_inhabitants=0 bitwise_takable=1))))
+// CHECK-64-NEXT:                 (field name=_object offset=8
+// CHECK-64-NEXT:                   (builtin size=8 alignment=8 stride=8 num_extra_inhabitants=[[#num_extra_inhabitants_64bit]] bitwise_takable=1)))))))))))
 
 // CHECK-32: Reflecting an object.
 // CHECK-32: Type reference:
 // CHECK-32: (class reflect_Character.TestClass)
 
 // CHECK-32: Type info:
-// CHECK-32-NEXT: (class_instance size=16 alignment=8 stride=16 num_extra_inhabitants=0
+// CHECK-32-NEXT: (class_instance size=20 alignment=4 stride=20 num_extra_inhabitants=0 bitwise_takable=1
 // CHECK-32-NEXT:   (field name=t offset=8
-// CHECK-32-NEXT:     (struct size=8 alignment=8 stride=8 num_extra_inhabitants=0
-// CHECK-32-NEXT:       (field name=_representation offset=0
-// CHECK-32-NEXT:         (multi_payload_enum size=8 alignment=8 stride=8 num_extra_inhabitants=0
-// CHECK-32-NEXT:           (field name=smallUTF16 offset=0
-// CHECK-32-NEXT:             (builtin size=8 alignment=8 stride=8 num_extra_inhabitants=2147483647))
-// CHECK-32-NEXT:           (field name=large offset=0
-// CHECK-32-NEXT:             (struct size=4 alignment=4 stride=4 num_extra_inhabitants=4096
-// CHECK-32-NEXT:               (field name=_nativeBuffer offset=0
-// CHECK-32-NEXT:                 (reference kind=strong refcounting=native)))))))))
+// CHECK-32-NEXT:     (struct size=12 alignment=4 stride=12 num_extra_inhabitants=253 bitwise_takable=1
+// CHECK-32-NEXT:       (field name=_str offset=0
+// CHECK-32-NEXT:         (struct size=12 alignment=4 stride=12 num_extra_inhabitants=253 bitwise_takable=1
 
 doneReflecting()
 

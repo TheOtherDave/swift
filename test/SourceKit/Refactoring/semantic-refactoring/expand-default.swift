@@ -9,8 +9,8 @@ func foo(e : E) {
   }
 }
 
-// RUN: rm -rf %t.result && mkdir -p %t.result
-// RUN: %sourcekitd-test -req=expand-default -pos=7:7 %s -- %s > %t.result/expand-default.swift.expected
-// RUN: diff -u %S/expand-default.swift.expected %t.result/expand-default.swift.expected
+// RUN: %empty-directory(%t.result)
+// RUN: %sourcekitd-test -req=refactoring.expand.default -pos=7:7 %s -- %s > %t.result/expand-default.swift.expected
+// RUN: %diff -u %S/expand-default.swift.expected %t.result/expand-default.swift.expected
 
-// REQUIRES-ANY: OS=macosx, OS=linux-gnu
+// REQUIRES: OS=macosx || OS=linux-gnu

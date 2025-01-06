@@ -18,6 +18,7 @@
 #define SWIFT_SILGEN_SCOPE_H
 
 #include "SILGenFunction.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILDebugScope.h"
 #include "Cleanup.h"
 
@@ -29,20 +30,44 @@ namespace Lowering {
 class LLVM_LIBRARY_VISIBILITY Scope {
   CleanupManager &cleanups;
   CleanupsDepth depth;
-  CleanupsDepth savedInnermostScope;
+  Scope *savedInnermostScope;
   CleanupLocation loc;
+
+  friend class CleanupManager;
 
 public:
   explicit Scope(CleanupManager &cleanups, CleanupLocation loc)
       : cleanups(cleanups), depth(cleanups.getCleanupsDepth()),
         savedInnermostScope(cleanups.innermostScope), loc(loc) {
     assert(depth.isValid());
-    cleanups.stack.checkIterator(cleanups.innermostScope);
-    cleanups.innermostScope = depth;
+    cleanups.innermostScope = this;
+    if (savedInnermostScope)
+      cleanups.stack.checkIterator(savedInnermostScope->depth);
+  }
+
+  Scope(const Scope &other) = delete;
+  Scope &operator=(const Scope &other) = delete;
+
+  Scope(Scope &&other)
+      : cleanups(other.cleanups), depth(other.depth),
+        savedInnermostScope(other.savedInnermostScope), loc(other.loc) {
+    // Invalidate other.
+    other.depth = CleanupsDepth::invalid();
+  }
+
+  Scope &operator=(Scope &&other) {
+    depth = other.depth;
+    savedInnermostScope = other.savedInnermostScope;
+    loc = other.loc;
+
+    // Invalidate other.
+    other.depth = CleanupsDepth::invalid();
+
+    return *this;
   }
 
   explicit Scope(SILGenFunction &SGF, SILLocation loc)
-      : Scope(SGF.Cleanups, CleanupLocation::get(loc)) {}
+      : Scope(SGF.Cleanups, CleanupLocation(loc)) {}
 
   void pop() {
     assert(depth.isValid() && "popping a scope twice!");
@@ -54,6 +79,9 @@ public:
     if (depth.isValid())
       popImpl();
   }
+
+  /// Verify that the invariants of this scope still hold.
+  void verify();
 
   bool isValid() const { return depth.isValid(); }
 
@@ -69,6 +97,30 @@ private:
   /// Internal private implementation of popImpl so we can use it in Scope::pop
   /// and in Scope's destructor.
   void popImpl();
+};
+
+/// A scope that must be manually popped by the using code. If not
+/// popped, the destructor asserts.
+class LLVM_LIBRARY_VISIBILITY AssertingManualScope {
+  Scope scope;
+
+public:
+  explicit AssertingManualScope(CleanupManager &cleanups, CleanupLocation loc)
+      : scope(cleanups, loc) {}
+
+  AssertingManualScope(AssertingManualScope &&other)
+      : scope(std::move(other.scope)) {}
+
+  AssertingManualScope &operator=(AssertingManualScope &&other) {
+    scope = std::move(other.scope);
+    return *this;
+  }
+
+  ~AssertingManualScope() {
+    assert(!scope.isValid() && "Unpopped manual scope?!");
+  }
+
+  void pop() && { scope.pop(); }
 };
 
 /// A FullExpr is a RAII object recording that a full-expression has
@@ -103,7 +155,7 @@ class LLVM_LIBRARY_VISIBILITY DebugScope {
   SILGenFunction &SGF;
 
 public:
-  explicit DebugScope(SILGenFunction &SGF, CleanupLocation loc) : SGF(SGF) {
+  explicit DebugScope(SILGenFunction &SGF, SILLocation loc) : SGF(SGF) {
     SGF.enterDebugScope(loc);
   }
 

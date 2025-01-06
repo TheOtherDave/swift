@@ -13,18 +13,22 @@
 #ifndef SWIFT_IDE_UTILS_H
 #define SWIFT_IDE_UTILS_H
 
-#include "llvm/ADT/PointerIntPair.h"
-#include "swift/Basic/LLVM.h"
 #include "swift/AST/ASTNode.h"
-#include "swift/AST/DeclNameLoc.h"
-#include "swift/AST/Module.h"
 #include "swift/AST/ASTPrinter.h"
+#include "swift/AST/DeclNameLoc.h"
+#include "swift/AST/Effects.h"
+#include "swift/AST/Expr.h"
+#include "swift/AST/Module.h"
+#include "swift/Basic/LLVM.h"
+#include "swift/IDE/IDEBridging.h"
 #include "swift/IDE/SourceEntityWalker.h"
 #include "swift/Parse/Token.h"
+#include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/VirtualFileSystem.h"
+#include <functional>
 #include <memory>
 #include <string>
-#include <functional>
 #include <vector>
 
 namespace llvm {
@@ -38,16 +42,15 @@ namespace clang {
 }
 
 namespace swift {
-  class ModuleDecl;
   class ValueDecl;
   class ASTContext;
-  class CompilerInvocation;
   class SourceFile;
   class TypeDecl;
   class SourceLoc;
   class Type;
   class Decl;
   class DeclContext;
+  class CallExpr;
   class ClangNode;
   class ClangImporter;
   class Token;
@@ -77,24 +80,19 @@ struct SourceCompleteResult {
 };
 
 SourceCompleteResult
-isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf);
-SourceCompleteResult isSourceInputComplete(StringRef Text);
-
-bool initInvocationByClangArguments(ArrayRef<const char *> ArgList,
-                                    CompilerInvocation &Invok,
-                                    std::string &Error);
+isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf,
+                      SourceFileKind SFKind, const LangOptions &LangOpts);
+SourceCompleteResult isSourceInputComplete(StringRef Text,
+                                           SourceFileKind SFKind,
+                                           const LangOptions &LangOpts);
 
 /// Visits all overridden declarations exhaustively from VD, including protocol
 /// conformances and clang declarations.
 void walkOverriddenDecls(const ValueDecl *VD,
-                         std::function<void(llvm::PointerUnion<
+                         llvm::function_ref<void(llvm::PointerUnion<
                              const ValueDecl*, const clang::NamedDecl*>)> Fn);
 
 void collectModuleNames(StringRef SDKPath, std::vector<std::string> &Modules);
-
-std::string getSDKName(StringRef Path);
-
-std::string getSDKVersion(StringRef Path);
 
 struct PlaceholderOccurrence {
   /// The complete placeholder string.
@@ -118,27 +116,7 @@ std::unique_ptr<llvm::MemoryBuffer>
   replacePlaceholders(std::unique_ptr<llvm::MemoryBuffer> InputBuf,
                       bool *HadPlaceholder = nullptr);
 
-void getLocationInfo(
-    const ValueDecl *VD,
-    llvm::Optional<std::pair<unsigned, unsigned>> &DeclarationLoc,
-    StringRef &Filename);
-
-void getLocationInfoForClangNode(ClangNode ClangNode,
-                                 ClangImporter *Importer,
-       llvm::Optional<std::pair<unsigned, unsigned>> &DeclarationLoc,
-                                 StringRef &Filename);
-
-Optional<std::pair<unsigned, unsigned>> parseLineCol(StringRef LineCol);
-
-Decl *getDeclFromUSR(ASTContext &context, StringRef USR, std::string &error);
-Decl *getDeclFromMangledSymbolName(ASTContext &context, StringRef mangledName,
-                                   std::string &error);
-
-Type getTypeFromMangledTypename(ASTContext &Ctx, StringRef mangledName,
-                                std::string &error);
-
-Type getTypeFromMangledSymbolname(ASTContext &Ctx, StringRef mangledName,
-                                  std::string &error);
+std::optional<std::pair<unsigned, unsigned>> parseLineCol(StringRef LineCol);
 
 class XMLEscapingPrinter : public StreamPrinter {
   public:
@@ -155,167 +133,185 @@ enum class CursorInfoKind {
   StmtStart,
 };
 
-struct ResolvedCursorInfo {
+/// Base class of more specialized \c ResolvedCursorInfos that also represents
+/// and \c Invalid cursor info.
+struct ResolvedCursorInfo : public llvm::RefCountedBase<ResolvedCursorInfo> {
+protected:
   CursorInfoKind Kind = CursorInfoKind::Invalid;
-  SourceFile *SF;
+  SourceFile *SF = nullptr;
   SourceLoc Loc;
-  ValueDecl *ValueD = nullptr;
-  TypeDecl *CtorTyRef = nullptr;
-  ExtensionDecl *ExtTyRef = nullptr;
-  ModuleEntity Mod;
-  bool IsRef = true;
-  bool IsKeywordArgument = false;
-  Type Ty;
-  DeclContext *DC = nullptr;
-  Type ContainerType;
-  Stmt *TrailingStmt = nullptr;
-  Expr *TrailingExpr = nullptr;
 
+protected:
+  ResolvedCursorInfo(CursorInfoKind Kind, SourceFile *SF, SourceLoc Loc)
+      : Kind(Kind), SF(SF), Loc(Loc) {}
+
+public:
   ResolvedCursorInfo() = default;
   ResolvedCursorInfo(SourceFile *SF) : SF(SF) {}
-  
-  void setValueRef(ValueDecl *ValueD,
-                   TypeDecl *CtorTyRef,
-                   ExtensionDecl *ExtTyRef,
-                   bool IsRef,
-                   Type Ty,
-                   Type ContainerType) {
-    Kind = CursorInfoKind::ValueRef;
-    this->ValueD = ValueD;
-    this->CtorTyRef = CtorTyRef;
-    this->ExtTyRef = ExtTyRef;
-    this->IsRef = IsRef;
-    this->Ty = Ty;
-    this->DC = ValueD->getDeclContext();
-    this->ContainerType = ContainerType;
-  }
-  void setModuleRef(ModuleEntity Mod) {
-    Kind = CursorInfoKind::ModuleRef;
-    this->Mod = Mod;
-  }
-  void setTrailingStmt(Stmt *TrailingStmt) {
-    Kind = CursorInfoKind::StmtStart;
-    this->TrailingStmt = TrailingStmt;
-  }
-  void setTrailingExpr(Expr* TrailingExpr) {
-    Kind = CursorInfoKind::ExprStart;
-    this->TrailingExpr = TrailingExpr;
+
+  CursorInfoKind getKind() const { return Kind; }
+
+  SourceFile *getSourceFile() const { return SF; }
+
+  SourceLoc getLoc() const { return Loc; }
+  void setLoc(SourceLoc Loc) { this->Loc = Loc; }
+
+  friend bool operator==(const ResolvedCursorInfo &lhs,
+                         const ResolvedCursorInfo &rhs) {
+    return lhs.SF == rhs.SF &&
+      lhs.Loc.getOpaquePointerValue() == rhs.Loc.getOpaquePointerValue();
   }
 
   bool isValid() const { return !isInvalid(); }
   bool isInvalid() const { return Kind == CursorInfoKind::Invalid; }
 };
 
-class CursorInfoResolver : public SourceEntityWalker {
-  SourceFile &SrcFile;
-  SourceLoc LocToResolve;
-  ResolvedCursorInfo CursorInfo;
-  Type ContainerType;
-  llvm::SmallVector<Expr*, 4> TrailingExprStack;
+typedef llvm::IntrusiveRefCntPtr<ResolvedCursorInfo> ResolvedCursorInfoPtr;
 
-public:
-  explicit CursorInfoResolver(SourceFile &SrcFile) :
-    SrcFile(SrcFile), CursorInfo(&SrcFile) {}
-  ResolvedCursorInfo resolve(SourceLoc Loc);
-  SourceManager &getSourceMgr() const;
+struct ResolvedValueRefCursorInfo : public ResolvedCursorInfo {
 private:
-  bool walkToExprPre(Expr *E) override;
-  bool walkToExprPost(Expr *E) override;
-  bool walkToDeclPre(Decl *D, CharSourceRange Range) override;
-  bool walkToDeclPost(Decl *D) override;
-  bool walkToStmtPre(Stmt *S) override;
-  bool walkToStmtPost(Stmt *S) override;
-  bool visitDeclReference(ValueDecl *D, CharSourceRange Range,
-                          TypeDecl *CtorTyRef, ExtensionDecl *ExtTyRef, Type T,
-                          ReferenceMetaData Data) override;
-  bool visitCallArgName(Identifier Name, CharSourceRange Range,
-                        ValueDecl *D) override;
-  bool visitDeclarationArgumentName(Identifier Name, SourceLoc StartLoc,
-                                    ValueDecl *D) override;
-  bool visitModuleReference(ModuleEntity Mod, CharSourceRange Range) override;
-  bool rangeContainsLoc(SourceRange Range) const {
-    return getSourceMgr().rangeContainsTokenLoc(Range, LocToResolve);
-  }
-  bool isDone() const { return CursorInfo.isValid(); }
-  bool tryResolve(ValueDecl *D, TypeDecl *CtorTyRef, ExtensionDecl *ExtTyRef,
-                  SourceLoc Loc, bool IsRef, Type Ty = Type());
-  bool tryResolve(ModuleEntity Mod, SourceLoc Loc);
-  bool tryResolve(Stmt *St);
-  bool visitSubscriptReference(ValueDecl *D, CharSourceRange Range,
-                               Optional<AccessKind> AccKind,
-                               bool IsOpenBracket) override;
-};
+  ValueDecl *ValueD = nullptr;
+  TypeDecl *CtorTyRef = nullptr;
+  ExtensionDecl *ExtTyRef = nullptr;
+  bool IsRef = true;
+  Type SolutionSpecificInterfaceType;
+  Type ContainerType;
+  std::optional<std::pair<const CustomAttr *, Decl *>> CustomAttrRef =
+      std::nullopt;
 
-struct UnresolvedLoc {
-  SourceLoc Loc;
-  bool ResolveArgLocs;
-};
-
-enum class LabelRangeType {
-  None,
-  CallArg,    // foo([a: ]2) or .foo([a: ]String)
-  Param,  // func([a b]: Int)
-  NoncollapsibleParam, // subscript([a a]: Int)
-  Selector,   // #selector(foo.func([a]:))
-};
-
-struct ResolvedLoc {
-  ASTWalker::ParentTy Node;
-  CharSourceRange Range;
-  std::vector<CharSourceRange> LabelRanges;
-  LabelRangeType LabelType;
-  bool IsActive;
-  bool IsInSelector;
-};
-
-
-/// Finds the parse-only AST nodes and corresponding name and param/argument
-/// label ranges for a given list of input name start locations
-///
-/// Resolved locations also indicate the nature of the matched occurrence (e.g.
-/// whether it is within active/inactive code, or a selector or string literal).
-class NameMatcher: public ASTWalker {
-  SourceFile &SrcFile;
-  std::vector<UnresolvedLoc> LocsToResolve;
-  std::vector<ResolvedLoc> ResolvedLocs;
-  ArrayRef<Token> TokensToCheck;
-  unsigned InactiveConfigRegionNestings = 0;
-  unsigned SelectorNestings = 0;
-
-  SourceManager &getSourceMgr() const;
-
-  SourceLoc nextLoc() const;
-  bool isDone() const { return LocsToResolve.empty(); };
-  bool isActive() const { return !InactiveConfigRegionNestings; };
-  bool isInSelector() const { return SelectorNestings; };
-  bool checkComments();
-  void skipLocsBefore(SourceLoc Start);
-  bool shouldSkip(Expr *E);
-  bool shouldSkip(SourceRange Range);
-  bool shouldSkip(CharSourceRange Range);
-  bool tryResolve(ASTWalker::ParentTy Node, SourceLoc NameLoc);
-  bool tryResolve(ASTWalker::ParentTy Node, DeclNameLoc NameLoc, Expr *Arg,
-                  bool checkParentForLabels = false);
-  bool tryResolve(ASTWalker::ParentTy Node, SourceLoc NameLoc, LabelRangeType RangeType,
-                  ArrayRef<CharSourceRange> LabelLocs);
-
-  std::pair<bool, Expr*> walkToExprPre(Expr *E) override;
-  Expr* walkToExprPost(Expr *E) override;
-  bool walkToDeclPre(Decl *D) override;
-  bool walkToDeclPost(Decl *D) override;
-  std::pair<bool, Stmt*> walkToStmtPre(Stmt *S) override;
-  Stmt* walkToStmtPost(Stmt *S) override;
-  bool walkToTypeLocPre(TypeLoc &TL) override;
-  bool walkToTypeLocPost(TypeLoc &TL) override;
-  bool walkToTypeReprPre(TypeRepr *T) override;
-  bool walkToTypeReprPost(TypeRepr *T) override;
-  std::pair<bool, Pattern*> walkToPatternPre(Pattern *P) override;
-  bool shouldWalkIntoGenericParams() override { return true; }
-
+  bool IsKeywordArgument = false;
+  /// It this is a ref, whether it is "dynamic". See \c ide::isDynamicRef.
+  bool IsDynamic = false;
+  /// If this is a dynamic ref, the types of the base (multiple in the case of
+  /// protocol composition).
+  SmallVector<NominalTypeDecl *> ReceiverTypes;
+  /// Declarations that were shadowed by \c ValueD using a shorthand syntax
+  /// that names both the newly declared variable and the referenced variable
+  /// by the same identifier in the source text. This includes shorthand
+  /// closure captures (`[foo]`) and shorthand if captures
+  /// (`if let foo {`). Ordered from innermost to outermost shadows.
+  ///
+  /// Decls that are shadowed using shorthand syntax should be reported as
+  /// additional cursor info results.
+  SmallVector<ValueDecl *> ShorthandShadowedDecls;
 
 public:
-  explicit NameMatcher(SourceFile &SrcFile) : SrcFile(SrcFile) { }
-  std::vector<ResolvedLoc> resolve(ArrayRef<UnresolvedLoc> Locs, ArrayRef<Token> Tokens);
+  ResolvedValueRefCursorInfo() = default;
+  explicit ResolvedValueRefCursorInfo(
+      SourceFile *SF, SourceLoc Loc, ValueDecl *ValueD, TypeDecl *CtorTyRef,
+      ExtensionDecl *ExtTyRef, bool IsRef, Type SolutionSpecificInterfaceType,
+      Type ContainerType,
+      std::optional<std::pair<const CustomAttr *, Decl *>> CustomAttrRef,
+      bool IsKeywordArgument, bool IsDynamic,
+      SmallVector<NominalTypeDecl *> ReceiverTypes,
+      SmallVector<ValueDecl *> ShorthandShadowedDecls)
+      : ResolvedCursorInfo(CursorInfoKind::ValueRef, SF, Loc), ValueD(ValueD),
+        CtorTyRef(CtorTyRef), ExtTyRef(ExtTyRef), IsRef(IsRef),
+        SolutionSpecificInterfaceType(SolutionSpecificInterfaceType),
+        ContainerType(ContainerType), CustomAttrRef(CustomAttrRef),
+        IsKeywordArgument(IsKeywordArgument), IsDynamic(IsDynamic),
+        ReceiverTypes(ReceiverTypes),
+        ShorthandShadowedDecls(ShorthandShadowedDecls) {}
+
+  ValueDecl *getValueD() const { return ValueD; }
+
+  ExtensionDecl *getExtTyRef() const { return ExtTyRef; }
+
+  TypeDecl *getCtorTyRef() const { return CtorTyRef; }
+
+  bool isRef() const { return IsRef; }
+
+  Type getSolutionSpecificInterfaceType() const {
+    return SolutionSpecificInterfaceType;
+  }
+
+  Type getContainerType() const { return ContainerType; }
+
+  bool isKeywordArgument() const { return IsKeywordArgument; }
+  void setIsKeywordArgument(bool IsKeywordArgument) {
+    this->IsKeywordArgument = IsKeywordArgument;
+  }
+
+  bool isDynamic() const { return this->IsDynamic; }
+
+  ArrayRef<NominalTypeDecl *> getReceiverTypes() const {
+    return this->ReceiverTypes;
+  }
+
+  ArrayRef<ValueDecl *> getShorthandShadowedDecls() const {
+    return this->ShorthandShadowedDecls;
+  };
+  void setShorthandShadowedDecls(
+      const SmallVector<ValueDecl *> &ShorthandShadowedDecls) {
+    this->ShorthandShadowedDecls = ShorthandShadowedDecls;
+  };
+
+  ValueDecl *typeOrValue() { return CtorTyRef ? CtorTyRef : ValueD; }
+
+  std::optional<std::pair<const CustomAttr *, Decl *>>
+  getCustomAttrRef() const {
+    return CustomAttrRef;
+  }
+
+  static bool classof(const ResolvedCursorInfo *Info) {
+    return Info->getKind() == CursorInfoKind::ValueRef;
+  }
+};
+
+typedef llvm::IntrusiveRefCntPtr<ResolvedValueRefCursorInfo>
+    ResolvedValueRefCursorInfoPtr;
+
+struct ResolvedModuleRefCursorInfo : public ResolvedCursorInfo {
+private:
+  ModuleEntity Mod;
+
+public:
+  ResolvedModuleRefCursorInfo(SourceFile *SF, SourceLoc Loc, ModuleEntity Mod)
+      : ResolvedCursorInfo(CursorInfoKind::ModuleRef, SF, Loc), Mod(Mod) {}
+
+  ModuleEntity getMod() const { return Mod; }
+
+  static bool classof(const ResolvedCursorInfo *Info) {
+    return Info->getKind() == CursorInfoKind::ModuleRef;
+  }
+};
+
+struct ResolvedExprStartCursorInfo : public ResolvedCursorInfo {
+private:
+  Expr *TrailingExpr = nullptr;
+
+public:
+  ResolvedExprStartCursorInfo(SourceFile *SF, SourceLoc Loc, Expr *TrailingExpr)
+      : ResolvedCursorInfo(CursorInfoKind::ExprStart, SF, Loc),
+        TrailingExpr(TrailingExpr) {}
+
+  Expr *getTrailingExpr() const { return TrailingExpr; }
+
+  static bool classof(const ResolvedCursorInfo *Info) {
+    return Info->getKind() == CursorInfoKind::ExprStart;
+  }
+};
+
+struct ResolvedStmtStartCursorInfo : public ResolvedCursorInfo {
+  Stmt *TrailingStmt = nullptr;
+
+  ResolvedStmtStartCursorInfo(SourceFile *SF, SourceLoc Loc, Stmt *TrailingStmt)
+      : ResolvedCursorInfo(CursorInfoKind::StmtStart, SF, Loc),
+        TrailingStmt(TrailingStmt) {}
+
+  Stmt *getTrailingStmt() const { return TrailingStmt; }
+
+  static bool classof(const ResolvedCursorInfo *Info) {
+    return Info->getKind() == CursorInfoKind::StmtStart;
+  }
+};
+
+void simple_display(llvm::raw_ostream &out, ResolvedCursorInfoPtr info);
+
+/// Used by NameMatcher to track parent CallExprs when walking a checked AST.
+struct CallingParent {
+  Expr *ApplicableTo;
+  CallExpr *Call;
 };
 
 enum class RangeKind : int8_t {
@@ -335,7 +331,7 @@ struct DeclaredDecl {
   bool ReferredAfterRange;
   DeclaredDecl(ValueDecl* VD) : VD(VD), ReferredAfterRange(false) {}
   DeclaredDecl(): DeclaredDecl(nullptr) {}
-  bool operator==(const DeclaredDecl& other);
+  bool operator==(const DeclaredDecl& other) const;
 };
 
 struct ReferencedDecl {
@@ -372,7 +368,7 @@ struct ResolvedRangeInfo {
   ArrayRef<Token> TokensInRange;
   CharSourceRange ContentRange;
   bool HasSingleEntry;
-  bool ThrowingUnhandledError;
+  PossibleEffects UnhandledEffects;
   OrphanKind Orphan;
 
   // The topmost ast nodes contained in the given range.
@@ -386,7 +382,7 @@ struct ResolvedRangeInfo {
                     ArrayRef<Token> TokensInRange,
                     DeclContext* RangeContext,
                     Expr *CommonExprParent, bool HasSingleEntry,
-                    bool ThrowingUnhandledError,
+                    PossibleEffects UnhandledEffects,
                     OrphanKind Orphan, ArrayRef<ASTNode> ContainedNodes,
                     ArrayRef<DeclaredDecl> DeclaredDecls,
                     ArrayRef<ReferencedDecl> ReferencedDecls): Kind(Kind),
@@ -394,7 +390,7 @@ struct ResolvedRangeInfo {
                       TokensInRange(TokensInRange),
                       ContentRange(calculateContentRange(TokensInRange)),
                       HasSingleEntry(HasSingleEntry),
-                      ThrowingUnhandledError(ThrowingUnhandledError),
+                      UnhandledEffects(UnhandledEffects),
                       Orphan(Orphan), ContainedNodes(ContainedNodes),
                       DeclaredDecls(DeclaredDecls),
                       ReferencedDecls(ReferencedDecls),
@@ -403,34 +399,28 @@ struct ResolvedRangeInfo {
   ResolvedRangeInfo(ArrayRef<Token> TokensInRange) :
   ResolvedRangeInfo(RangeKind::Invalid, {nullptr, ExitState::Unsure},
                     TokensInRange, nullptr, /*Commom Expr Parent*/nullptr,
-                    /*Single entry*/true, /*unhandled error*/false,
+                    /*Single entry*/true, /*UnhandledEffects*/{},
                     OrphanKind::None, {}, {}, {}) {}
-  void print(llvm::raw_ostream &OS);
+  ResolvedRangeInfo(): ResolvedRangeInfo(ArrayRef<Token>()) {}
+  void print(llvm::raw_ostream &OS) const;
   ExitState exit() const { return ExitInfo.Exit; }
   Type getType() const { return ExitInfo.ReturnType; }
+
+  friend bool operator==(const ResolvedRangeInfo &lhs,
+                         const ResolvedRangeInfo &rhs) {
+    if (lhs.TokensInRange.size() != rhs.TokensInRange.size())
+      return false;
+    if (lhs.TokensInRange.empty())
+      return true;
+    return lhs.TokensInRange.front().getLoc() ==
+      rhs.TokensInRange.front().getLoc();
+  }
 
 private:
   static CharSourceRange calculateContentRange(ArrayRef<Token> Tokens);
 };
 
-class RangeResolver : public SourceEntityWalker {
-  struct Implementation;
-  std::unique_ptr<Implementation> Impl;
-  bool walkToExprPre(Expr *E) override;
-  bool walkToExprPost(Expr *E) override;
-  bool walkToStmtPre(Stmt *S) override;
-  bool walkToStmtPost(Stmt *S) override;
-  bool walkToDeclPre(Decl *D, CharSourceRange Range) override;
-  bool walkToDeclPost(Decl *D) override;
-  bool visitDeclReference(ValueDecl *D, CharSourceRange Range,
-                          TypeDecl *CtorTyRef, ExtensionDecl *ExtTyRef, Type T,
-                          ReferenceMetaData Data) override;
-public:
-  RangeResolver(SourceFile &File, SourceLoc Start, SourceLoc End);
-  RangeResolver(SourceFile &File, unsigned Offset, unsigned Length);
-  ~RangeResolver();
-  ResolvedRangeInfo resolve();
-};
+void simple_display(llvm::raw_ostream &out, const ResolvedRangeInfo &info);
 
 /// This provides a utility to view a printed name by parsing the components
 /// of that name. The components include a base name and an array of argument
@@ -445,7 +435,7 @@ public:
   DeclNameViewer() : DeclNameViewer(StringRef()) {}
   operator bool() const { return !BaseName.empty(); }
   StringRef base() const { return BaseName; }
-  llvm::ArrayRef<StringRef> args() const { return llvm::makeArrayRef(Labels); }
+  llvm::ArrayRef<StringRef> args() const { return llvm::ArrayRef(Labels); }
   unsigned argSize() const { return Labels.size(); }
   unsigned partsCount() const { return 1 + Labels.size(); }
   unsigned commonPartsCount(DeclNameViewer &Other) const;
@@ -453,63 +443,59 @@ public:
   bool isFunction() const { return HasParen; }
 };
 
-/// This provide a utility for writing to an underlying string buffer multiple
-/// string pieces and retrieve them later when the underlying buffer is stable.
-class DelayedStringRetriever : public raw_ostream {
-    SmallVectorImpl<char> &OS;
-    llvm::raw_svector_ostream Underlying;
-    SmallVector<std::pair<unsigned, unsigned>, 4> StartEnds;
-    unsigned CurrentStart;
-
-public:
-    explicit DelayedStringRetriever(SmallVectorImpl<char> &OS) : OS(OS),
-                                                              Underlying(OS) {}
-    void startPiece() {
-      CurrentStart = OS.size();
-    }
-    void endPiece() {
-      StartEnds.emplace_back(CurrentStart, OS.size());
-    }
-    void write_impl(const char *ptr, size_t size) override {
-      Underlying.write(ptr, size);
-    }
-    uint64_t current_pos() const override {
-      return Underlying.tell();
-    }
-    size_t preferred_buffer_size() const override {
-      return 0;
-    }
-    void retrieve(llvm::function_ref<void(StringRef)> F) const {
-      for (auto P : StartEnds) {
-        F(StringRef(OS.begin() + P.first, P.second - P.first));
-      }
-    }
-    StringRef operator[](unsigned I) const {
-      auto P = StartEnds[I];
-      return StringRef(OS.begin() + P.first, P.second - P.first);
-    }
-};
-
 enum class RegionType {
+  /// We could not match the rename location to a symbol to be renamed and the
+  /// symbol was originally a text match result (has `RenameLocUsage::Unknown`).
   Unmatched,
+  /// We could not match the rename location to a symbol to be renamed and the
+  /// symbol came from the index (does not have `RenameLocUsage::Unknown`).
   Mismatch,
+  /// We were able to match the result to a location in source code that's
+  /// active with respect to the current compiler arguments.
   ActiveCode,
+  /// We were able to match the result to a location in source code that's
+  /// inactive with respect to the current compiler arguments.
+  ///
+  /// Currently, we don't evaluate #if so all occurrences inside #if blocks
+  /// are considered inactive.
   InactiveCode,
+  /// The location is inside a string literal.
   String,
+  /// The location is inside a `#selector`.
   Selector,
+  /// The location is inside a comment.
   Comment,
 };
 
 enum class RefactoringRangeKind {
-  BaseName,                    // func [foo](a b: Int)
-  KeywordBaseName,             // [init](a: Int)
-  ParameterName,               // func foo(a[ b]: Int)
-  NoncollapsibleParameterName, // subscript(a[ a]: Int)
-  DeclArgumentLabel,           // func foo([a] b: Int)
-  CallArgumentLabel,           // foo([a]: 1)
-  CallArgumentColon,           // foo(a[: ]1)
-  CallArgumentCombined,        // foo([]1) could expand to foo([a: ]1)
-  SelectorArgumentLabel,       // foo([a]:)
+  /// `func [foo](a b: Int)`
+  BaseName,
+  
+  /// `[init](a: Int)`
+  KeywordBaseName,
+  
+  /// `func foo(a[ b]: Int)`
+  ParameterName,
+  
+  /// `subscript(a[ a]: Int)`
+  NoncollapsibleParameterName,
+  
+  /// `func foo([a] b: Int)`
+  DeclArgumentLabel,
+  
+  /// `foo([a]: 1)`
+  CallArgumentLabel,
+  
+  /// `foo(a[: ]1)`
+  CallArgumentColon,
+  
+  /// `foo([]1) could expand to foo([a: ]1)`
+  /// Also used for enum case declarations without a label, eg.
+  /// `case foo([]String)` should expand to `case foo([a: ]String)`.
+  CallArgumentCombined,
+
+  /// `foo([a]:)`
+  SelectorArgumentLabel,
 };
 
 struct NoteRegion {
@@ -520,11 +506,19 @@ struct NoteRegion {
   unsigned StartColumn;
   unsigned EndLine;
   unsigned EndColumn;
-  Optional<unsigned> ArgIndex;
+  std::optional<unsigned> ArgIndex;
 };
 
 struct Replacement {
+  /// If the edit is outside of the originally request source file, the path
+  /// to the file it is editing.
+  StringRef Path;
+  /// Range to apply the replacement to, zero-width if making an addition.
   CharSourceRange Range;
+  /// If the edit is actually a file (which could be generated/from an
+  /// expansion), the name (or path) of that buffer.
+  StringRef BufferName;
+  /// The text to replace \c Range with.
   StringRef Text;
   ArrayRef<NoteRegion> RegionsWorthNote;
 };
@@ -538,6 +532,9 @@ public:
   void insertAfter(SourceManager &SM, SourceLoc Loc, StringRef Text, ArrayRef<NoteRegion> SubRegions = {});
   void accept(SourceManager &SM, Replacement Replacement) { accept(SM, RegionType::ActiveCode, {Replacement}); }
   void remove(SourceManager &SM, CharSourceRange Range);
+  void acceptMacroExpansionBuffer(SourceManager &SM, unsigned bufferID,
+                                  SourceFile *containingSF,
+                                  bool adjustExpansion, bool includeBufferName);
 };
 
 /// This helper stream inserts text into a SourceLoc by calling functions in
@@ -575,6 +572,7 @@ public:
   }
 };
 
+/// Outputs replacements as JSON, see `writeEditsInJson`
 class SourceEditJsonConsumer : public SourceEditConsumer {
   struct Implementation;
   Implementation &Impl;
@@ -584,6 +582,23 @@ public:
   void accept(SourceManager &SM, RegionType RegionType, ArrayRef<Replacement> Replacements) override;
 };
 
+/// Outputs replacements to `OS` in the form
+/// ```
+/// // </path/to/file> startLine:startCol -> endLine:endCol
+/// replacement
+/// text
+///
+/// ```
+class SourceEditTextConsumer : public SourceEditConsumer {
+  llvm::raw_ostream &OS;
+
+public:
+  SourceEditTextConsumer(llvm::raw_ostream &OS) : OS(OS) {}
+  void accept(SourceManager &SM, RegionType RegionType,
+              ArrayRef<Replacement> Replacements) override;
+};
+
+/// Outputs the rewritten buffer to `OS` with RUN and CHECK lines removed
 class SourceEditOutputConsumer : public SourceEditConsumer {
   struct Implementation;
   Implementation &Impl;
@@ -594,6 +609,18 @@ public:
   void accept(SourceManager &SM, RegionType RegionType, ArrayRef<Replacement> Replacements) override;
 };
 
+/// Broadcasts `accept` to all `Consumers`
+class BroadcastingSourceEditConsumer : public SourceEditConsumer {
+  ArrayRef<std::unique_ptr<SourceEditConsumer>> Consumers;
+
+public:
+  BroadcastingSourceEditConsumer(
+      ArrayRef<std::unique_ptr<SourceEditConsumer>> Consumers)
+      : Consumers(Consumers) {}
+  void accept(SourceManager &SM, RegionType RegionType,
+              ArrayRef<Replacement> Replacements) override;
+};
+
 enum class LabelRangeEndAt: int8_t {
   BeforeElemStart,
   LabelNameOnly,
@@ -602,15 +629,77 @@ enum class LabelRangeEndAt: int8_t {
 struct CallArgInfo {
   Expr *ArgExp;
   CharSourceRange LabelRange;
+  bool IsTrailingClosure;
   CharSourceRange getEntireCharRange(const SourceManager &SM) const;
 };
 
 std::vector<CallArgInfo>
-getCallArgInfo(SourceManager &SM, Expr *Arg, LabelRangeEndAt EndKind);
+getCallArgInfo(SourceManager &SM, ArgumentList *Args, LabelRangeEndAt EndKind);
 
-// Get the ranges of argument labels from an Arg, either tuple or paren.
-std::vector<CharSourceRange>
-getCallArgLabelRanges(SourceManager &SM, Expr *Arg, LabelRangeEndAt EndKind);
+// Get the ranges of argument labels from an Arg, either tuple or paren, and
+// the index of the first trailing closure argument, if any. This includes empty
+// ranges for any unlabelled arguments, including the first trailing closure.
+std::pair<std::vector<CharSourceRange>, std::optional<unsigned>>
+getCallArgLabelRanges(SourceManager &SM, ArgumentList *Args,
+                      LabelRangeEndAt EndKind);
+
+/// Whether a decl is defined from clang source.
+bool isFromClang(const Decl *D);
+
+/// Retrieve the effective Clang node for the given declaration, which
+/// copes with the odd case of imported Error enums.
+ClangNode getEffectiveClangNode(const Decl *decl);
+
+/// Retrieve the Clang node for the given extension, if it has one.
+ClangNode extensionGetClangNode(const ExtensionDecl *ext);
+
+/// Utility for finding the referenced declaration from a call, which might
+/// include a second level of function application for a 'self.' expression,
+/// or a curry thunk, etc. If \p semantic is true then the underlying semantic
+/// expression of \p expr is used.
+std::pair<Type, ConcreteDeclRef> getReferencedDecl(Expr *expr,
+                                                   bool semantic = true);
+
+/// Whether the last expression in \p ExprStack is being called.
+bool isBeingCalled(ArrayRef<Expr*> ExprStack);
+
+/// The base of the last expression in \p ExprStack (which may look up the
+/// stack in eg. the case of a `DotSyntaxCallExpr`).
+Expr *getBase(ArrayRef<Expr *> ExprStack);
+
+/// Returns whether or not \p D could be overridden, eg. it's a member of a
+/// protocol, a non-final method in a class, etc.
+bool isDeclOverridable(ValueDecl *D);
+
+/// Given a reference to a member \p D and its \p Base expression, return
+/// whether that declaration could be dynamic, ie. may resolve to some other
+/// declaration. Note that while the decl itself itself may be overridable, a
+/// reference to it is not necessarily "dynamic". Furthermore,  is *not* the
+/// `dynamic` keyword.
+///
+/// A simple example is `SomeType.classMethod()`. `classMethod`
+/// is itself overridable, but that particular reference to it *has* to be the
+/// one in `SomeType`. Contrast that to `type(of: foo).classMethod()` where
+/// `classMethod` could be any `classMethod` up or down the hierarchy from the
+/// type of the \p Base expression.
+bool isDynamicRef(Expr *Base, ValueDecl *D, llvm::function_ref<Type(Expr *)> getType = [](Expr *E) { return E->getType(); });
+
+/// Adds the resolved nominal types of \p Base to \p Types.
+void getReceiverType(Expr *Base,
+                     SmallVectorImpl<NominalTypeDecl *> &Types);
+
+#if SWIFT_BUILD_SWIFT_SYNTAX
+/// Entry point to run the NameMatcher written in swift-syntax.
+///
+/// - Parameters:
+///   - sourceFile: The source file from which to load the SwiftSyntax tree
+///   - locations: The locations to resolve
+/// - Returns: A list of `ResolvedLoc` that have been resolved. This list might
+///   be shorteder than `locations` if some locations could not be resolved and
+///   the resolved locations might be in a different order than `locations`.
+std::vector<ResolvedLoc> runNameMatcher(const SourceFile &sourceFile,
+                                        ArrayRef<SourceLoc> locations);
+#endif
 
 } // namespace ide
 } // namespace swift

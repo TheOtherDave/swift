@@ -58,17 +58,17 @@ public:
                       bool isOutlined) const override {
     Explosion temp;
     asDerived().Derived::loadAsCopy(IGF, src, temp);
-    asDerived().Derived::assign(IGF, temp, dest, isOutlined);
+    asDerived().Derived::assign(IGF, temp, dest, isOutlined, T);
   }
 
   void assignWithTake(IRGenFunction &IGF, Address dest, Address src, SILType T,
                       bool isOutlined) const override {
     Explosion temp;
     asDerived().Derived::loadAsTake(IGF, src, temp);
-    asDerived().Derived::assign(IGF, temp, dest, isOutlined);
+    asDerived().Derived::assign(IGF, temp, dest, isOutlined, T);
   }
 
-  void reexplode(IRGenFunction &IGF, Explosion &in,
+  void reexplode(Explosion &in,
                  Explosion &out) const override {
     unsigned size = asDerived().Derived::getExplosionSize();
     in.transferInto(out, size);
@@ -99,8 +99,8 @@ public:
 
   // Subclasses must implement the following four operations:
 
-  // Is the scalar POD?
-  // static const bool IsScalarPOD;
+  // Is the scalar trivially destructible?
+  // static const bool IsScalarTriviallyDestroyable;
 
   // Make the scalar +1.
   // void emitScalarRetain(IRGenFunction &IGF, llvm::Value *value) const;
@@ -117,10 +117,33 @@ public:
     schema.add(ExplosionSchema::Element::forScalar(ty));
   }
 
+  void storeAsBytes(IRGenFunction &IGF, Explosion &src, Address addr) const {
+    auto &IGM = IGF.IGM;
+
+    // Store in multiples of bytes to avoid undefined bits.
+    auto storageTy = addr.getElementType();
+    if (storageTy->isIntegerTy() && (storageTy->getIntegerBitWidth() % 8)) {
+      auto &Builder = IGF.Builder;
+      auto nextByteSize = (storageTy->getIntegerBitWidth() + 7) & ~7UL;
+      auto nextByteSizedIntTy =
+          llvm::IntegerType::get(IGM.getLLVMContext(), nextByteSize);
+      auto newAddr =
+          Address(Builder.CreatePointerCast(addr.getAddress(),
+                                            nextByteSizedIntTy->getPointerTo()),
+                  nextByteSizedIntTy, addr.getAlignment());
+      auto newValue = Builder.CreateZExt(src.claimNext(), nextByteSizedIntTy);
+      Builder.CreateStore(newValue, newAddr);
+      return;
+    }
+
+    IGF.Builder.CreateStore(src.claimNext(), addr);
+  }
+
   void initialize(IRGenFunction &IGF, Explosion &src, Address addr,
                   bool isOutlined) const override {
     addr = asDerived().projectScalar(IGF, addr);
-    IGF.Builder.CreateStore(src.claimNext(), addr);
+
+    storeAsBytes(IGF, src, addr);
   }
 
   void loadAsCopy(IRGenFunction &IGF, Address addr,
@@ -138,22 +161,21 @@ public:
   }
 
   void assign(IRGenFunction &IGF, Explosion &src, Address dest,
-              bool isOutlined) const override {
+              bool isOutlined, SILType T) const override {
     // Project down.
     dest = asDerived().projectScalar(IGF, dest);
 
     // Grab the old value if we need to.
     llvm::Value *oldValue = nullptr;
-    if (!Derived::IsScalarPOD) {
+    if (!Derived::IsScalarTriviallyDestroyable) {
       oldValue = IGF.Builder.CreateLoad(dest, "oldValue");
     }
 
     // Store.
-    llvm::Value *newValue = src.claimNext();
-    IGF.Builder.CreateStore(newValue, dest);
+    storeAsBytes(IGF, src, dest);
 
     // Release the old value if we need to.
-    if (!Derived::IsScalarPOD) {
+    if (!Derived::IsScalarTriviallyDestroyable) {
       asDerived().emitScalarRelease(IGF, oldValue, IGF.getDefaultAtomicity());
     }
   }
@@ -166,7 +188,7 @@ public:
   }
 
   void consume(IRGenFunction &IGF, Explosion &in,
-               Atomicity atomicity) const override {
+               Atomicity atomicity, SILType T) const override {
     llvm::Value *value = in.claimNext();
     asDerived().emitScalarRelease(IGF, value, atomicity);
   }
@@ -178,18 +200,19 @@ public:
 
   void destroy(IRGenFunction &IGF, Address addr, SILType T,
                bool isOutlined) const override {
-    if (!Derived::IsScalarPOD) {
+    if (!Derived::IsScalarTriviallyDestroyable) {
       addr = asDerived().projectScalar(IGF, addr);
       llvm::Value *value = IGF.Builder.CreateLoad(addr, "toDestroy");
       asDerived().emitScalarRelease(IGF, value, IGF.getDefaultAtomicity());
     }
   }
   
-  void packIntoEnumPayload(IRGenFunction &IGF,
+  void packIntoEnumPayload(IRGenModule &IGM,
+                           IRBuilder &builder,
                            EnumPayload &payload,
                            Explosion &src,
                            unsigned offset) const override {
-    payload.insertValue(IGF, src.claimNext(), offset);
+    payload.insertValue(IGM, builder, src.claimNext(), offset);
   }
   
   void unpackFromEnumPayload(IRGenFunction &IGF,
@@ -207,6 +230,40 @@ public:
         IGM, lowering, asDerived().getScalarType(), offset,
         Size(IGM.DataLayout.getTypeStoreSize(asDerived().getScalarType())));
   }
+
+};
+
+/// SingleScalarTypeInfoWithTypeLayout - A further specialization of
+/// SingleScalarTypeInfo for types which knows how-to construct a type layout
+/// from its derived type which must be a TypeInfo.
+template <class Derived, class Base>
+class SingleScalarTypeInfoWithTypeLayout
+    : public SingleScalarTypeInfo<Derived, Base> {
+protected:
+  template <class... T>
+  SingleScalarTypeInfoWithTypeLayout(ScalarKind kind, T &&... args)
+      : SingleScalarTypeInfo<Derived, Base>(::std::forward<T>(args)...),
+        kind(kind) {}
+
+  const Derived &asDerived() const {
+    return static_cast<const Derived &>(*this);
+  }
+
+public:
+  friend class SingleScalarTypeInfo<Derived, Base>;
+
+  TypeLayoutEntry *
+  buildTypeLayoutEntry(IRGenModule &IGM,
+                       SILType T,
+                       bool useStructLayouts) const override {
+    if (!useStructLayouts) {
+      return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
+    }
+    return IGM.typeLayoutCache.getOrCreateScalarEntry(asDerived(), T, kind);
+  }
+
+private:
+  ScalarKind kind;
 };
 
 /// PODSingleScalarTypeInfo - A further specialization of
@@ -220,12 +277,19 @@ protected:
                           SpareBitVector spareBits,
                           Alignment align, T &&...args)
     : SingleScalarTypeInfo<Derived, Base>(storage, size, spareBits, align,
-                                          IsPOD, IsFixedSize,
+                                          IsTriviallyDestroyable,
+                                          IsCopyable,
+                                          IsFixedSize,
+                                          IsABIAccessible,
                                           ::std::forward<T>(args)...) {}
+
+  const Derived &asDerived() const {
+    return static_cast<const Derived &>(*this);
+  }
 
 private:
   friend class SingleScalarTypeInfo<Derived, Base>;
-  static const bool IsScalarPOD = true;
+  static const bool IsScalarTriviallyDestroyable = true;
 
   void emitScalarRetain(IRGenFunction &IGF, llvm::Value *value,
                         Atomicity atomicity) const {}
@@ -235,6 +299,18 @@ private:
 
   void emitScalarFixLifetime(IRGenFunction &IGF, llvm::Value *value) const {
   }
+
+  TypeLayoutEntry *
+  buildTypeLayoutEntry(IRGenModule &IGM,
+                       SILType T,
+                       bool useStructLayouts = false) const override {
+    if (!useStructLayouts) {
+      return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(asDerived(), T);
+    }
+    return IGM.typeLayoutCache.getOrCreateScalarEntry(asDerived(), T,
+                                                      ScalarKind::TriviallyDestroyable);
+  }
+
 };
 
 }

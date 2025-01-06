@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift
+// RUN: %target-typecheck-verify-swift -enable-objc-interop
 
 // ---------------------------------------------------------------------------
 // Mark function's return value as discardable and silence warning
@@ -149,7 +149,7 @@ func f(a : () -> Int) {
   42  // expected-warning {{integer literal is unused}}
   
   4 + 5 // expected-warning {{result of operator '+' is unused}}
-  a() // expected-warning {{result of call is unused, but produces 'Int'}}
+  a() // expected-warning {{result of call to function returning 'Int' is unused}}
 }
 
 @warn_unused_result func g() -> Int { } // expected-warning {{'warn_unused_result' attribute behavior is now the default}} {{1-21=}}
@@ -180,8 +180,71 @@ func testOptionalChaining(c1: C1?, s1: S1?) {
   s1!.f2Optional() // expected-warning {{result of call to 'f2Optional()' is unused}}
 }
 
-@discardableResult func SR2948 (_ closure: @escaping ()->()) -> (()->()) {
+// https://github.com/apple/swift/issues/45542
+
+@discardableResult func f_45542(_ closure: @escaping ()->()) -> (()->()) {
   closure()
   return closure
 }
-SR2948({}) // okay
+do {
+  f_45542({}) // okay
+}
+
+// https://github.com/apple/swift/issues/50104
+
+class C1_50104 {
+  @discardableResult required init(input: Int) { }
+}
+class C2_50104 : C1_50104 {}
+do {
+  C1_50104(input: 10) // okay
+  C2_50104(input: 10) // okay
+}
+
+protocol FooProtocol {}
+
+extension FooProtocol {
+  @discardableResult
+  static func returnSomething() -> Bool? {
+    return true
+  }
+}
+
+class Foo {
+  var myOptionalFooProtocol: FooProtocol.Type?
+  
+  func doSomething() {
+    myOptionalFooProtocol?.returnSomething() // okay
+  }
+}
+
+class Discard {
+  @discardableResult func bar() -> Int {
+    return 0
+  }
+
+  func baz() {
+    self.bar // expected-error {{function is unused}}
+    bar // expected-error {{function is unused}}
+  }
+}
+
+// https://github.com/apple/swift/issues/54699
+
+struct S_54699 {
+  @discardableResult
+  func bar1() -> () -> Void {
+    return {}
+  }
+
+  @discardableResult
+  static func bar2() -> () -> Void {
+    return {}
+  }
+}
+do {
+  S_54699().bar1() // Okay
+  S_54699.bar2() // Okay
+  S_54699().bar1 // expected-error {{function is unused}}
+  S_54699.bar2 // expected-error {{function is unused}}
+}

@@ -1,12 +1,16 @@
-// RUN: %empty-directory(%t)
-// RUN: cp %s %t/main.swift
-// RUN: %target-build-swift -Xfrontend -playground -Xfrontend -disable-playground-transform -Xfrontend -debugger-support -o %t/main %S/Inputs/PlaygroundsRuntime.swift %t/main.swift
-// RUN: %target-run %t/main | %FileCheck %s -allow-empty
-// RUN: %target-build-swift -Xfrontend -pc-macro -Xfrontend -playground -Xfrontend -disable-playground-transform -Xfrontend -debugger-support -o %t/main %S/Inputs/PlaygroundsRuntime.swift %S/Inputs/SilentPCMacroRuntime.swift %t/main.swift
-// RUN: %target-run %t/main | %FileCheck %s -allow-empty
+// -playground
+// RUN: %target-playground-build-run-swift(-swift-version 5 -Xfrontend -playground -Xfrontend -disable-playground-transform) | %FileCheck %s -allow-empty
+// RUN: %target-playground-build-run-swift(-swift-version 6 -Xfrontend -playground -Xfrontend -disable-playground-transform) | %FileCheck %s -allow-empty
+//
+// -pc-macro -playground
+// RUN: %target-playground-build-run-swift(-swift-version 5 -Xfrontend -pc-macro -Xfrontend -playground -Xfrontend -disable-playground-transform) | %FileCheck %s -allow-empty
+// RUN: %target-playground-build-run-swift(-swift-version 6 -Xfrontend -pc-macro -Xfrontend -playground -Xfrontend -disable-playground-transform) | %FileCheck %s -allow-empty
+//
 // REQUIRES: executable_test
+
+import PlaygroundSupport
 
 var a = 2
 var b = 3
 a + b
-// CHECK-NOT: $builtin_log
+// CHECK-NOT: __builtin_log

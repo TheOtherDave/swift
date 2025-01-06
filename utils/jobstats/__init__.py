@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 #
 # ==-- jobstats - support for reading the contents of stats dirs --==#
 #
@@ -20,4 +20,4 @@ __email__ = 'ghoare@apple.com'
 __versioninfo__ = (0, 1, 0)
 __version__ = '.'.join(str(v) for v in __versioninfo__)
 
-from .jobstats import JobStats, load_stats_dir, merge_all_jobstats # noqa
+from .jobstats import JobStats, JobProfs, load_stats_dir, merge_all_jobstats, list_stats_dir_profiles # noqa

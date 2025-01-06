@@ -1,6 +1,11 @@
 // RUN: %target-swift-frontend %s -O -emit-sil | %FileCheck %s
 // RUN: %target-swift-frontend %s -O -emit-sil -enable-testing | %FileCheck -check-prefix=CHECK-TESTING %s
 
+// Check if a private global is kept alive if it's only reference from another global variable.
+
+private var g1 = 27
+let g2 = UnsafePointer(&g1)
+
 // Check if cycles are removed.
 
 @inline(never)
@@ -168,11 +173,31 @@ internal func donotEliminate() {
   return
 }
 
+func callingGlobalFuncPtr() {
+  GFStr.globalFuncPtr()
+}
+
+func aliveReferencedFunc() {
+}
+
+struct GFStr {
+  static var globalFuncPtr: () -> () = callingGlobalFuncPtr
+  static var aliveFuncPtr: () -> () = aliveReferencedFunc
+}
+
+public func keepPtrAlive() {
+  GFStr.aliveFuncPtr()
+}
+
+// CHECK-LABEL: sil_global private @$s25dead_function_elimination2g1{{.*}}
+
 // CHECK-NOT: sil {{.*}}inCycleA
 // CHECK-NOT: sil {{.*}}inCycleB
 // CHECK-NOT: sil {{.*}}DeadMethod
 // CHECK-NOT: sil {{.*}}DeadWitness
 // CHECK-NOT: sil {{.*}}publicClassMethod
+// CHECK-NOT: sil {{.*}}callingGlobalFuncPtr
+// CHECK-NOT: sil_global {{.*}}globalFuncPtr
 
 // CHECK-TESTING: sil {{.*}}inCycleA
 // CHECK-TESTING: sil {{.*}}inCycleB
@@ -180,7 +205,8 @@ internal func donotEliminate() {
 // CHECK-TESTING: sil {{.*}}publicClassMethod
 // CHECK-TESTING: sil {{.*}}DeadWitness
 
-// CHECK-LABEL: @_T025dead_function_elimination14donotEliminateyyF
+// CHECK-LABEL: @$s25dead_function_elimination14donotEliminateyyF
+// CHECK-LABEL: sil @$s25dead_function_elimination12keepPtrAliveyyF
 
 // CHECK-LABEL: sil_vtable Base
 // CHECK: aliveMethod
@@ -190,7 +216,7 @@ internal func donotEliminate() {
 // CHECK: notInDerived
 // CHECK-NOT: notInOther
 
-// CHECK-TESTING-LABEL: sil_vtable [serialized] Base
+// CHECK-TESTING-LABEL: sil_vtable Base
 // CHECK-TESTING: DeadMethod
 
 // CHECK-LABEL: sil_vtable Derived
@@ -200,7 +226,7 @@ internal func donotEliminate() {
 // CHECK: notInDerived
 // CHECK: notInOther
 
-// CHECK-TESTING-LABEL: sil_vtable [serialized] Derived
+// CHECK-TESTING-LABEL: sil_vtable Derived
 // CHECK-TESTING: DeadMethod
 
 // CHECK-LABEL: sil_vtable Other
@@ -211,20 +237,8 @@ internal func donotEliminate() {
 // CHECK: notInOther
 
 // CHECK-LABEL: sil_witness_table hidden Adopt: Prot
-// CHECK: aliveWitness!1: {{.*}} : @{{.*}}aliveWitness
-// CHECK: DeadWitness!1: {{.*}} : nil
+// CHECK: aliveWitness: {{.*}} : @{{.*}}aliveWitness
+// CHECK: DeadWitness: {{.*}} : nil
 
-// CHECK-TESTING-LABEL: sil_witness_table [serialized] Adopt: Prot
+// CHECK-TESTING-LABEL: sil_witness_table Adopt: Prot
 // CHECK-TESTING: DeadWitness{{.*}}: @{{.*}}DeadWitness
-
-// CHECK-LABEL: sil_default_witness_table hidden Prot
-// CHECK:  no_default
-// CHECK:  no_default
-// CHECK:  method #Prot.aliveDefaultWitness!1: {{.*}} : @{{.*}}aliveDefaultWitness
-// CHECK:  no_default
-
-// CHECK-TESTING-LABEL: sil_default_witness_table Prot
-// CHECK-TESTING:  no_default
-// CHECK-TESTING:  no_default
-// CHECK-TESTING:  method #Prot.aliveDefaultWitness!1: {{.*}} : @{{.*}}aliveDefaultWitness
-// CHECK-TESTING:  method #Prot.DeadDefaultWitness!1: {{.*}} : @{{.*}}DeadDefaultWitness

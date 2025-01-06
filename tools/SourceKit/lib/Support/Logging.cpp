@@ -63,9 +63,12 @@ Logger::~Logger() {
   OS << llvm::format("%7.4f] ", TR.getWallTime() - sBeginTR.getWallTime());
   OS << Msg.str();
 
-  llvm::errs() << LoggerName << ": " << LogMsg.str() << '\n';
+  fprintf(stderr, "%s: %s\n", LoggerName.c_str(), LogMsg.c_str());
 
 #if __APPLE__
+  // rdar://121076739
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
   // Use the Apple System Log facility.
   aslclient asl = asl_open(LoggerName.c_str(), "com.apple.console",
                            ASL_OPT_NO_DELAY);
@@ -76,5 +79,6 @@ Logger::~Logger() {
   asl_send(asl, msg);
   asl_free(msg);
   asl_close(asl);
+#pragma clang diagnostic pop
 #endif
 }

@@ -1,5 +1,3 @@
-from __future__ import print_function
-
 import random
 
 TESTRESULT_NOFAILURE = "NoFailure"
@@ -12,8 +10,8 @@ TESTRESULTS = set([TESTRESULT_NOFAILURE, TESTRESULT_KEEPSUFFIX,
 class ListReducer(object):
     """Reduce lists of objects. Inspired by llvm bugpoint"""
 
-    def __init__(self, l):
-        self.target_list = l
+    def __init__(self, lst):
+        self.target_list = lst
         # Maximal number of allowed splitting iterations,
         # before the elements are randomly shuffled.
         self.max_iters_without_progress = 3
@@ -94,7 +92,7 @@ class ListReducer(object):
             self._reset_progress()
             return False
 
-        assert(result == TESTRESULT_NOFAILURE)
+        assert result == TESTRESULT_NOFAILURE
         # The property does not hold. Some of the elements we removed must
         # be necessary to maintain the property.
         self.mid_top = mid
@@ -167,7 +165,7 @@ class ListReducer(object):
     def reduce_list(self):
         random.seed(0x6e5ea738)  # Seed the random number generator
         (result, self.target_list, kept) = self.run_test(self.target_list, [])
-        assert(result in TESTRESULTS)
+        assert result in TESTRESULTS
         (should_continue, result) = self._should_continue(result)
         if not should_continue:
             return result

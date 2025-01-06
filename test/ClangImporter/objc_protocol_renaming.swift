@@ -11,10 +11,12 @@
 
 // REQUIRES: objc_interop
 
+import Foundation
 import ProtoRenaming
 import ImplementProtoRenaming
 
-// SR-3917: compiler crash when using an "old" name for an imported requirement
+// https://github.com/apple/swift/issues/46502
+// Compiler crash when using an "old" name for an imported requirement
 class MyGraphViewSubclass : MyGraphView {
-	func doSomethingToGraphView(_ view: GraphView) { } // expected-error{{method 'doSomethingToGraphView' with Objective-C selector 'doSomethingToGraphView:' conflicts with method 'doSomething(to:)' from superclass 'MyGraphView' with the same Objective-C selector}}
+	@objc func doSomethingToGraphView(_ view: GraphView) { } // expected-error{{method 'doSomethingToGraphView' with Objective-C selector 'doSomethingToGraphView:' conflicts with method 'doSomething(to:)' from superclass 'MyGraphView' with the same Objective-C selector}}
 }

@@ -1,9 +1,11 @@
 // RUN: %empty-directory(%t)
 
 // RUN: %target-build-swift -emit-executable %s -g -o %t/ASTSection -emit-module
-// RUN: %lldb-moduleimport-test %t/ASTSection | %FileCheck %s
+// RUN: %lldb-moduleimport-test -verbose %t/ASTSection | %FileCheck %s
+// RUN: %lldb-moduleimport-test -filter mips64-unknown-hurd -verbose %t/ASTSection | %FileCheck %s --check-prefix=LINETABLE-CHECK
 
 // REQUIRES: executable_test
+// REQUIRES: swift_tools_extra
 
 // The test ASTSection_linker.swift builds this code with separate
 // compile and link steps.
@@ -23,9 +25,9 @@ Double(foo.bar())
 func objCUser(_ obj: ObjCClass) {}
 #endif
 
-// CHECK: Loaded module ASTSection from
 // CHECK: - Target: {{.+}}-{{.+}}-{{.+}}
-// CHECK: Importing ASTSection... ok!
+// CHECK: Importing ASTSection...
+// CHECK: Import successful!
 
 // LINETABLE-CHECK-NOT: ASTSection
 

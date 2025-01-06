@@ -16,41 +16,54 @@
 
 #include "swift/AST/Pattern.h"
 #include "swift/AST/ASTContext.h"
-#include "swift/AST/Expr.h"
+#include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
+#include "swift/AST/Expr.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeLoc.h"
+#include "swift/AST/TypeRepr.h"
+#include "swift/Basic/Assertions.h"
+#include "swift/Basic/Statistic.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/Support/raw_ostream.h"
 using namespace swift;
 
-/// Diagnostic printing of PatternKinds.
-llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &OS, PatternKind kind) {
-  switch (kind) {
-  case PatternKind::Paren:
-    return OS << "parenthesized pattern";
-  case PatternKind::Tuple:
-    return OS << "tuple pattern";
-  case PatternKind::Named:
-    return OS << "pattern variable binding";
-  case PatternKind::Any:
-    return OS << "'_' pattern";
-  case PatternKind::Typed:
-    return OS << "pattern type annotation";
-  case PatternKind::Is:
-    return OS << "prefix 'is' pattern";
-  case PatternKind::Expr:
-    return OS << "expression pattern";
-  case PatternKind::Var:
-    return OS << "'var' binding pattern";
-  case PatternKind::EnumElement:
-    return OS << "enum case matching pattern";
-  case PatternKind::OptionalSome:
-    return OS << "optional .Some matching pattern";
-  case PatternKind::Bool:
-    return OS << "bool matching pattern";
+#define PATTERN(Id, _) \
+  static_assert(IsTriviallyDestructible<Id##Pattern>::value, \
+                "Patterns are BumpPtrAllocated; the d'tor is never called");
+#include "swift/AST/PatternNodes.def"
+
+DescriptivePatternKind Pattern::getDescriptiveKind() const {
+#define TRIVIAL_PATTERN_KIND(Kind)                                             \
+  case PatternKind::Kind:                                                      \
+    return DescriptivePatternKind::Kind
+
+  switch (getKind()) {
+    TRIVIAL_PATTERN_KIND(Paren);
+    TRIVIAL_PATTERN_KIND(Tuple);
+    TRIVIAL_PATTERN_KIND(Named);
+    TRIVIAL_PATTERN_KIND(Any);
+    TRIVIAL_PATTERN_KIND(Typed);
+    TRIVIAL_PATTERN_KIND(Is);
+    TRIVIAL_PATTERN_KIND(EnumElement);
+    TRIVIAL_PATTERN_KIND(OptionalSome);
+    TRIVIAL_PATTERN_KIND(Bool);
+    TRIVIAL_PATTERN_KIND(Expr);
+
+  case PatternKind::Binding:
+    switch (cast<BindingPattern>(this)->getIntroducer()) {
+    case VarDecl::Introducer::Let:
+    case VarDecl::Introducer::Borrowing:
+      return DescriptivePatternKind::Let;
+      
+    case VarDecl::Introducer::Var:
+    case VarDecl::Introducer::InOut:
+      return DescriptivePatternKind::Var;
+    }
   }
-  llvm_unreachable("bad PatternKind");
+#undef TRIVIAL_PATTERN_KIND
+  llvm_unreachable("bad DescriptivePatternKind");
 }
 
 StringRef Pattern::getKindName(PatternKind K) {
@@ -59,6 +72,28 @@ StringRef Pattern::getKindName(PatternKind K) {
 #include "swift/AST/PatternNodes.def"
   }
   llvm_unreachable("bad PatternKind");
+}
+
+StringRef Pattern::getDescriptivePatternKindName(DescriptivePatternKind K) {
+#define ENTRY(Kind, String)                                                    \
+  case DescriptivePatternKind::Kind:                                           \
+    return String
+  switch (K) {
+    ENTRY(Paren, "parenthesized pattern");
+    ENTRY(Tuple, "tuple pattern");
+    ENTRY(Named, "pattern variable binding");
+    ENTRY(Any, "'_' pattern");
+    ENTRY(Typed, "pattern type annotation");
+    ENTRY(Is, "prefix 'is' pattern");
+    ENTRY(EnumElement, "enum case matching pattern");
+    ENTRY(OptionalSome, "optional pattern");
+    ENTRY(Bool, "bool matching pattern");
+    ENTRY(Expr, "expression pattern");
+    ENTRY(Var, "'var' binding pattern");
+    ENTRY(Let, "'let' binding pattern");
+  }
+#undef ENTRY
+  llvm_unreachable("bad DescriptivePatternKind");
 }
 
 // Metaprogram to verify that every concrete class implements
@@ -101,14 +136,14 @@ void Pattern::setDelayedInterfaceType(Type interfaceTy, DeclContext *dc) {
   Ty = interfaceTy;
   ASTContext &ctx = interfaceTy->getASTContext();
   ctx.DelayedPatternContexts[this] = dc;
-  PatternBits.hasInterfaceType = true;
+  Bits.Pattern.hasInterfaceType = true;
 }
 
 Type Pattern::getType() const {
   assert(hasType());
 
   // If this pattern has an interface type, map it into the context type.
-  if (PatternBits.hasInterfaceType) {
+  if (Bits.Pattern.hasInterfaceType) {
     ASTContext &ctx = Ty->getASTContext();
 
     // Retrieve the generic environment to use for the mapping.
@@ -119,7 +154,7 @@ Type Pattern::getType() const {
     if (auto genericEnv = dc->getGenericEnvironmentOfContext()) {
       ctx.DelayedPatternContexts.erase(this);
       Ty = genericEnv->mapTypeIntoContext(Ty);
-      PatternBits.hasInterfaceType = false;
+      const_cast<Pattern*>(this)->Bits.Pattern.hasInterfaceType = false;
     }
   }
 
@@ -159,38 +194,49 @@ namespace {
     
     WalkToVarDecls(const std::function<void(VarDecl*)> &fn)
     : fn(fn) {}
-    
-    Pattern *walkToPatternPost(Pattern *P) override {
+
+    /// Walk everything that's available; there shouldn't be macro expansions
+    /// that matter anyway.
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::ArgumentsAndExpansion;
+    }
+
+    PostWalkResult<Pattern *> walkToPatternPost(Pattern *P) override {
       // Handle vars.
       if (auto *Named = dyn_cast<NamedPattern>(P))
         fn(Named->getDecl());
-      return P;
+      return Action::Continue(P);
     }
 
     // Only walk into an expression insofar as it doesn't open a new scope -
     // that is, don't walk into a closure body.
-    std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
+    PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
       if (isa<ClosureExpr>(E)) {
-        return { false, E };
+        return Action::SkipNode(E);
       }
-      return { true, E };
+      return Action::Continue(E);
     }
 
     // Don't walk into anything else.
-    std::pair<bool, Stmt *> walkToStmtPre(Stmt *S) override {
-      return { false, S };
+    PreWalkResult<Stmt *> walkToStmtPre(Stmt *S) override {
+      return Action::SkipNode(S);
     }
-    bool walkToTypeLocPre(TypeLoc &TL) override { return false; }
-    bool walkToTypeReprPre(TypeRepr *T) override { return false; }
-    bool walkToParameterListPre(ParameterList *PL) override { return false; }
-    bool walkToDeclPre(Decl *D) override { return false; }
+    PreWalkAction walkToTypeReprPre(TypeRepr *T) override {
+      return Action::SkipNode();
+    }
+    PreWalkAction walkToParameterListPre(ParameterList *PL) override {
+      return Action::SkipNode();
+    }
+    PreWalkAction walkToDeclPre(Decl *D) override {
+      return Action::SkipNode();
+    }
   };
 } // end anonymous namespace
 
 
-/// \brief apply the specified function to all variables referenced in this
+/// apply the specified function to all variables referenced in this
 /// pattern.
-void Pattern::forEachVariable(const std::function<void(VarDecl*)> &fn) const {
+void Pattern::forEachVariable(llvm::function_ref<void(VarDecl *)> fn) const {
   switch (getKind()) {
   case PatternKind::Any:
   case PatternKind::Bool:
@@ -207,7 +253,7 @@ void Pattern::forEachVariable(const std::function<void(VarDecl*)> &fn) const {
 
   case PatternKind::Paren:
   case PatternKind::Typed:
-  case PatternKind::Var:
+  case PatternKind::Binding:
     return getSemanticsProvidingPattern()->forEachVariable(fn);
 
   case PatternKind::Tuple:
@@ -233,9 +279,9 @@ void Pattern::forEachVariable(const std::function<void(VarDecl*)> &fn) const {
   }
 }
 
-/// \brief apply the specified function to all pattern nodes recursively in
+/// apply the specified function to all pattern nodes recursively in
 /// this pattern.  This is a pre-order traversal.
-void Pattern::forEachNode(const std::function<void(Pattern*)> &f) {
+void Pattern::forEachNode(llvm::function_ref<void(Pattern*)> f) {
   f(this);
 
   switch (getKind()) {
@@ -255,8 +301,8 @@ void Pattern::forEachNode(const std::function<void(Pattern*)> &f) {
     return cast<ParenPattern>(this)->getSubPattern()->forEachNode(f);
   case PatternKind::Typed:
     return cast<TypedPattern>(this)->getSubPattern()->forEachNode(f);
-  case PatternKind::Var:
-    return cast<VarPattern>(this)->getSubPattern()->forEachNode(f);
+  case PatternKind::Binding:
+    return cast<BindingPattern>(this)->getSubPattern()->forEachNode(f);
 
   case PatternKind::Tuple:
     for (auto elt : cast<TuplePattern>(this)->getElements())
@@ -285,12 +331,59 @@ bool Pattern::hasStorage() const {
   return HasStorage;
 }
 
+bool Pattern::hasAnyMutableBindings() const {
+  auto HasMutable = false;
+  forEachVariable([&](VarDecl *VD) {
+    if (!VD->isLet())
+      HasMutable = true;
+  });
+  return HasMutable;
+}
+
+BindingPattern *BindingPattern::createParsed(ASTContext &ctx, SourceLoc loc,
+                                             VarDecl::Introducer introducer,
+                                             Pattern *sub) {
+  // Reset the introducer of the all variables in the pattern.
+  sub->forEachVariable([&](VarDecl *vd) { vd->setIntroducer(introducer); });
+  return new (ctx) BindingPattern(loc, introducer, sub);
+}
+
+BindingPattern *BindingPattern::createImplicitCatch(DeclContext *dc,
+                                                    SourceLoc loc) {
+  auto &ctx = dc->getASTContext();
+  auto var = new (ctx) VarDecl(/*IsStatic=*/false, VarDecl::Introducer::Let,
+                               loc, ctx.Id_error, dc);
+  var->setImplicit();
+  auto namePattern = new (ctx) NamedPattern(var);
+  auto varPattern =
+      new (ctx) BindingPattern(loc, VarDecl::Introducer::Let, namePattern);
+  varPattern->setImplicit();
+  return varPattern;
+}
+
+OptionalSomePattern *OptionalSomePattern::create(ASTContext &ctx,
+                                                 Pattern *subPattern,
+                                                 SourceLoc questionLoc) {
+  return new (ctx) OptionalSomePattern(ctx, subPattern, questionLoc);
+}
+
+OptionalSomePattern *
+OptionalSomePattern::createImplicit(ASTContext &ctx, Pattern *subPattern,
+                                    SourceLoc questionLoc) {
+  auto *P = OptionalSomePattern::create(ctx, subPattern, questionLoc);
+  P->setImplicit();
+  return P;
+}
+
+EnumElementDecl *OptionalSomePattern::getElementDecl() const {
+  return Ctx.getOptionalSomeDecl();
+}
+
 /// Return true if this is a non-resolved ExprPattern which is syntactically
 /// irrefutable.
 static bool isIrrefutableExprPattern(const ExprPattern *EP) {
-  // If the pattern has a registered match expression, it's
-  // a type-checked ExprPattern.
-  if (EP->getMatchExpr()) return false;
+  // If the pattern is resolved, it must be irrefutable.
+  if (EP->isResolved()) return false;
 
   auto expr = EP->getSubExpr();
   while (true) {
@@ -339,11 +432,6 @@ case PatternKind::ID: foundRefutablePattern = true; break;
   return foundRefutablePattern;
 }
 
-/// Standard allocator for Patterns.
-void *Pattern::operator new(size_t numBytes, const ASTContext &C) {
-  return C.Allocate(numBytes, alignof(Pattern));
-}
-
 /// Find the name directly bound by this pattern.  When used as a
 /// tuple element in a function signature, such names become part of
 /// the type.
@@ -360,15 +448,17 @@ Identifier NamedPattern::getBoundName() const {
 
 /// Allocate a new pattern that matches a tuple.
 TuplePattern *TuplePattern::create(ASTContext &C, SourceLoc lp,
-                                   ArrayRef<TuplePatternElt> elts, SourceLoc rp,
-                                   Optional<bool> implicit) {
-  if (!implicit.hasValue())
-    implicit = !lp.isValid();
+                                   ArrayRef<TuplePatternElt> elts,
+                                   SourceLoc rp) {
+#ifndef NDEBUG
+  if (elts.size() == 1)
+    assert(!elts[0].getLabel().empty());
+#endif
 
   unsigned n = elts.size();
   void *buffer = C.Allocate(totalSizeToAlloc<TuplePatternElt>(n),
                             alignof(TuplePattern));
-  TuplePattern *pattern = ::new (buffer) TuplePattern(lp, n, rp, *implicit);
+  TuplePattern *pattern = ::new (buffer) TuplePattern(lp, n, rp);
   std::uninitialized_copy(elts.begin(), elts.end(),
                           pattern->getTrailingObjects<TuplePatternElt>());
   return pattern;
@@ -376,17 +466,16 @@ TuplePattern *TuplePattern::create(ASTContext &C, SourceLoc lp,
 
 Pattern *TuplePattern::createSimple(ASTContext &C, SourceLoc lp,
                                     ArrayRef<TuplePatternElt> elements,
-                                    SourceLoc rp,
-                                    Optional<bool> implicit) {
+                                    SourceLoc rp) {
   assert(lp.isValid() == rp.isValid());
 
   if (elements.size() == 1 &&
-      elements[0].getPattern()->getBoundName().empty()) {
+      elements[0].getLabel().empty()) {
     auto &first = const_cast<TuplePatternElt&>(elements.front());
-    return new (C) ParenPattern(lp, first.getPattern(), rp, implicit);
+    return new (C) ParenPattern(lp, first.getPattern(), rp);
   }
 
-  return create(C, lp, elements, rp, implicit);
+  return create(C, lp, elements, rp);
 }
 
 SourceRange TuplePattern::getSourceRange() const {
@@ -399,6 +488,18 @@ SourceRange TuplePattern::getSourceRange() const {
            Fields.back().getPattern()->getEndLoc() };
 }
 
+TypedPattern::TypedPattern(Pattern *pattern, TypeRepr *tr)
+  : Pattern(PatternKind::Typed), SubPattern(pattern), PatTypeRepr(tr) {
+  Bits.TypedPattern.IsPropagatedType = false;
+}
+
+SourceLoc TypedPattern::getLoc() const {
+  if (SubPattern->isImplicit() && PatTypeRepr)
+    return PatTypeRepr->getSourceRange().Start;
+
+  return SubPattern->getLoc();
+}
+
 SourceRange TypedPattern::getSourceRange() const {
   if (isImplicit() || isPropagatedType()) {
     // If a TypedPattern is implicit, then its type is definitely implicit, so
@@ -407,21 +508,164 @@ SourceRange TypedPattern::getSourceRange() const {
     return SubPattern->getSourceRange();
   }
 
-  if (SubPattern->isImplicit())
-    return PatType.getSourceRange();
+  if (!PatTypeRepr)
+    return SourceRange();
 
-  return { SubPattern->getSourceRange().Start, PatType.getSourceRange().End };
+  if (SubPattern->isImplicit())
+    return PatTypeRepr->getSourceRange();
+
+  return { SubPattern->getSourceRange().Start,
+           PatTypeRepr->getSourceRange().End };
 }
 
-/// Construct an ExprPattern.
-ExprPattern::ExprPattern(Expr *e, bool isResolved, Expr *matchExpr,
-                         VarDecl *matchVar,
-                         Optional<bool> implicit)
-  : Pattern(PatternKind::Expr), SubExprAndIsResolved(e, isResolved),
-    MatchExpr(matchExpr), MatchVar(matchVar) {
-  assert(!matchExpr || e->isImplicit() == matchExpr->isImplicit());
-  if (implicit.hasValue() ? *implicit : e->isImplicit())
-    setImplicit();
+IsPattern::IsPattern(SourceLoc IsLoc, TypeExpr *CastTy, Pattern *SubPattern,
+                     CheckedCastKind Kind)
+    : Pattern(PatternKind::Is), IsLoc(IsLoc), SubPattern(SubPattern),
+      CastKind(Kind), CastType(CastTy) {
+  assert(IsLoc.isValid() == CastTy->getLoc().isValid());
+}
+
+IsPattern *IsPattern::createImplicit(ASTContext &Ctx, Type castTy,
+                                     Pattern *SubPattern,
+                                     CheckedCastKind Kind) {
+  assert(castTy);
+  auto *CastTE = TypeExpr::createImplicit(castTy, Ctx);
+  auto *ip = new (Ctx) IsPattern(SourceLoc(), CastTE, SubPattern, Kind);
+  ip->setImplicit();
+  return ip;
+}
+
+SourceRange IsPattern::getSourceRange() const {
+  SourceLoc beginLoc = SubPattern ? SubPattern->getSourceRange().Start : IsLoc;
+  SourceLoc endLoc = (isImplicit() ? beginLoc : CastType->getEndLoc());
+  return {beginLoc, endLoc};
+}
+
+Type IsPattern::getCastType() const { return CastType->getInstanceType(); }
+void IsPattern::setCastType(Type type) {
+  assert(type);
+  CastType->setType(MetatypeType::get(type));
+}
+
+TypeRepr *IsPattern::getCastTypeRepr() const { return CastType->getTypeRepr(); }
+
+ExprPattern *ExprPattern::createParsed(ASTContext &ctx, Expr *E,
+                                       DeclContext *DC) {
+  return new (ctx) ExprPattern(E, DC, /*isResolved*/ false);
+}
+
+ExprPattern *ExprPattern::createResolved(ASTContext &ctx, Expr *E,
+                                         DeclContext *DC) {
+  return new (ctx) ExprPattern(E, DC, /*isResolved*/ true);
+}
+
+ExprPattern *ExprPattern::createImplicit(ASTContext &ctx, Expr *E,
+                                         DeclContext *DC) {
+  auto *EP = ExprPattern::createResolved(ctx, E, DC);
+  EP->setImplicit();
+  return EP;
+}
+
+Expr *ExprPattern::getMatchExpr() const {
+  auto &eval = DC->getASTContext().evaluator;
+  return evaluateOrDefault(eval, ExprPatternMatchRequest{this}, std::nullopt)
+      .getMatchExpr();
+}
+
+VarDecl *ExprPattern::getMatchVar() const {
+  auto &eval = DC->getASTContext().evaluator;
+  return evaluateOrDefault(eval, ExprPatternMatchRequest{this}, std::nullopt)
+      .getMatchVar();
+}
+
+void ExprPattern::updateMatchExpr(Expr *e) const {
+  class FindMatchOperatorDeclRef: public ASTWalker {
+  public:
+    ValueOwnership Ownership = ValueOwnership::Default;
+  
+    PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
+      // See if this is the reference to the ~= operator used.
+      auto declRef = dyn_cast<DeclRefExpr>(E);
+      if (!declRef) {
+        return Action::Continue(E);
+      }
+      auto decl = declRef->getDecl();
+      auto declName = decl->getName();
+      if (!declName.isOperator()) {
+        return Action::Continue(E);
+      }
+      
+      if (!declName.getBaseIdentifier().is("~=")) {
+        return Action::Continue(E);
+      }
+      
+      // We found a `~=` declref. Get the value ownership from the parameter.
+      auto fnTy = decl->getInterfaceType()->castTo<AnyFunctionType>();
+      if (decl->isStatic()) {
+        fnTy = fnTy->getResult()->castTo<AnyFunctionType>();
+      }
+      // Subject value is the right-hand operand to the operator.
+      assert(fnTy->getParams().size() == 2);
+      Ownership = fnTy->getParams()[1].getValueOwnership();
+      // Operators are always normal functions or methods, so their default
+      // parameter ownership is always borrowing.
+      if (Ownership == ValueOwnership::Default) {
+        Ownership = ValueOwnership::Shared;
+      }
+      return Action::Stop();
+    }
+  };
+  FindMatchOperatorDeclRef walker;
+  e->walk(walker);
+
+  MatchExprAndOperandOwnership = {e, walker.Ownership};
+}
+
+EnumElementPattern *
+EnumElementPattern::createImplicit(Type parentTy, SourceLoc dotLoc,
+                                   DeclNameLoc nameLoc, EnumElementDecl *decl,
+                                   Pattern *subPattern, DeclContext *DC) {
+  auto &ctx = DC->getASTContext();
+  auto *parentExpr = TypeExpr::createImplicit(parentTy, ctx);
+  auto *P = new (ctx) EnumElementPattern(
+      parentExpr, dotLoc, nameLoc, decl->createNameRef(), decl, subPattern, DC);
+  P->setImplicit();
+  P->setType(parentTy);
+  return P;
+}
+
+SourceLoc EnumElementPattern::getStartLoc() const {
+  return (ParentType && !ParentType->isImplicit())
+             ? ParentType->getSourceRange().Start
+             : DotLoc.isValid() ? DotLoc : NameLoc.getBaseNameLoc();
+}
+
+SourceLoc EnumElementPattern::getEndLoc() const {
+  if (SubPattern && SubPattern->getSourceRange().isValid()) {
+    return SubPattern->getSourceRange().End;
+  }
+  return NameLoc.getEndLoc();
+}
+
+TypeRepr *EnumElementPattern::getParentTypeRepr() const {
+  if (!ParentType)
+    return nullptr;
+  return ParentType->getTypeRepr();
+}
+
+Type EnumElementPattern::getParentType() const {
+  if (!ParentType)
+    return Type();
+  return ParentType->getInstanceType();
+}
+
+void EnumElementPattern::setParentType(Type type) {
+  assert(type);
+  if (ParentType) {
+    ParentType->setType(MetatypeType::get(type));
+  } else {
+    ParentType = TypeExpr::createImplicit(type, type->getASTContext());
+  }
 }
 
 SourceLoc ExprPattern::getLoc() const {
@@ -431,4 +675,183 @@ SourceLoc ExprPattern::getLoc() const {
 SourceRange ExprPattern::getSourceRange() const {
   return getSubExpr()->getSourceRange();
 }
+
+// See swift/Basic/Statistic.h for declaration: this enables tracing Patterns, is
+// defined here to avoid too much layering violation / circular linkage
+// dependency.
+
+struct PatternTraceFormatter : public UnifiedStatsReporter::TraceFormatter {
+  void traceName(const void *Entity, raw_ostream &OS) const override {
+    if (!Entity)
+      return;
+    const Pattern *P = static_cast<const Pattern *>(Entity);
+    if (const NamedPattern *NP = dyn_cast<NamedPattern>(P)) {
+      OS << NP->getBoundName();
+    }
+  }
+  void traceLoc(const void *Entity, SourceManager *SM,
+                clang::SourceManager *CSM, raw_ostream &OS) const override {
+    if (!Entity)
+      return;
+    const Pattern *P = static_cast<const Pattern *>(Entity);
+    P->getSourceRange().print(OS, *SM, false);
+  }
+};
+
+static PatternTraceFormatter TF;
+
+template<>
+const UnifiedStatsReporter::TraceFormatter*
+FrontendStatsTracer::getTraceFormatter<const Pattern *>() {
+  return &TF;
+}
+
+
+ContextualPattern ContextualPattern::forPatternBindingDecl(
+    PatternBindingDecl *pbd, unsigned index) {
+  return ContextualPattern(
+      pbd->getPattern(index), /*isTopLevel=*/true, pbd, index);
+}
+
+DeclContext *ContextualPattern::getDeclContext() const {
+  if (auto pbd = getPatternBindingDecl())
+    return pbd->getDeclContext();
+
+  return declOrContext.get<DeclContext *>();
+}
+
+PatternBindingDecl *ContextualPattern::getPatternBindingDecl() const {
+  return declOrContext.dyn_cast<PatternBindingDecl *>();
+}
+
+bool ContextualPattern::allowsInference() const {
+  if (auto pbd = getPatternBindingDecl()) {
+    return pbd->isInitialized(index) ||
+        pbd->isDefaultInitializableViaPropertyWrapper(index);
+  }
+
+  return true;
+}
+
+void swift::simple_display(llvm::raw_ostream &out,
+                           const ContextualPattern &pattern) {
+  simple_display(out, pattern.getPattern());
+}
+
+void swift::simple_display(llvm::raw_ostream &out, const Pattern *pattern) {
+  out << "(pattern @ " << pattern << ")";
+}
+
+SourceLoc swift::extractNearestSourceLoc(const Pattern *pattern) {
+  return pattern->getLoc();
+}
+
+ValueOwnership
+Pattern::getOwnership(
+  SmallVectorImpl<Pattern *> *mostRestrictiveSubpatterns) const
+{
+  class GetPatternOwnership: public PatternVisitor<GetPatternOwnership, void> {
+  public:
+    ValueOwnership Ownership = ValueOwnership::Shared;
+    SmallVectorImpl<Pattern *> *RestrictingPatterns = nullptr;
+
+    void increaseOwnership(ValueOwnership newOwnership, Pattern *p) {
+      // If the new ownership is stricter than the current ownership, then
+      // clear the restricting patterns we'd collected and start over with the
+      // new stricter ownership.
+      if (newOwnership > Ownership) {
+        Ownership = newOwnership;
+        if (RestrictingPatterns) {
+          RestrictingPatterns->clear();
+        }
+      }
+      
+      if (RestrictingPatterns
+          && newOwnership == Ownership
+          && Ownership > ValueOwnership::Shared) {
+        RestrictingPatterns->push_back(p);
+      }
+    }
+
+#define USE_SUBPATTERN(Kind) \
+    void visit##Kind##Pattern(Kind##Pattern *pattern) { \
+      return visit(pattern->getSubPattern());            \
+    }
+
+    USE_SUBPATTERN(Paren)
+    USE_SUBPATTERN(Typed)
+    USE_SUBPATTERN(Binding)
+#undef USE_SUBPATTERN
+    void visitTuplePattern(TuplePattern *p) {
+      for (auto &element : p->getElements()) {
+        visit(element.getPattern());
+      }
+    }
+    
+    void visitNamedPattern(NamedPattern *p) {
+      switch (p->getDecl()->getIntroducer()) {
+      case VarDecl::Introducer::Let:
+        // `let` defaults to the prevailing ownership of the switch.
+        break;
+      
+      case VarDecl::Introducer::Var:
+        // If the subpattern type is copyable, then we can bind the variable
+        // by copying without requiring more than a borrow of the original.
+        if (!p->hasType() || !p->getType()->isNoncopyable()) {
+          break;
+        }
+        // TODO: An explicit `consuming` binding kind consumes regardless of
+        // type.
+      
+        // Noncopyable `var` consumes the bound value to move it into
+        // a new independent variable.
+        increaseOwnership(ValueOwnership::Owned, p);
+        break;
+        
+      case VarDecl::Introducer::InOut:
+        // `inout` bindings modify the value in-place.
+        increaseOwnership(ValueOwnership::InOut, p);
+        break;
+        
+      case VarDecl::Introducer::Borrowing:
+        // `borrow` bindings borrow parts of the value in-place.
+        increaseOwnership(ValueOwnership::Shared, p);        
+        break;
+      }
+    }
+    
+    void visitAnyPattern(AnyPattern *p) {
+      /* no change */
+    }
+    void visitBoolPattern(BoolPattern *p) {
+      /* no change */
+    }
+    
+    void visitIsPattern(IsPattern *p) {
+      // Casting has to either be possible by borrowing or copying the subject,
+      // or can't be supported in a pattern match.
+      /* no change */
+    }
+    
+    void visitEnumElementPattern(EnumElementPattern *p) {
+      if (p->hasSubPattern()) {
+        visit(p->getSubPattern());
+      }
+    }
+    
+    void visitOptionalSomePattern(OptionalSomePattern *p) {
+      visit(p->getSubPattern());
+    }
+    
+    void visitExprPattern(ExprPattern *p) {
+      // A `~=` operator has to be able to either borrow or copy the operand,
+      // or can't be used.
+      /* no change */
+    }
+  };
   
+  GetPatternOwnership visitor;
+  visitor.RestrictingPatterns = mostRestrictiveSubpatterns;
+  visitor.visit(const_cast<Pattern *>(this));
+  return visitor.Ownership;
+}

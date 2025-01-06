@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2019 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -19,22 +19,31 @@
 #ifndef SWIFT_DEMANGLING_DEMANGLE_H
 #define SWIFT_DEMANGLING_DEMANGLE_H
 
-#include <memory>
-#include <string>
+#include "swift/Demangling/Errors.h"
+#include "swift/Demangling/ManglingFlavor.h"
+#include "swift/Demangling/NamespaceMacros.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Compiler.h"
+
 #include <cassert>
 #include <cstdint>
-#include "llvm/ADT/StringRef.h"
-
-namespace llvm {
-  class raw_ostream;
-}
+#include <functional>
+#include <memory>
+#include <string>
 
 namespace swift {
 namespace Demangle {
+SWIFT_BEGIN_INLINE_NAMESPACE
 
+enum class SymbolicReferenceKind : uint8_t;
+
+/// A simple default implementation that assigns letters to type parameters in
+/// alphabetic order.
+std::string genericParameterName(uint64_t depth, uint64_t index);
+
+/// Display style options for the demangler.
 struct DemangleOptions {
   bool SynthesizeSugarOnTypes = false;
-  bool DisplayDebuggerGeneratedModule = true;
   bool QualifyEntities = true;
   bool DisplayExtensionContexts = true;
   bool DisplayUnmangledSuffix = true;
@@ -43,12 +52,25 @@ struct DemangleOptions {
   bool DisplayProtocolConformances = true;
   bool DisplayWhereClauses = true;
   bool DisplayEntityTypes = true;
+  bool DisplayLocalNameContexts = true;
   bool ShortenPartialApply = false;
   bool ShortenThunk = false;
   bool ShortenValueWitness = false;
   bool ShortenArchetype = false;
   bool ShowPrivateDiscriminators = true;
   bool ShowFunctionArgumentTypes = true;
+  bool DisplayDebuggerGeneratedModule = true;
+  bool DisplayStdlibModule = true;
+  bool DisplayObjCModule = true;
+  bool PrintForTypeName = false;
+  bool ShowAsyncResumePartial = true;
+  bool ShowClosureSignature = true;
+
+  /// If this is nonempty, entities in this module name will not be qualified.
+  llvm::StringRef HidingCurrentModule;
+  /// A function to render generic parameter names.
+  std::function<std::string(uint64_t, uint64_t)> GenericParameterName =
+      genericParameterName;
 
   DemangleOptions() {}
 
@@ -69,12 +91,13 @@ struct DemangleOptions {
     Opt.ShortenArchetype = true;
     Opt.ShowPrivateDiscriminators = false;
     Opt.ShowFunctionArgumentTypes = false;
+    Opt.ShowAsyncResumePartial = false;
     return Opt;
   };
 };
 
 class Node;
-typedef Node *NodePointer;
+using NodePointer = Node *;
 
 enum class FunctionSigSpecializationParamKind : unsigned {
   // Option Flags use bits 0-5. This give us 6 bits implying 64 entries to
@@ -87,26 +110,60 @@ enum class FunctionSigSpecializationParamKind : unsigned {
   ClosureProp = 5,
   BoxToValue = 6,
   BoxToStack = 7,
+  InOutToOut = 8,
+  ConstantPropKeyPath = 9,
 
   // Option Set Flags use bits 6-31. This gives us 26 bits to use for option
   // flags.
   Dead = 1 << 6,
   OwnedToGuaranteed = 1 << 7,
   SROA = 1 << 8,
+  GuaranteedToOwned = 1 << 9,
+  ExistentialToGeneric = 1 << 10,
+};
+
+enum class AutoDiffFunctionKind : char {
+  JVP = 'f',
+  VJP = 'r',
+  Differential = 'd',
+  Pullback = 'p',
+};
+
+enum class MangledDifferentiabilityKind : char {
+  NonDifferentiable = 0,
+  Forward = 'f',
+  Reverse = 'r',
+  Normal = 'd',
+  Linear = 'l',
+};
+
+enum class MangledSILThunkKind : char {
+  Invalid = 0,
+  Identity = 'I',
+  HopToMainActorIfNeeded = 'H',
 };
 
 /// The pass that caused the specialization to occur. We use this to make sure
 /// that two passes that generate similar changes do not yield the same
 /// mangling. This currently cannot happen, so this is just a safety measure
 /// that creates separate name spaces.
+///
+/// The number of entries is limited! See `Demangler::demangleSpecAttributes`.
+/// If you exceed the max, you'll need to upgrade the mangling.
 enum class SpecializationPass : uint8_t {
-  AllocBoxToStack,
+  AllocBoxToStack = 0,
   ClosureSpecializer,
   CapturePromotion,
   CapturePropagation,
   FunctionSignatureOpts,
   GenericSpecializer,
+  MoveDiagnosticInOutToOut,
+  AsyncDemotion,
+  LAST = AsyncDemotion
 };
+
+constexpr uint8_t MAX_SPECIALIZATION_PASS = 10;
+static_assert((uint8_t)SpecializationPass::LAST < MAX_SPECIALIZATION_PASS);
 
 static inline char encodeSpecializationPass(SpecializationPass Pass) {
   return char(uint8_t(Pass)) + '0';
@@ -132,37 +189,44 @@ public:
 #include "swift/Demangling/DemangleNodes.def"
   };
 
-  typedef uint64_t IndexType;
+  using IndexType = uint64_t;
 
   friend class NodeFactory;
   
 private:
+
+  struct NodeVector {
+    NodePointer *Nodes;
+    uint32_t Number = 0;
+    uint32_t Capacity = 0;
+  };
+
+  union {
+    llvm::StringRef Text;
+    IndexType Index;
+    NodePointer InlineChildren[2];
+    NodeVector Children;
+  };
+
+
   Kind NodeKind;
 
   enum class PayloadKind : uint8_t {
-    None, Text, Index
+    None = 0, OneChild = 1, TwoChildren = 2,
+    Text, Index, ManyChildren
   };
   PayloadKind NodePayloadKind;
-
-  union {
-    llvm::StringRef TextPayload;
-    IndexType IndexPayload;
-  };
-
-  NodePointer *Children = nullptr;
-  size_t NumChildren = 0;
-  size_t ReservedChildren = 0;
 
   Node(Kind k)
       : NodeKind(k), NodePayloadKind(PayloadKind::None) {
   }
   Node(Kind k, llvm::StringRef t)
       : NodeKind(k), NodePayloadKind(PayloadKind::Text) {
-    TextPayload = t;
+    Text = t;
   }
   Node(Kind k, IndexType index)
       : NodeKind(k), NodePayloadKind(PayloadKind::Index) {
-    IndexPayload = index;
+    Index = index;
   }
   Node(const Node &) = delete;
   Node &operator=(const Node &) = delete;
@@ -170,69 +234,186 @@ private:
 public:
   Kind getKind() const { return NodeKind; }
 
+  bool isSimilarTo(const Node *other) const {
+    if (NodeKind != other->NodeKind
+        || NodePayloadKind != other->NodePayloadKind)
+      return false;
+    switch (NodePayloadKind) {
+    case PayloadKind::ManyChildren:
+      return Children.Number == other->Children.Number;
+    case PayloadKind::Index:
+      return Index == other->Index;
+    case PayloadKind::Text:
+      return Text == other->Text;
+    default:
+      return true;
+    }
+  }
+
+  static bool deepEquals(const Node *lhs, const Node *rhs) {
+    if (lhs == rhs)
+      return true;
+    if ((!lhs && rhs) || (lhs && !rhs))
+      return false;
+    if (!lhs->isSimilarTo(rhs))
+      return false;
+    for (auto li = lhs->begin(), ri = rhs->begin(), le = lhs->end(); li != le;
+         ++li, ++ri) {
+      if (!deepEquals(*li, *ri))
+        return false;
+    }
+    return true;
+  }
+
+  bool isDeepEqualTo(const Node *other) const {
+    return deepEquals(this, other);
+  }
+
   bool hasText() const { return NodePayloadKind == PayloadKind::Text; }
   llvm::StringRef getText() const {
     assert(hasText());
-    return TextPayload;
+    return Text;
   }
 
   bool hasIndex() const { return NodePayloadKind == PayloadKind::Index; }
   uint64_t getIndex() const {
     assert(hasIndex());
-    return IndexPayload;
+    return Index;
   }
-  
-  typedef NodePointer *iterator;
-  typedef const NodePointer *const_iterator;
-  typedef size_t size_type;
 
-  bool hasChildren() const { return NumChildren != 0; }
-  size_t getNumChildren() const { return NumChildren; }
-  iterator begin() { return Children; }
-  iterator end() { return Children + NumChildren; }
-  const_iterator begin() const { return Children; }
-  const_iterator end() const { return Children + NumChildren; }
+  using iterator = const NodePointer *;
+
+  size_t getNumChildren() const {
+    switch (NodePayloadKind) {
+    case PayloadKind::OneChild: return 1;
+    case PayloadKind::TwoChildren: return 2;
+    case PayloadKind::ManyChildren: return Children.Number;
+    default: return 0;
+    }
+  }
+
+  bool hasChildren() const { return getNumChildren() != 0; }
+
+  iterator begin() const {
+    switch (NodePayloadKind) {
+    case PayloadKind::OneChild:
+    case PayloadKind::TwoChildren:
+      return &InlineChildren[0];
+    case PayloadKind::ManyChildren:
+      return Children.Nodes;
+    default:
+      return nullptr;
+    }
+  }
+
+  iterator end() const {
+    switch (NodePayloadKind) {
+    case PayloadKind::OneChild:
+      return &InlineChildren[1];
+    case PayloadKind::TwoChildren:
+      return &InlineChildren[2];
+    case PayloadKind::ManyChildren:
+      return Children.Nodes + Children.Number;
+    default:
+      return nullptr;
+    }
+  }
 
   NodePointer getFirstChild() const {
-    assert(NumChildren >= 1);
-    return Children[0];
+    return getChild(0);
+  }
+  NodePointer getLastChild() const {
+    return getChild(getNumChildren() - 1);
   }
   NodePointer getChild(size_t index) const {
-    assert(NumChildren > index);
-    return Children[index];
+    if (index >= getNumChildren())
+      return nullptr;
+    return begin()[index];
   }
-
-//  inline void addChild(NodePointer Child, Context &Ctx);
 
   // Only to be used by the demangler parsers.
   void addChild(NodePointer Child, NodeFactory &Factory);
+  // Only to be used by the demangler parsers.
+  void removeChildAt(unsigned Pos);
+
+  void replaceChild(unsigned Pos, NodePointer Child);
 
   // Reverses the order of children.
   void reverseChildren(size_t StartingAt = 0);
 
+  // Find a node by its kind, traversing the node depth-first,
+  // and bailing out early if not found at the 'maxDepth'.
+  NodePointer findByKind(Node::Kind kind, int maxDepth);
+
   /// Prints the whole node tree in readable form to stderr.
   ///
   /// Useful to be called from the debugger.
-  void dump();
+  void dump() LLVM_ATTRIBUTE_USED;
 };
 
 /// Returns the length of the swift mangling prefix of the \p SymbolName.
 ///
 /// Returns 0 if \p SymbolName is not a mangled swift (>= swift 4.x) name.
-int getManglingPrefixLength(const char *mangledName);
+int getManglingPrefixLength(llvm::StringRef mangledName);
 
 /// Returns true if \p SymbolName is a mangled swift name.
 ///
 /// This does not include the old (<= swift 3.x) mangling prefix "_T".
-inline bool isMangledName(llvm::StringRef MangledName) {
-  return getManglingPrefixLength(MangledName.data()) != 0;
+inline bool isMangledName(llvm::StringRef mangledName) {
+  return getManglingPrefixLength(mangledName) != 0;
 }
 
 /// Returns true if the mangledName starts with the swift mangling prefix.
 ///
 /// This includes the old (<= swift 3.x) mangling prefix "_T".
-/// \param mangledName A null-terminated string containing a mangled name.
+bool isSwiftSymbol(llvm::StringRef mangledName);
+
+/// Returns true if the mangledName starts with the swift mangling prefix.
+///
+/// This includes the old (<= swift 3.x) mangling prefix "_T".
 bool isSwiftSymbol(const char *mangledName);
+
+/// Drops the Swift mangling prefix from the given mangled name, if there is
+/// one.
+///
+/// This does not include the old (<= swift 3.x) mangling prefix "_T".
+llvm::StringRef dropSwiftManglingPrefix(llvm::StringRef mangledName);
+
+/// Returns true if the mangled name is an alias type name.
+///
+/// \param mangledName A null-terminated string containing a mangled name.
+bool isAlias(llvm::StringRef mangledName);
+
+/// Returns true if the mangled name is a class type name.
+///
+/// \param mangledName A null-terminated string containing a mangled name.
+bool isClass(llvm::StringRef mangledName);
+
+/// Returns true if the mangled name is an enum type name.
+///
+/// \param mangledName A null-terminated string containing a mangled name.
+bool isEnum(llvm::StringRef mangledName);
+
+/// Returns true if the mangled name is a protocol type name.
+///
+/// \param mangledName A null-terminated string containing a mangled name.
+bool isProtocol(llvm::StringRef mangledName);
+
+/// Returns true if the mangled name is a structure type name.
+///
+/// \param mangledName A null-terminated string containing a mangled name.
+bool isStruct(llvm::StringRef mangledName);
+
+/// Returns true if the mangled name is an Objective-C symbol.
+///
+/// \param mangledName A null-terminated string containing a mangled name.
+bool isObjCSymbol(llvm::StringRef mangledName);
+
+/// Returns true if the mangled name has the old scheme of function type
+/// mangling where labels are part of the type.
+///
+/// \param mangledName A null-terminated string containing a mangled name.
+bool isOldFunctionTypeMangling(llvm::StringRef mangledName);
 
 class Demangler;
 
@@ -291,8 +472,9 @@ public:
   /// prefix: _T, _T0, $S, _$S.
   ///
   /// \returns The demangled string.
-  std::string demangleSymbolAsString(llvm::StringRef MangledName,
-                            const DemangleOptions &Options = DemangleOptions());
+  std::string demangleSymbolAsString(
+      llvm::StringRef MangledName,
+      const DemangleOptions &Options = DemangleOptions());
 
   /// Demangle the given type and return the readable name.
   ///
@@ -300,13 +482,14 @@ public:
   /// a mangling prefix.
   ///
   /// \returns The demangled string.
-  std::string demangleTypeAsString(llvm::StringRef MangledName,
-                            const DemangleOptions &Options = DemangleOptions());
+  std::string
+  demangleTypeAsString(llvm::StringRef MangledName,
+                       const DemangleOptions &Options = DemangleOptions());
 
   /// Returns true if the mangledName refers to a thunk function.
   ///
   /// Thunk functions are either (ObjC) partial apply forwarder, swift-as-ObjC
-  /// or ObjC-as-swift thunks.
+  /// or ObjC-as-swift thunks or allocating init functions.
   bool isThunkSymbol(llvm::StringRef MangledName);
 
   /// Returns the mangled name of the target of a thunk.
@@ -323,6 +506,14 @@ public:
   /// The return value is unspecified if the \p MangledName does not refer to a
   /// function symbol.
   bool hasSwiftCallingConvention(llvm::StringRef MangledName);
+
+  /// Demangle the given symbol and return the module name of the symbol.
+  ///
+  /// \param mangledName The mangled symbol string, which start a mangling
+  /// prefix: _T, _T0, $S, _$S.
+  ///
+  /// \returns The module name.
+  std::string getModuleName(llvm::StringRef mangledName);
 
   /// Deallocates all nodes.
   ///
@@ -412,23 +603,120 @@ enum class OperatorKind {
   Infix,
 };
 
-/// \brief Mangle an identifier using Swift's mangling rules.
-void mangleIdentifier(const char *data, size_t length,
-                      OperatorKind operatorKind, std::string &out,
-                      bool usePunycode = true);
+/// A mangling error, which consists of an error code and a Node pointer
+struct [[nodiscard]] ManglingError {
+  enum Code {
+    Success = 0,
+    AssertionFailed,
+    Uninitialized,
+    TooComplex,
+    BadNodeKind,
+    BadNominalTypeKind,
+    NotAStorageNode,
+    UnsupportedNodeKind,
+    UnexpectedBuiltinVectorType,
+    UnexpectedBuiltinType,
+    MultipleChildNodes,
+    WrongNodeType,
+    WrongDependentMemberType,
+    BadDirectness,
+    UnknownEncoding,
+    InvalidImplCalleeConvention,
+    InvalidImplDifferentiability,
+    InvalidImplCoroutineKind,
+    InvalidImplFunctionAttribute,
+    InvalidImplParameterConvention,
+    InvalidImplParameterSending,
+    InvalidMetatypeRepresentation,
+    MultiByteRelatedEntity,
+    BadValueWitnessKind,
+    NotAContextNode,
+  };
 
-/// \brief Remangle a demangled parse tree.
+  Code        code;
+  NodePointer node;
+  unsigned    line;
+
+  ManglingError() : code(Uninitialized), node(nullptr) {}
+  ManglingError(Code c) : code(c), node(nullptr), line(0) {}
+  ManglingError(Code c, NodePointer n, unsigned l) : code(c), node(n), line(l) {}
+
+  bool isSuccess() const { return code == Success; }
+};
+
+#define MANGLING_ERROR(c,n)     ManglingError((c), (n), __LINE__)
+
+/// Used as a return type for mangling functions that may fail
+template <typename T>
+class [[nodiscard]] ManglingErrorOr {
+private:
+  ManglingError err_;
+  T             value_;
+
+public:
+  ManglingErrorOr() : err_() {}
+  ManglingErrorOr(ManglingError::Code code,
+                  NodePointer node = nullptr,
+                  unsigned line = 0)
+  : err_(code, node, line) {}
+  ManglingErrorOr(const ManglingError &err) : err_(err) {}
+  ManglingErrorOr(const T &t) : err_(ManglingError::Success), value_(t) {}
+  ManglingErrorOr(T &&t) : err_(ManglingError::Success), value_(std::move(t)) {}
+
+  bool isSuccess() const { return err_.code == ManglingError::Success; }
+
+  const ManglingError &error() const { return err_; }
+
+  const T &result() const {
+    assert(isSuccess());
+    return value_;
+  }
+};
+
+/// Remangle a demangled parse tree.
+ManglingErrorOr<std::string>
+mangleNode(NodePointer root,
+           Mangle::ManglingFlavor Flavor = Mangle::ManglingFlavor::Default);
+
+using SymbolicResolver = llvm::function_ref<Demangle::NodePointer(
+    SymbolicReferenceKind, const void *)>;
+
+/// Remangle a demangled parse tree, using a callback to resolve
+/// symbolic references.
+ManglingErrorOr<std::string>
+mangleNode(NodePointer root, SymbolicResolver resolver,
+           Mangle::ManglingFlavor Flavor = Mangle::ManglingFlavor::Default);
+
+/// Remangle a demangled parse tree, using a callback to resolve
+/// symbolic references.
 ///
-/// This should always round-trip perfectly with demangleSymbolAsNode.
-std::string mangleNode(const NodePointer &root);
+/// The returned string is owned by \p Factory. This means \p Factory must stay
+/// alive as long as the returned string is used.
+ManglingErrorOr<llvm::StringRef>
+mangleNode(NodePointer root, SymbolicResolver resolver, NodeFactory &Factory,
+           Mangle::ManglingFlavor Flavor = Mangle::ManglingFlavor::Default);
 
 /// Remangle in the old mangling scheme.
 ///
-/// This is only used for objc-runtime names and should be removed as soon as
-/// we switch to the new mangling for those names as well.
-std::string mangleNodeOld(const NodePointer &root);
+/// This is only used for objc-runtime names.
+ManglingErrorOr<std::string> mangleNodeOld(NodePointer root);
 
-/// \brief Transform the node structure to a string.
+/// Remangle in the old mangling scheme.
+///
+/// This is only used for objc-runtime names.
+/// The returned string is owned by \p Factory. This means \p Factory must stay
+/// alive as long as the returned string is used.
+ManglingErrorOr<llvm::StringRef> mangleNodeOld(NodePointer node,
+                                               NodeFactory &Factory);
+
+/// Remangle in the old mangling scheme and embed the name in "_Tt<name>_".
+///
+/// The returned string is null terminated and owned by \p Factory. This means
+/// \p Factory must stay alive as long as the returned string is used.
+ManglingErrorOr<const char *> mangleNodeAsObjcCString(NodePointer node,
+                                                      NodeFactory &Factory);
+
+/// Transform the node structure to a string.
 ///
 /// Typical usage:
 /// \code
@@ -443,6 +731,11 @@ std::string mangleNodeOld(const NodePointer &root);
 ///
 std::string nodeToString(NodePointer Root,
                          const DemangleOptions &Options = DemangleOptions());
+
+/// Transforms a mangled key path accessor thunk helper
+/// into the identfier/subscript that would be used to invoke it in swift code.
+std::string keyPathSourceString(const char *MangledName,
+                                size_t MangledNameLength);
 
 /// A class for printing to a std::string.
 class DemanglerPrinter {
@@ -478,6 +771,8 @@ public:
     return std::move(*this << std::forward<T>(x));
   }
   
+  DemanglerPrinter &writeHex(unsigned long long n) &;
+ 
   std::string &&str() && { return std::move(Stream); }
 
   llvm::StringRef getStringRef() const { return Stream; }
@@ -499,10 +794,31 @@ const char *getNodeKindString(swift::Demangle::Node::Kind k);
 /// Useful for debugging.
 std::string getNodeTreeAsString(NodePointer Root);
 
-bool isSpecialized(Node *node);
-NodePointer getUnspecialized(Node *node, NodeFactory &Factory);
-std::string archetypeName(Node::IndexType index, Node::IndexType depth);
+bool nodeConsumesGenericArgs(Node *node);
 
+bool isSpecialized(Node *node);
+
+ManglingErrorOr<NodePointer> getUnspecialized(Node *node, NodeFactory &Factory);
+
+/// Returns true if the node \p kind refers to a context node, e.g. a nominal
+/// type or a function.
+bool isContext(Node::Kind kind);
+
+/// Returns true if the node \p kind refers to a node which is placed before a
+/// function node, e.g. a specialization attribute.
+bool isFunctionAttr(Node::Kind kind);
+
+/// Form a StringRef around the mangled name starting at base, if the name may
+/// contain symbolic references.
+llvm::StringRef makeSymbolicMangledNameStringRef(const char *base);
+
+/// Produce the mangled name for the nominal type descriptor of a type
+/// referenced by its module and type name.
+std::string mangledNameForTypeMetadataAccessor(
+    llvm::StringRef moduleName, llvm::StringRef typeName, Node::Kind typeKind,
+    Mangle::ManglingFlavor Flavor = Mangle::ManglingFlavor::Default);
+
+SWIFT_END_INLINE_NAMESPACE
 } // end namespace Demangle
 } // end namespace swift
 

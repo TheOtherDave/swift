@@ -3,7 +3,7 @@
 protocol HasSelfRequirements {
   func foo(_ x: Self)
 
-  func returnsOwnProtocol() -> HasSelfRequirements // expected-error{{protocol 'HasSelfRequirements' can only be used as a generic constraint because it has Self or associated type requirements}}
+  func returnsOwnProtocol() -> HasSelfRequirements // expected-error {{use of protocol 'HasSelfRequirements' as a type must be written 'any HasSelfRequirements'}}
 }
 protocol Bar {
   // init() methods should not prevent use as an existential.
@@ -36,10 +36,10 @@ func useCompoAsWhereRequirement<T>(_ x: T) where T: HasSelfRequirements & Bar {}
 func useCompoAliasAsWhereRequirement<T>(_ x: T) where T: Compo {}
 func useNestedCompoAliasAsWhereRequirement<T>(_ x: T) where T: CompoAssocType.Compo {}
 
-func useAsType(_ x: HasSelfRequirements) { } // expected-error{{protocol 'HasSelfRequirements' can only be used as a generic constraint}}
-func useCompoAsType(_ x: HasSelfRequirements & Bar) { } // expected-error{{protocol 'HasSelfRequirements' can only be used as a generic constraint}}
-func useCompoAliasAsType(_ x: Compo) { } // expected-error{{protocol 'HasSelfRequirements' can only be used as a generic constraint}}
-func useNestedCompoAliasAsType(_ x: CompoAssocType.Compo) { } // expected-error{{protocol 'HasSelfRequirements' can only be used as a generic constraint}}
+func useAsType(_: any HasSelfRequirements,
+               _: any HasSelfRequirements & Bar,
+               _: any Compo,
+               _: any CompoAssocType.Compo) { }
 
 struct TypeRequirement<T: HasSelfRequirements> {}
 struct CompoTypeRequirement<T: HasSelfRequirements & Bar> {}
@@ -52,14 +52,14 @@ struct NestedCompoAliasTypeWhereRequirement<T> where T: CompoAssocType.Compo {}
 
 struct Struct1<T> { }
 struct Struct2<T : Pub & Bar> { }
-struct Struct3<T : Pub & Bar & P3> { } // expected-error {{use of undeclared type 'P3'}}
+struct Struct3<T : Pub & Bar & P3> { } // expected-error {{cannot find type 'P3' in scope}}
 struct Struct4<T> where T : Pub & Bar {}
 
-struct Struct5<T : protocol<Pub, Bar>> { } // expected-warning {{'protocol<...>' composition syntax is deprecated; join the protocols using '&'}}
-struct Struct6<T> where T : protocol<Pub, Bar> {} // expected-warning {{'protocol<...>' composition syntax is deprecated; join the protocols using '&'}}
+struct Struct5<T : protocol<Pub, Bar>> { } // expected-error {{'protocol<...>' composition syntax has been removed; join the type constraints using '&'}}
+struct Struct6<T> where T : protocol<Pub, Bar> {} // expected-error {{'protocol<...>' composition syntax has been removed; join the type constraints using '&'}}
 
 typealias T1 = Pub & Bar
-typealias T2 = protocol<Pub , Bar> // expected-warning {{'protocol<...>' composition syntax is deprecated; join the protocols using '&'}}
+typealias T2 = protocol<Pub , Bar> // expected-error {{'protocol<...>' composition syntax has been removed; join the type constraints using '&'}}
 
 // rdar://problem/20593294
 protocol HasAssoc {
@@ -67,29 +67,43 @@ protocol HasAssoc {
   func foo()
 }
 
-func testHasAssoc(_ x: Any) {
-  if let p = x as? HasAssoc { // expected-error {{protocol 'HasAssoc' can only be used as a generic constraint}}
-    p.foo() // don't crash here.
+do {
+  enum MyError : Error {
+    case bad(Any)
+  }
+
+  func checkIt(_ js: Any) throws {
+    switch js {
+    case let dbl as HasAssoc: // expected-error {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}
+      throw MyError.bad(dbl)
+
+    default:
+      fatalError("wrong")
+    }
   }
 }
 
-// rdar://problem/16803384
-protocol InheritsAssoc : HasAssoc {
-  func silverSpoon()
+func testHasAssoc(_ x: Any, _: HasAssoc) { // expected-error {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}
+  if let p = x as? any HasAssoc {
+    p.foo() // don't crash here.
+  }
+
+  struct ConformingType : HasAssoc {
+    typealias Assoc = Int
+    func foo() {}
+
+    func method() -> HasAssoc {} // expected-error {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}
+  }
 }
 
-func testInheritsAssoc(_ x: InheritsAssoc) { // expected-error {{protocol 'InheritsAssoc' can only be used as a generic constraint}}
-  x.silverSpoon()
-}
-
-// SR-38
-var b: HasAssoc // expected-error {{protocol 'HasAssoc' can only be used as a generic constraint because it has Self or associated type requirements}}
+// https://github.com/apple/swift/issues/42661
+var b: HasAssoc // expected-error {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}
 
 // Further generic constraint error testing - typealias used inside statements
 protocol P {}
 typealias MoreHasAssoc = HasAssoc & P
 func testHasMoreAssoc(_ x: Any) {
-  if let p = x as? MoreHasAssoc { // expected-error {{protocol 'HasAssoc' can only be used as a generic constraint}}
+  if let p = x as? any MoreHasAssoc {
     p.foo() // don't crash here.
   }
 }
@@ -103,3 +117,131 @@ struct Outer {
 typealias X = Struct1<Pub & Bar>
 _ = Struct1<Pub & Bar>.self
 
+typealias AliasWhere<T> = T
+where T : HasAssoc, T.Assoc == HasAssoc // expected-error {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}
+
+struct StructWhere<T>
+where T : HasAssoc,
+      T.Assoc == any HasAssoc {}
+
+protocol ProtocolWhere where T == HasAssoc { // expected-error {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}
+  associatedtype T
+
+  associatedtype U : HasAssoc
+    where U.Assoc == any HasAssoc
+}
+
+extension HasAssoc where Assoc == HasAssoc {} // expected-error {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}
+
+func FunctionWhere<T>(_: T)
+where T : HasAssoc,
+      T.Assoc == any HasAssoc {}
+
+struct SubscriptWhere {
+  subscript<T>(_: T) -> Int
+  where T : HasAssoc,
+        T.Assoc == any HasAssoc {
+    get {}
+    set {}
+  }
+}
+
+struct OuterGeneric<T> {
+  func contextuallyGenericMethod() where T == any HasAssoc {}
+}
+
+typealias HasAssocAlias = HasAssoc
+
+func testExistentialInCase(_ x: Any) {
+  switch x {
+  case is HasAssoc:
+    // expected-error@-1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}
+    break
+  default:
+    break
+  }
+  _ = {
+    switch x {
+    case is HasAssoc:
+      // expected-error@-1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}
+      break
+    default:
+      break
+    }
+  }
+  switch x {
+  case is HasAssocAlias:
+    // expected-error@-1 {{use of 'HasAssocAlias' (aka 'HasAssoc') as a type must be written 'any HasAssocAlias' (aka 'any HasAssoc')}}
+    break
+  default:
+    break
+  }
+  _ = {
+    switch x {
+    case is HasAssocAlias:
+      // expected-error@-1 {{use of 'HasAssocAlias' (aka 'HasAssoc') as a type must be written 'any HasAssocAlias' (aka 'any HasAssoc')}}
+      break
+    default:
+      break
+    }
+  }
+  switch x {
+  case is ~Copyable:
+    // expected-error@-1 {{constraint that suppresses conformance requires 'any'}}
+    // expected-warning@-2 {{'is' test is always true}}
+    break
+  default:
+    break
+  }
+  _ = {
+    switch x {
+    case is ~Copyable:
+      // expected-error@-1 {{constraint that suppresses conformance requires 'any'}}
+      // expected-warning@-2 {{'is' test is always true}}
+      break
+    default:
+      break
+    }
+  }
+}
+
+func throwingFn() throws {}
+
+// These are downgraded to warnings until Swift 7, see protocol_types_swift7.swift.
+// https://github.com/swiftlang/swift/issues/77553
+func testExistentialInCatch() throws {
+  do {
+    try throwingFn()
+  } catch is HasAssoc {}
+  // expected-warning@-1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}
+  _ = {
+    do {
+      try throwingFn()
+    } catch is HasAssoc {}
+    // expected-warning@-1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}
+  }
+  do {
+    try throwingFn()
+  } catch is HasAssocAlias {}
+  // expected-warning@-1 {{use of 'HasAssocAlias' (aka 'HasAssoc') as a type must be written 'any HasAssocAlias' (aka 'any HasAssoc')}}
+  _ = {
+    do {
+      try throwingFn()
+    } catch is HasAssocAlias {}
+    // expected-warning@-1 {{use of 'HasAssocAlias' (aka 'HasAssoc') as a type must be written 'any HasAssocAlias' (aka 'any HasAssoc')}}
+  }
+  do {
+    try throwingFn()
+  } catch is ~Copyable {}
+  // expected-warning@-1 {{constraint that suppresses conformance requires 'any'}}
+  // expected-warning@-2 {{'is' test is always true}}
+
+  // FIXME: We shouldn't emit a duplicate 'always true' warning here.
+  _ = {
+    do {
+      try throwingFn()
+    } catch is ~Copyable {}
+    // expected-warning@-1 {{constraint that suppresses conformance requires 'any'}}
+    // expected-warning@-2 2{{'is' test is always true}}
+  }
+}

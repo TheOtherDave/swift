@@ -29,21 +29,28 @@ enum class ArrayCallKind {
   kGetCount,
   kGetCapacity,
   kGetElement,
-  kGetArrayOwner,
   kGetElementAddress,
   kMakeMutable,
+  kEndMutation,
   kMutateUnknown,
   kReserveCapacityForAppend,
   kWithUnsafeMutableBufferPointer,
   kAppendContentsOf,
   kAppendElement,
+  kCopyIntoVector,
   // The following two semantic function kinds return the result @owned
   // instead of operating on self passed as parameter. If you are adding
   // a function, and it has a self parameter, make sure that it is defined
   // before this comment.
   kArrayInit,
-  kArrayUninitialized
+  kArrayInitEmpty,
+  kArrayUninitialized,
+  kArrayUninitializedIntrinsic,
+  kArrayFinalizeIntrinsic,
 };
+
+/// Return true is the given function is an array semantics call.
+ArrayCallKind getArraySemanticsKind(SILFunction *f);
 
 /// Wrapper around array semantic calls.
 class ArraySemanticsCall {
@@ -74,6 +81,11 @@ public:
   /// Match array semantic calls.
   ArraySemanticsCall(SILValue V, StringRef semanticName,
                      bool matchPartialName);
+
+  ArraySemanticsCall() : SemanticsCall(nullptr) {}
+
+  /// Return the SemanticsCall
+  ApplyInst *getInstruction() { return SemanticsCall; }
 
   /// Can we hoist this call.
   bool canHoist(SILInstruction *To, DominanceInfo *DT) const;
@@ -114,7 +126,7 @@ public:
   SILValue getIndex() const;
 
   /// Get the index as a constant if possible.
-  Optional<int64_t> getConstantIndex() const;
+  std::optional<int64_t> getConstantIndex() const;
 
   /// Get the array.props.isNativeTypeChecked argument.
   SILValue getArrayPropertyIsNativeTypeChecked() const;
@@ -141,22 +153,6 @@ public:
   /// parameter.
   void removeCall();
 
-  /// Replace a call to get_element by a value.
-  ///
-  /// Preconditions:
-  /// The value \p V must dominate this get_element call.
-  /// This must be a get_element call.
-  ///
-  /// Returns true on success, false otherwise.
-  bool replaceByValue(SILValue V);
-
-  /// Replace a call to append(contentsOf: ) with a series of
-  /// append(element: ) calls.
-  bool replaceByAppendingValues(SILModule &M, SILFunction *AppendFn,
-                                SILFunction *ReserveFn,
-                                const llvm::SmallVectorImpl<SILValue> &Vals,
-                                ArrayRef<Substitution> Subs);
-
   /// Hoist the call to the insert point.
   void hoist(SILInstruction *InsertBefore, DominanceInfo *DT) {
     hoistOrCopy(InsertBefore, DT, false);
@@ -180,9 +176,24 @@ public:
 
   /// Could this array be backed by an NSArray.
   bool mayHaveBridgedObjectElementType() const;
-  
+
   /// Can this function be inlined by the early inliner.
   bool canInlineEarly() const;
+
+  /// If this is a call to  ArrayUninitialized (or
+  /// ArrayUninitializedIntrinsic), identify the instructions that store
+  /// elements into the array indices. For every index, add the store
+  /// instruction that stores to that index to \p ElementStoreMap.
+  ///
+  /// \returns true iff this is an "array.uninitialized" semantic call, and the
+  /// stores into the array indices are identified and the \p ElementStoreMap is
+  /// populated.
+  ///
+  /// Note that this function does not support array initializations that use
+  /// copy_addr, which implies that arrays with address-only types would not
+  /// be recognized by this function as yet.
+  bool mapInitializationStores(
+      llvm::DenseMap<uint64_t, StoreInst *> &ElementStoreMap);
 
 protected:
   /// Validate the signature of this call.

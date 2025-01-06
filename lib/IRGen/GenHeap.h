@@ -30,12 +30,14 @@ namespace swift {
 namespace irgen {
   class Address;
   class OwnedAddress;
+  enum class IsaEncoding : unsigned char;
 
 /// A heap layout is the result of laying out a complete structure for
 /// heap-allocation.
 class HeapLayout : public StructLayout {
   SmallVector<SILType, 8> ElementTypes;
   NecessaryBindings Bindings;
+  unsigned BindingsIndex;
   mutable llvm::Constant *privateMetadata = nullptr;
   
 public:
@@ -43,8 +45,8 @@ public:
              ArrayRef<SILType> elementTypes,
              ArrayRef<const TypeInfo *> elementTypeInfos,
              llvm::StructType *typeToFill = 0,
-             NecessaryBindings &&bindings = {});
-  
+             NecessaryBindings &&bindings = {}, unsigned bindingsIndex = 0);
+
   /// True if the heap object carries type bindings.
   ///
   /// If true, the first element of the heap layout will be the type metadata
@@ -55,6 +57,12 @@ public:
   
   const NecessaryBindings &getBindings() const {
     return Bindings;
+  }
+
+  unsigned getBindingsIndex() const { return BindingsIndex; }
+
+  unsigned getIndexAfterBindings() const {
+    return BindingsIndex + (hasBindings() ? 1 : 0);
   }
 
   /// Get the types of the elements.
@@ -138,6 +146,40 @@ Address
 emitAllocateExistentialBoxInBuffer(IRGenFunction &IGF, SILType boxedType,
                                    Address destBuffer, GenericEnvironment *env,
                                    const llvm::Twine &name, bool isOutlined);
+
+/// Given a heap-object instance, with some heap-object type,
+/// produce a reference to its type metadata.
+llvm::Value *emitDynamicTypeOfHeapObject(IRGenFunction &IGF,
+                                         llvm::Value *object,
+                                         MetatypeRepresentation rep,
+                                         SILType objectType,
+                                         bool allowArtificialSubclasses = false);
+
+/// Given a non-tagged object pointer, load a pointer to its class object.
+llvm::Value *emitLoadOfObjCHeapMetadataRef(IRGenFunction &IGF,
+                                           llvm::Value *object);
+
+/// Given a heap-object instance, with some heap-object type, produce a
+/// reference to its heap metadata by dynamically asking the runtime for it.
+llvm::Value *emitHeapMetadataRefForUnknownHeapObject(IRGenFunction &IGF,
+                                                     llvm::Value *object);
+
+/// Given a heap-object instance, with some heap-object type,
+/// produce a reference to its heap metadata.
+llvm::Value *emitHeapMetadataRefForHeapObject(IRGenFunction &IGF,
+                                              llvm::Value *object,
+                                              CanType objectType,
+                                              bool suppressCast = false);
+
+/// Given a heap-object instance, with some heap-object type,
+/// produce a reference to its heap metadata.
+llvm::Value *emitHeapMetadataRefForHeapObject(IRGenFunction &IGF,
+                                              llvm::Value *object,
+                                              SILType objectType,
+                                              bool suppressCast = false);
+
+/// What isa-encoding mechanism does a type use?
+IsaEncoding getIsaEncodingForType(IRGenModule &IGM, CanType type);
 
 } // end namespace irgen
 } // end namespace swift

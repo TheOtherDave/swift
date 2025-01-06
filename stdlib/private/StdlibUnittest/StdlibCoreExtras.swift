@@ -12,14 +12,22 @@
 
 import SwiftPrivate
 import SwiftPrivateLibcExtras
-#if os(OSX) || os(iOS)
-import Darwin
-#elseif os(Linux) || os(FreeBSD) || os(PS4) || os(Android) || os(Cygwin) || os(Haiku)
-import Glibc
+#if canImport(Darwin)
+internal import Darwin
+#elseif canImport(Glibc)
+internal import Glibc
+#elseif canImport(Musl)
+internal import Musl
+#elseif canImport(Android)
+internal import Android
+#elseif os(WASI)
+internal import WASILibc
+#elseif os(Windows)
+internal import CRT
 #endif
 
 #if _runtime(_ObjC)
-import Foundation
+internal import Foundation
 #endif
 
 //
@@ -28,7 +36,7 @@ import Foundation
 //
 
 func findSubstring(_ haystack: Substring, _ needle: String) -> String.Index? {
-  return findSubstring(String(haystack._ephemeralContent), needle)
+  return findSubstring(haystack._ephemeralString, needle)
 }
 
 func findSubstring(_ string: String, _ substring: String) -> String.Index? {
@@ -73,6 +81,7 @@ func findSubstring(_ string: String, _ substring: String) -> String.Index? {
 #endif
 }
 
+#if !os(Windows)
 public func createTemporaryFile(
   _ fileNamePrefix: String, _ fileNameSuffix: String, _ contents: String
 ) -> String {
@@ -95,6 +104,7 @@ public func createTemporaryFile(
   }
   return fileName
 }
+#endif
 
 public final class Box<T> {
   public init(_ value: T) { self.value = value }
@@ -110,22 +120,28 @@ public func <=> <T: Comparable>(lhs: T, rhs: T) -> ExpectedComparisonResult {
 }
 
 public struct TypeIdentifier : Hashable, Comparable {
+  public var value: Any.Type
+
   public init(_ value: Any.Type) {
     self.value = value
   }
 
   public var hashValue: Int { return objectID.hashValue }
-  public var value: Any.Type
-  
-  internal var objectID : ObjectIdentifier { return ObjectIdentifier(value) }
-}
+  public func hash(into hasher: inout Hasher) {
+    hasher.combine(objectID)
+  }
 
-public func < (lhs: TypeIdentifier, rhs: TypeIdentifier) -> Bool {
-  return lhs.objectID < rhs.objectID
-}
+  internal var objectID : ObjectIdentifier {
+    return ObjectIdentifier(value)
+  }
 
-public func == (lhs: TypeIdentifier, rhs: TypeIdentifier) -> Bool {
-  return lhs.objectID == rhs.objectID
+  public static func < (lhs: TypeIdentifier, rhs: TypeIdentifier) -> Bool {
+    return lhs.objectID < rhs.objectID
+  }
+
+  public static func == (lhs: TypeIdentifier, rhs: TypeIdentifier) -> Bool {
+    return lhs.objectID == rhs.objectID
+  }
 }
 
 extension TypeIdentifier
@@ -227,7 +243,7 @@ public func forAllPermutations(_ size: Int, _ body: ([Int]) -> Void) {
 
 /// Generate all permutations.
 public func forAllPermutations<S : Sequence>(
-  _ sequence: S, _ body: ([S.Iterator.Element]) -> Void
+  _ sequence: S, _ body: ([S.Element]) -> Void
 ) {
   let data = Array(sequence)
   forAllPermutations(data.count) {
@@ -239,8 +255,8 @@ public func forAllPermutations<S : Sequence>(
 
 public func cartesianProduct<C1 : Collection, C2 : Collection>(
   _ c1: C1, _ c2: C2
-) -> [(C1.Iterator.Element, C2.Iterator.Element)] {
-  var result: [(C1.Iterator.Element, C2.Iterator.Element)] = []
+) -> [(C1.Element, C2.Element)] {
+  var result: [(C1.Element, C2.Element)] = []
   for e1 in c1 {
     for e2 in c2 {
       result.append((e1, e2))
@@ -257,3 +273,51 @@ public func _isStdlibDebugConfiguration() -> Bool {
   return false
 #endif
 }
+
+// Return true if the Swift runtime available is at least 5.1
+public func _hasSwift_5_1() -> Bool {
+  if #available(SwiftStdlib 5.1, *) {
+    return true
+  }
+  return false
+}
+
+@frozen
+public struct LinearCongruentialGenerator: RandomNumberGenerator {
+
+  @usableFromInline
+  internal var _state: UInt64
+
+  @inlinable
+  public init(seed: UInt64) {
+    _state = seed
+    for _ in 0 ..< 10 { _ = next() }
+  }
+
+  @inlinable
+  public mutating func next() -> UInt64 {
+    _state = 2862933555777941757 &* _state &+ 3037000493
+    return _state
+  }
+}
+
+#if !SWIFT_ENABLE_REFLECTION
+
+public func dump<T, TargetStream: TextOutputStream>(_ value: T, to target: inout TargetStream) {
+  target.write("(reflection not available)")
+}
+
+#endif
+
+#if SWIFT_STDLIB_STATIC_PRINT
+
+public func print(_ s: Any, terminator: String = "\n") {
+  let data = Array("\(s)\(terminator)".utf8)
+  write(STDOUT_FILENO, data, data.count)
+}
+
+public func print<Target>(_ s: Any, terminator: String = "\n", to output: inout Target) where Target : TextOutputStream {
+  output.write("\(s)\(terminator)")
+}
+
+#endif

@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/SILOptimizer/Analysis/IVAnalysis.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/PatternMatch.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILValue.h"
@@ -20,9 +21,8 @@ using namespace swift::PatternMatch;
 
 #if !defined(NDEBUG)
 static bool inSCC(ValueBase *value, IVInfo::SCCType &SCC) {
-  SILNode *valueNode = value->getRepresentativeSILNodeInObject();
   for (SILNode *node : SCC) {
-    if (node->getRepresentativeSILNodeInObject() == valueNode)
+    if (node == value)
       return true;
   }
   return false;

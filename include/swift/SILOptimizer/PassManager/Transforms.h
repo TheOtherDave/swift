@@ -19,10 +19,11 @@
 namespace swift {
   class SILModule;
   class SILFunction;
+  class SILInstruction;
   class PrettyStackTraceSILFunctionTransform;
 
   /// The base class for all SIL-level transformations.
-  class SILTransform : public DeleteNotificationHandler {
+  class SILTransform {
   public:
     /// The kind of transformation passes we use.
     enum class TransformKind {
@@ -66,14 +67,13 @@ namespace swift {
     /// Inject the pass manager running this pass.
     void injectPassManager(SILPassManager *PMM) { PM = PMM; }
 
+    SILPassManager *getPassManager() const { return PM; }
+
     irgen::IRGenModule *getIRGenModule() {
       auto *Mod = PM->getIRGenModule();
       assert(Mod && "Expecting a valid module");
       return Mod;
     }
-
-    /// Get the name of the transform.
-    llvm::StringRef getName() { return PassKindName(getPassKind()); }
 
     /// Get the transform's (command-line) tag.
     llvm::StringRef getTag() { return PassKindTag(getPassKind()); }
@@ -81,11 +81,13 @@ namespace swift {
     /// Get the transform's name as a C++ identifier.
     llvm::StringRef getID() { return PassKindID(getPassKind()); }
 
-  protected:
-    /// \brief Searches for an analysis of type T in the list of registered
+    /// Searches for an analysis of type T in the list of registered
     /// analysis. If the analysis is not found, the program terminates.
     template<typename T>
     T* getAnalysis() { return PM->getAnalysis<T>(); }
+
+    template<typename T>
+    T* getAnalysis(SILFunction *f) { return PM->getAnalysis<T>(f); }
 
     const SILOptions &getOptions() { return PM->getOptions(); }
   };
@@ -108,7 +110,7 @@ namespace swift {
 
     void injectFunction(SILFunction *Func) { F = Func; }
 
-    /// \brief Notify the pass manager of a function \p F that needs to be
+    /// Notify the pass manager of a function \p F that needs to be
     /// processed by the function passes and the analyses.
     ///
     /// If not null, the function \p DerivedFrom is the function from which \p F
@@ -116,17 +118,20 @@ namespace swift {
     /// derived from a common base function, e.g. due to specialization.
     /// The number should be small anyway, but bugs in optimizations could cause
     /// an infinite loop in the passmanager.
-    void notifyAddFunction(SILFunction *F, SILFunction *DerivedFrom) {
+    void addFunctionToPassManagerWorklist(SILFunction *F,
+                                          SILFunction *DerivedFrom) {
       PM->addFunctionToWorklist(F, DerivedFrom);
-      PM->notifyAnalysisOfFunction(F);
     }
 
-    /// \brief Reoptimize the current function by restarting the pass
+    /// Reoptimize the current function by restarting the pass
     /// pipeline on it.
     void restartPassPipeline() { PM->restartWithCurrentFunction(this); }
 
-  protected:
     SILFunction *getFunction() { return F; }
+
+    bool continueWithNextSubpassRun(SILInstruction *forInst = nullptr) {
+      return PM->continueWithNextSubpassRun(forInst, F, this);
+    }
 
     void invalidateAnalysis(SILAnalysis::InvalidationKind K) {
       PM->invalidateAnalysis(F, K);
@@ -167,14 +172,9 @@ namespace swift {
       PM->invalidateFunctionTables();
     }
 
-    /// Inform the pass manager of a deleted function.
-    void notifyDeleteFunction(SILFunction *F) {
-      PM->notifyDeleteFunction(F);
-    }
-
-    /// Inform the pass manager of an added function.
-    void notifyAddFunction(SILFunction *F) {
-      PM->notifyAnalysisOfFunction(F);
+    /// Inform the pass manager that we are going to delete a function.
+    void notifyWillDeleteFunction(SILFunction *F) {
+      PM->notifyWillDeleteFunction(F);
     }
   };
 } // end namespace swift

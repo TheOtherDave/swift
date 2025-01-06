@@ -2,10 +2,16 @@
 // REQUIRES: executable_test
 
 import StdlibUnittest
-#if os(Linux) || os(FreeBSD) || os(PS4) || os(Android) || os(Windows)
-import Glibc
+#if canImport(Darwin)
+  import Darwin
+#elseif canImport(Glibc)
+  import Glibc
+#elseif os(Windows)
+  import MSVCRT
+#elseif canImport(Android)
+  import Android
 #else
-import Darwin
+#error("Unsupported platform")
 #endif
 
 _setTestSuiteFailedCallback() { print("abort()") }

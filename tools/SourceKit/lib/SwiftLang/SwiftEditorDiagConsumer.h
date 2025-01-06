@@ -16,6 +16,7 @@
 #include "SourceKit/Core/LangSupport.h"
 #include "swift/AST/DiagnosticConsumer.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringMap.h"
 
 namespace SourceKit {
 
@@ -24,8 +25,10 @@ class EditorDiagConsumer : public swift::DiagnosticConsumer {
   /// Maps from a BufferID to the diagnostics that were emitted inside that
   /// buffer.
   llvm::DenseMap<unsigned, DiagnosticsTy> BufferDiagnostics;
+  DiagnosticsTy InvalidLocDiagnostics;
 
-  SmallVector<unsigned, 8> InputBufIDs;
+  llvm::StringMap<BufferInfoSharedPtr> BufferInfos;
+
   int LastDiagBufferID = -1;
   unsigned LastDiagIndex = 0;
 
@@ -40,19 +43,13 @@ class EditorDiagConsumer : public swift::DiagnosticConsumer {
     return BufferDiagnostics[LastDiagBufferID][LastDiagIndex];
   }
 
-  bool HadInvalidLocError = false;
   bool HadAnyError = false;
 
+  BufferInfoSharedPtr getBufferInfo(StringRef FileName,
+                                    std::optional<unsigned> BufferID,
+                                    swift::SourceManager &SM);
+
 public:
-  void setInputBufferIDs(ArrayRef<unsigned> BufferIDs) {
-    InputBufIDs.append(BufferIDs.begin(), BufferIDs.end());
-    std::sort(InputBufIDs.begin(), InputBufIDs.end());
-  }
-
-  bool isInputBufferID(unsigned BufferID) const {
-    return std::binary_search(InputBufIDs.begin(), InputBufIDs.end(), BufferID);
-  }
-
   /// The diagnostics are returned in source-order.
   ArrayRef<DiagnosticEntryInfo> getDiagnosticsForBuffer(unsigned BufferID) const {
     ArrayRef<DiagnosticEntryInfo> Diags;
@@ -62,14 +59,11 @@ public:
     return Diags;
   }
 
-  bool hadErrorWithInvalidLoc() const { return HadInvalidLocError; }
+  void getAllDiagnostics(SmallVectorImpl<DiagnosticEntryInfo> &Result);
 
   bool hadAnyError() const { return HadAnyError; }
 
-  void handleDiagnostic(swift::SourceManager &SM, swift::SourceLoc Loc,
-                        swift::DiagnosticKind Kind,
-                        StringRef FormatString,
-                        ArrayRef<swift::DiagnosticArgument> FormatArgs,
+  void handleDiagnostic(swift::SourceManager &SM,
                         const swift::DiagnosticInfo &Info) override;
 };
 

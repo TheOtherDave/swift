@@ -13,6 +13,7 @@
 
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Analysis/ArraySemantic.h"
@@ -102,7 +103,7 @@ bool ArrayAllocation::isInitializationWithKnownCount() {
       (ArrayValue = Uninitialized.getArrayValue()))
     return true;
 
-  ArraySemanticsCall Init(Alloc, "array.init");
+  ArraySemanticsCall Init(Alloc, "array.init", /*matchPartialName*/true);
   if (Init &&
       (ArrayCount = Init.getInitializationCount()) &&
       (ArrayValue = Init.getArrayValue()))
@@ -123,10 +124,15 @@ bool ArrayAllocation::recursivelyCollectUses(ValueBase *Def) {
   for (auto *Opd : Def->getUses()) {
     auto *User = Opd->getUser();
     // Ignore reference counting and debug instructions.
-    if (isa<RefCountingInst>(User) ||
-        isa<StrongPinInst>(User) ||
+    if (isa<RefCountingInst>(User) || isa<DestroyValueInst>(User) ||
         isa<DebugValueInst>(User))
       continue;
+
+    if (auto *MDI = dyn_cast<MarkDependenceInst>(User)) {
+      if (Def == MDI->getBase()) {
+        continue;
+      }
+    }
 
     // Array value projection.
     if (auto *SEI = dyn_cast<StructExtractInst>(User)) {
@@ -136,13 +142,24 @@ bool ArrayAllocation::recursivelyCollectUses(ValueBase *Def) {
     }
 
     // Check array semantic calls.
-    if (auto apply = dyn_cast<ApplyInst>(User)) {
+    if (auto *apply = dyn_cast<ApplyInst>(User)) {
       ArraySemanticsCall ArrayOp(apply);
-      if (ArrayOp && ArrayOp.doesNotChangeArray()) {
-        if (ArrayOp.getKind() == ArrayCallKind::kGetCount)
+      switch (ArrayOp.getKind()) {
+        case ArrayCallKind::kNone:
+          return false;
+        case ArrayCallKind::kGetCount:
           CountCalls.insert(ArrayOp);
-        continue;
+          break;
+        case ArrayCallKind::kArrayFinalizeIntrinsic:
+          if (!recursivelyCollectUses(apply))
+            return false;
+          break;
+        default:
+          if (!ArrayOp.doesNotChangeArray())
+            return false;
+          break;
       }
+      continue;
     }
 
     // An operation that escapes or modifies the array value.
@@ -153,7 +170,7 @@ bool ArrayAllocation::recursivelyCollectUses(ValueBase *Def) {
 
 bool ArrayAllocation::propagateCountToUsers() {
   bool HasChanged = false;
-  DEBUG(llvm::dbgs() << "Propagating count from " << *Alloc);
+  LLVM_DEBUG(llvm::dbgs() << "Propagating count from " << *Alloc);
   for (auto *Count : CountCalls) {
     assert(ArraySemanticsCall(Count).getKind() == ArrayCallKind::kGetCount &&
            "Expecting a call to count");
@@ -166,7 +183,7 @@ bool ArrayAllocation::propagateCountToUsers() {
     }
 
     for (auto *Use : Uses) {
-      DEBUG(llvm::dbgs() << "  to user " << *Use->getUser());
+      LLVM_DEBUG(llvm::dbgs() << "  to user " << *Use->getUser());
       Use->set(ArrayCount);
       HasChanged = true;
     }

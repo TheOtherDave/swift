@@ -1,8 +1,9 @@
 // RUN: %empty-directory(%t)
 // RUN: %target-build-swift -parse-stdlib %s -module-name Reflection -o %t/a.out
-// RUN: %S/timeout.sh 360 %target-run %t/a.out | %FileCheck %s
+// RUN: %target-codesign %t/a.out
+// RUN: %target-run %t/a.out | %FileCheck %s
 // REQUIRES: executable_test
-// FIXME: timeout wrapper is necessary because the ASan test runs for hours
+// REQUIRES: reflection
 
 //
 // DO NOT add more tests to this file.  Add them to test/1_stdlib/Runtime.swift.
@@ -117,7 +118,7 @@ print("Fooable double:")
 fooable = 2.5
 dump(fooable)
 
-protocol Barrable : class {}
+protocol Barrable : AnyObject {}
 extension Best: Barrable {}
 
 // CHECK-LABEL: Barrable class:
@@ -191,6 +192,41 @@ sanePointerString.deallocate()
 // CHECK-NEXT: (Opaque Value)
 var rawPointer = unsafeBitCast(0 as Int, to: Builtin.RawPointer.self)
 dump(rawPointer)
+
+// https://github.com/apple/swift/issues/43211
+// CHECK-LABEL: {{^}}weak with dynamic value{{$}}
+print("weak with dynamic value")
+do {
+  class Child {}
+  class Example {
+    weak var value: Child?
+  }
+
+  var c: Child? = Child()
+  let e = Example()
+  e.value = c
+
+  // CHECK-NEXT: c1: Optional(Reflection.{{.*}}.Child)
+  // CHECK-NEXT:   some: Reflection.{{.*}}.Child #0
+  dump(c, name: "c1")
+  // CHECK-NEXT: e1: Reflection.{{.*}}.Example #0
+  // CHECK-NEXT:   value: Optional(Reflection.{{.*}}.Child)
+  // CHECK-NEXT:     some: Reflection.{{.*}}.Child #1
+  dump(e, name: "e1")
+  // CHECK-NEXT: value1: Optional(Reflection.{{.*}}.Child)
+  // CHECK-NEXT:   some: Reflection.{{.*}}.Child #0
+  dump(e.value, name: "value1")
+
+  c = nil
+
+  // CHECK-NEXT: c2: nil
+  dump(c, name: "c2")
+  // CHECK-NEXT: e2: Reflection.{{.*}}.Example #0
+  // CHECK-NEXT:   value: nil
+  dump(e, name: "e2")
+  // CHECK-NEXT: value2: nil
+  dump(e.value, name: "value2")
+}
 
 // CHECK-LABEL: and now our song is done
 print("and now our song is done")

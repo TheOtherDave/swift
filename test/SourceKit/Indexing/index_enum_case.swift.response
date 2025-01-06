@@ -1,11 +1,9 @@
 {
-  key.hash: <hash>,
   key.dependencies: [
     {
       key.kind: source.lang.swift.import.module.swift,
       key.name: "Swift",
       key.filepath: Swift.swiftmodule,
-      key.hash: <hash>,
       key.is_system: 1
     }
   ],
@@ -20,14 +18,15 @@
         {
           key.kind: source.lang.swift.decl.enumelement,
           key.name: "one",
-          key.usr: "s:15index_enum_case1EO3oneA2CmF",
+          key.usr: "s:15index_enum_case1EO3oneyA2CmF",
           key.line: 6,
-          key.column: 10
+          key.column: 10,
+          key.effective_access: source.decl.effective_access.public
         },
         {
           key.kind: source.lang.swift.decl.enumelement,
-          key.name: "two",
-          key.usr: "s:15index_enum_case1EO3twoACSS1a_tcACmF",
+          key.name: "two(a:)",
+          key.usr: "s:15index_enum_case1EO3twoyACSS_tcACmF",
           key.line: 6,
           key.column: 15,
           key.entities: [
@@ -38,14 +37,16 @@
               key.line: 6,
               key.column: 22
             }
-          ]
+          ],
+          key.effective_access: source.decl.effective_access.public
         },
         {
           key.kind: source.lang.swift.decl.enumelement,
           key.name: "three",
-          key.usr: "s:15index_enum_case1EO5threeA2CmF",
+          key.usr: "s:15index_enum_case1EO5threeyA2CmF",
           key.line: 6,
-          key.column: 31
+          key.column: 31,
+          key.effective_access: source.decl.effective_access.public
         },
         {
           key.kind: source.lang.swift.decl.var.instance,
@@ -64,27 +65,28 @@
                 {
                   key.kind: source.lang.swift.ref.enumelement,
                   key.name: "one",
-                  key.usr: "s:15index_enum_case1EO3oneA2CmF",
+                  key.usr: "s:15index_enum_case1EO3oneyA2CmF",
                   key.line: 10,
                   key.column: 15
                 },
                 {
                   key.kind: source.lang.swift.ref.enumelement,
-                  key.name: "two",
-                  key.usr: "s:15index_enum_case1EO3twoACSS1a_tcACmF",
+                  key.name: "two(a:)",
+                  key.usr: "s:15index_enum_case1EO3twoyACSS_tcACmF",
                   key.line: 12,
                   key.column: 15
                 },
                 {
                   key.kind: source.lang.swift.ref.enumelement,
                   key.name: "three",
-                  key.usr: "s:15index_enum_case1EO5threeA2CmF",
+                  key.usr: "s:15index_enum_case1EO5threeyA2CmF",
                   key.line: 14,
                   key.column: 15
                 }
               ]
             }
-          ]
+          ],
+          key.effective_access: source.decl.effective_access.internal
         },
         {
           key.kind: source.lang.swift.ref.struct,
@@ -98,7 +100,8 @@
         {
           key.attribute: source.decl.attribute.public
         }
-      ]
+      ],
+      key.effective_access: source.decl.effective_access.public
     },
     {
       key.kind: source.lang.swift.decl.var.global,
@@ -111,15 +114,18 @@
           key.kind: source.lang.swift.decl.function.accessor.getter,
           key.usr: "s:15index_enum_case1eAA1EOvg",
           key.line: 21,
-          key.column: 5
+          key.column: 5,
+          key.is_implicit: 1
         },
         {
           key.kind: source.lang.swift.decl.function.accessor.setter,
           key.usr: "s:15index_enum_case1eAA1EOvs",
           key.line: 21,
-          key.column: 5
+          key.column: 5,
+          key.is_implicit: 1
         }
-      ]
+      ],
+      key.effective_access: source.decl.effective_access.internal
     },
     {
       key.kind: source.lang.swift.ref.enum,
@@ -130,8 +136,8 @@
     },
     {
       key.kind: source.lang.swift.ref.enumelement,
-      key.name: "two",
-      key.usr: "s:15index_enum_case1EO3twoACSS1a_tcACmF",
+      key.name: "two(a:)",
+      key.usr: "s:15index_enum_case1EO3twoyACSS_tcACmF",
       key.line: 21,
       key.column: 13
     },
@@ -152,11 +158,12 @@
         {
           key.kind: source.lang.swift.ref.enumelement,
           key.name: "one",
-          key.usr: "s:15index_enum_case1EO3oneA2CmF",
+          key.usr: "s:15index_enum_case1EO3oneyA2CmF",
           key.line: 28,
           key.column: 12
         }
-      ]
+      ],
+      key.effective_access: source.decl.effective_access.internal
     }
   ]
 }

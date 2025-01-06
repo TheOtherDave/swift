@@ -15,12 +15,12 @@ struct FooStruct {
 
 FooStruct().#^COMPLETE^#
 
-// CHECK: Begin completions, 7 items
-// CHECK-DAG: Decl[InstanceMethod]/CurrNominal: instanceMethod1({#(callback): (Int, Int) -> Void##(Int, Int) -> Void#})[#Void#]; name=instanceMethod1(callback: (Int, Int) -> Void){{$}}
+// CHECK: Begin completions, 8 items
+// CHECK-DAG: Decl[InstanceMethod]/CurrNominal: instanceMethod1({#(callback): (Int, Int) -> Void##(Int, Int) -> Void#})[#Void#]; name=instanceMethod1(:){{$}}
 // CHECK-DAG: Decl[InstanceMethod]/CurrNominal: instanceMethod2({#(callback): ((Int, Int) -> Void)?##(Int, Int) -> Void#})[#Void#]{{; name=.+$}}
 // CHECK-DAG: Decl[InstanceMethod]/CurrNominal: instanceMethod3({#(callback): ((Int, Int) -> Void)??##(Int, Int) -> Void#})[#Void#]{{; name=.+$}}
 // CHECK-DAG: Decl[InstanceMethod]/CurrNominal: instanceMethod4({#(callback): ((Int, Int) -> Void)!##(Int, Int) -> Void#})[#Void#]{{; name=.+$}}
 // CHECK-DAG: Decl[InstanceMethod]/CurrNominal: instanceMethod5({#(callback): (Int, Int) -> Bool##(Int, Int) -> Bool#})[#Void#]{{; name=.+$}}
 // CHECK-DAG: Decl[InstanceMethod]/CurrNominal: instanceMethod6({#(callback): FunctionTypealias?##(Int, Int) -> Bool#})[#Void#]{{; name=.+$}}
 // CHECK-DAG: Decl[InstanceMethod]/CurrNominal: instanceMethod7({#(callback): OptionalFunctionTypealias##(Int, Int) -> Bool#})[#Void#]{{; name=.+$}}
-// CHECK: End completions
+// CHECK-DAG: Keyword[self]/CurrNominal: self[#FooStruct#]; name=self

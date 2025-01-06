@@ -1,4 +1,3 @@
-
 # Testing Swift
 
 This document describes how we test the Swift compiler, the Swift runtime, and
@@ -24,15 +23,18 @@ We use multiple approaches to test the Swift toolchain.
   locally before committing.  (Usually on a single platform, and not necessarily
   all tests.)
 * Buildbots run all tests, on all supported platforms.
+  [Smoke testing](ContinuousIntegration.md#smoke-testing)
+  skips the iOS, tvOS, and watchOS platforms.
 
 ### Testsuite subsets
 
-The testsuite is split into four subsets:
+The testsuite is split into five subsets:
 
 * Primary testsuite, located under ``swift/test``.
 * Validation testsuite, located under ``swift/validation-test``.
 * Unit tests, located under ``swift/unittests``.
 * Long tests, which are marked with ``REQUIRES: long_test``.
+* Stress tests, which are marked with ``REQUIRES: stress_test``.
 
 ### Running the LLVM lit-based testsuite
 
@@ -48,6 +50,22 @@ test suite, via ``utils/build-script --validation-test``.
 Using ``utils/build-script`` will rebuild all targets which can add substantial
 time to a debug cycle.
 
+#### Using utils/run-test
+
+Using `utils/run-test` allows the user to run a single test or tests in a specific directory. 
+This can significantly speed up the debug cycle.  One can use this tool 
+instead of invoking `lit.py` directly as described in the next section.
+
+Here is an example of running the `test/Parse` tests:
+```
+    % ${swift_SOURCE_ROOT}/utils/run-test --build-dir ${SWIFT_BUILD_DIR} ${swift_SOURCE_ROOT}/test/Parse
+```
+Note that one example of a valid `${SWIFT_BUILD_DIR}` is 
+`{swift_SOURCE_ROOT}/../build/Ninja-DebugAssert/swift-linux-x86_64`.  
+It differs based on your build options and on which directory you invoke the script from.
+
+For full help options, pass `-h` to `utils/run-test` utility.
+
 #### Using lit.py
 
 Using `lit.py` directly can provide more control and faster feedback to your
@@ -55,23 +73,23 @@ development cycle. To invoke LLVM's `lit.py` script directly, it must be
 configured to use your local build directory. For example:
 
 ```
-    % ${LLVM_SOURCE_ROOT}/utils/lit/lit.py -sv ${SWIFT_BUILD_DIR}/test-iphonesimulator-i386/Parse/
+    % ${LLVM_SOURCE_ROOT}/utils/lit/lit.py -sv ${SWIFT_BUILD_DIR}/test-macosx-x86_64/Parse/
 ```
 
-This runs the tests in the 'test/Parse/' directory targeting the 32-bit iOS
-Simulator. The ``-sv`` options give you a nice progress bar and only show you
+This runs the tests in the 'test/Parse/' directory targeting 64-bit macOS.
+The ``-sv`` options give you a nice progress bar and only show you
 output from the tests that fail.
 
 One downside of using this form is that you're appending relative paths from
 the source directory to the test directory in your build directory. (That is,
 there may not actually be a directory named 'Parse' in
-'test-iphonesimulator-i386/'; the invocation works because there is one in the
+'test-macosx-x86_64/'; the invocation works because there is one in the
 source 'test/' directory.) There is a more verbose form that specifies the
 testing configuration explicitly, which then allows you to test files
 regardless of location.
 
 ```
-    % ${LLVM_SOURCE_ROOT}/utils/lit/lit.py -sv --param swift_site_config=${SWIFT_BUILD_DIR}/test-iphonesimulator-i386/lit.site.cfg ${SWIFT_SOURCE_ROOT}/test/Parse/
+    % ${LLVM_SOURCE_ROOT}/utils/lit/lit.py -sv --param swift_site_config=${SWIFT_BUILD_DIR}/test-macosx-x86_64/lit.site.cfg ${SWIFT_SOURCE_ROOT}/test/Parse/
 ```
 
 For more complicated configuration, copy the invocation from one of the build
@@ -79,7 +97,7 @@ targets mentioned above and modify it as necessary. lit.py also has several
 useful features, like timing tests and providing a timeout. Check these features
 out with ``lit.py -h``. We document some of the more useful ones below:
 
-##### Extra lit.py invocation options
+##### Standard lit.py invocation options
 
 * ``-s`` reduces the amount of output that lit shows.
 * ``-v`` causes a test's commandline and output to be printed if the test fails.
@@ -89,7 +107,9 @@ out with ``lit.py -h``. We document some of the more useful ones below:
          line, amid a sequence.
 * ``-a`` causes a test's commandline and output to always be printed.
 * ``--filter=<pattern>`` causes only tests with paths matching the given regular
-  expression to be run.
+  expression to be run. Alternately, you can use the `LIT_FILTER='<pattern>'`
+  environment variable, in case you're invoking `lit.py` through some other
+  tool such as `build-script`.
 * ``-i`` causes tests that have a newer modification date and failing tests to
   be run first. This is implemented by updating the mtimes of the tests.
 * ``--no-execute`` causes a dry run to be performed. *NOTE* This means that all
@@ -99,6 +119,9 @@ out with ``lit.py -h``. We document some of the more useful ones below:
   running a single test (in seconds). 0 (the default means no time limit.
 * ``--max-failures=<MAXFAILURES>`` stops execution after ``MAXFAILURES`` number
   of failures.
+
+##### Swift-specific testing options
+
 * ``--param gmalloc`` will run all tests under Guard Malloc (macOS only). See
   ``man libgmalloc`` for more information.
 * ``--param swift-version=<MAJOR>`` overrides the default Swift language
@@ -109,6 +132,27 @@ out with ``lit.py -h``. We document some of the more useful ones below:
 * ``--param swift_test_mode=<MODE>`` drives the various suffix variations
   mentioned above. Again, it's best to get the invocation from the existing
   build system targets and modify it rather than constructing it yourself.
+* ``--param use_os_stdlib`` will run all tests with the standard libraries
+  coming from the OS.
+
+##### Remote testing options
+
+* ``--param remote_run_host=[USER@]<HOST>[:PORT]`` causes execution tests that
+  would normally be run on the host (via the ``%target-run`` substitutions
+  described below) to be run over SSH on another machine instead, using the
+  `remote-run` tool in the `utils` directory. Requires that `remote_run_tmpdir`
+  also be provided.
+* ``--param remote_run_tmpdir=<PATH>`` specifies the scratch directory to be
+  used on the remote machine when testing with `remote_run_host`.
+* ``--param remote_run_identity=<FILE>`` provides an SSH private key to be used
+  when testing with `remote_run_host`. (`remote-run` does not support
+  passwords.)
+* ``--param remote_run_extra_args="ARG1 ARG2 ..."`` provides a list of extra
+  arguments to pass to `remote-run`. (This can be used with `remote-run`'s `-o`
+  option to pass extra options to SSH.)
+* ``--param remote_run_skip_upload_stdlib`` assumes that the standard library
+  binaries have already been uploaded to `remote_run_tmpdir` and are up to date.
+  This is meant for repeat runs and probably shouldn't be used in automation.
 
 #### CMake
 
@@ -126,8 +170,9 @@ Besides ``check-swift``, other targets are also available. Here's the full list:
 
 * ``check-swift``: Runs tests from the ``${SWIFT_SOURCE_ROOT}/test`` directory.
 * ``check-swift-only_validation``: Runs tests from the ``${SWIFT_SOURCE_ROOT}/validation-test`` directory.
-* ``check-swift-validation``: Runs the primary and validation tests, without the long tests.
+* ``check-swift-validation``: Runs the primary and validation tests, without the long tests or stress tests.
 * ``check-swift-only_long``: Runs long tests only.
+* ``check-swift-only_stress``: Runs stress tests only.
 * ``check-swift-all``: Runs all tests (primary, validation, and long).
 * ``SwiftUnitTests``: Builds all unit tests.  Executables are located under
   ``${SWIFT_BUILD_DIR}/unittests`` and must be run individually.
@@ -139,16 +184,16 @@ For every target above, there are variants for different optimizations:
 * the target with ``-optimize`` suffix (e.g., ``check-swift-optimize``) -- runs
   execution tests in ``-O`` mode.  This target will only run tests marked as
   ``executable_test``.
-* the target with ``-optimize-unchecked`` suffix (e.g.,
-  ``check-swift-optimize-unchecked``) -- runs execution tests in
+* the target with ``-optimize_unchecked`` suffix (e.g.,
+  ``check-swift-optimize_unchecked``) -- runs execution tests in
   ``-Ounchecked`` mode. This target will only run tests marked as
   ``executable_test``.
-* the target with ``-executable`` suffix (e.g.,
-  ``check-swift-executable-iphoneos-arm64``) -- runs tests marked with
+* the target with ``-only_executable`` suffix (e.g.,
+  ``check-swift-only_executable-iphoneos-arm64``) -- runs tests marked with
   ``executable_test`` in ``-Onone`` mode.
-* the target with ``-non-executable`` suffix (e.g.,
-  ``check-swift-non-executable-iphoneos-arm64``) -- runs tests not marked with
-  ``executable_test`` in ``-Onone`` mode.
+* the target with ``-only_non_executable`` suffix (e.g.,
+  ``check-swift-only_non_executable-iphoneos-arm64``) -- runs tests not marked
+  with ``executable_test`` in ``-Onone`` mode.
 
 ### Writing tests
 
@@ -206,7 +251,7 @@ code for the target that is not the build machine:
 
 * ``%target-typecheck-verify-swift``: parse and type check the current Swift file
   for the target platform and verify diagnostics, like ``swift -frontend -typecheck -verify
-  %s``.
+  %s``. For further explanation of `-verify` mode, see [Diagnostics.md](Diagnostics.md).
 
   Use this substitution for testing semantic analysis in the compiler.
 
@@ -230,6 +275,26 @@ code for the target that is not the build machine:
 
   Use this substitution for executable tests that don't require special
   compiler arguments.
+
+  Add ``REQUIRES: executable_test`` to the test.
+
+* ``%target-run-simple-swift(`` *compiler arguments* ``)``: like
+  ``%target-run-simple-swift``, but enables specifying compiler arguments when
+  compiling the Swift program.
+
+  Add ``REQUIRES: executable_test`` to the test.
+
+* ``%target-run-simple-swiftgyb``: build a one-file Swift `.gyb` program and
+  run it on the target machine.
+
+  Use this substitution for executable tests that don't require special
+  compiler arguments.
+
+  Add ``REQUIRES: executable_test`` to the test.
+
+* ``%target-run-simple-swiftgyb(`` *compiler arguments* ``)``: like
+  ``%target-run-simple-swiftgyb``, but enables specifying compiler arguments
+  when compiling the Swift program.
 
   Add ``REQUIRES: executable_test`` to the test.
 
@@ -265,6 +330,23 @@ code for the target that is not the build machine:
 * ``%target-swift-autolink-extract``: run ``swift-autolink-extract`` for the
   target to extract its autolink flags on platforms that support them (when the
   autolink-extract feature flag is set)
+  
+* ``%target-swift-emit-module-interface(`` *swift interface path* ``)``
+  *other arguments*: run ``swift-frontend`` for the target, emitting a
+  swiftinterface to the given path and passing additional default flags
+  appropriate for resilient frameworks.
+
+* ``%target-swift-emit-module-interfaces(`` *swift interface path*,
+  *swift private interface path* ``)`` *other arguments*:
+  run ``swift-frontend`` for the target, emitting both swiftinterfaces
+  to the given paths and passing additional default flags appropriate for
+  resilient frameworks.
+
+* ``%target-swift-typecheck-module-from-interface(`` *swift interface path*
+  ``)`` *other arguments*: run ``swift-frontend`` for the target, verifying
+  the swiftinterface at the given path and passing additional default flags
+  appropriate for resilient frameworks. Designed to be used in combination with
+  ``%target-swift-emit-module-interface()``.
 
 * ``%target-clang``: run the system's ``clang++`` for the target.
 
@@ -277,6 +359,9 @@ code for the target that is not the build machine:
 * ``%target-cc-options``: the clang flags to setup the target with the right
   architecture and platform version.
 
+* ``%target-sanitizer-opt``: if sanitizers are enabled for the build, the
+  corresponding ``-fsanitize=`` option.
+
 * ``%target-triple``: a triple composed of the ``%target-cpu``, the vendor,
   the ``%target-os``, and the operating system version number. Possible values
   include ``i386-apple-ios7.0`` or ``armv7k-apple-watchos2.0``.
@@ -286,6 +371,9 @@ code for the target that is not the build machine:
 
 * ``%target-os``: the target operating system (``macosx``, ``darwin``,
   ``linux``, ``freebsd``, ``windows-cygnus``, ``windows-gnu``).
+
+* ``%target-is-simulator``: ``true`` if the target is a simulator (iOS,
+  watchOS, tvOS), otherwise ``false``.
 
 * ``%target-object-format``: the platform's object format (``elf``, ``macho``,
   ``coff``).
@@ -304,6 +392,16 @@ code for the target that is not the build machine:
 * ``%target-static-stdlib-path``: the path to the static standard library.
 
   Add ``REQUIRES: static_stdlib`` to the test.
+
+* ``%target-rtti-opt``: the ``-frtti`` or ``-fno-rtti`` option required to
+  link with the Swift libraries on the target platform.
+
+* ``%target-cxx-lib``: the argument to add to the command line when using
+  ``swiftc`` and linking in a C++ object file.  Typically ``-lc++`` or
+  ``-lstdc++`` depending on platform.
+
+* ``%target-msvc-runtime-opt``: for Windows, the MSVC runtime option, e.g.
+  ``-MD``, to use when building C/C++ code to link with Swift.
 
 Always use ``%target-*`` substitutions unless you have a good reason.  For
 example, an exception would be a test that checks how the compiler handles
@@ -383,6 +481,11 @@ Other substitutions:
   directory exists and is empty.  Equivalent to
   ``rm -rf directory-name && mkdir -p directory-name``.
 
+* ``%host_sdk%``, ``%host_triple%``: Host SDK path and triple for '-target'.
+  These can be used for build host tools/libraries in test cases.
+
+* ``%host-swift-build``: Build swift tools/libraries for the host.
+
 When writing a test where output (or IR, SIL) depends on the bitness of the
 target CPU, use this pattern::
 
@@ -438,6 +541,27 @@ FIXME: full list.
 * ``XFAIL: linux``: tests that need to be adapted for Linux, for example parts
   that depend on Objective-C interop need to be split out.
 
+#### Features ``REQUIRES: swift_feature_...``
+
+Each of the Swift compiler features defined in `include/swift/Basic/Features.def`
+will get a LLVM Lit feature prefixing `swift_feature_` to the feature name
+automatically. The LLVM Lit features will be available only in those
+configurations where the compiler supports the given feature, and will not be
+available when the compiler does not support the feature. This means that
+standard language features and upcoming features will always be available,
+while experimental features will only be available when the compiler supports
+them.
+
+For every test that uses `--enable-experimental-feature` or
+`--enable-upcoming-feature` add a `REQUIRES: swift_feature_...` for each of the
+used features. The `Misc/verify-swift-feature-testing.test-sh` will check that
+every test with those command line arguments have the necessary `REQUIRES:` and
+fail otherwise.
+
+Do NOT add `REQUIRES: asserts` for experimental features anymore. The correct
+usage of `REQUIRES: swift_feature_...` will take care of testing the feature as
+it evolves from experimental, to upcoming, to language feature.
+
 #### Feature ``REQUIRES: executable_test``
 
 This feature marks an executable test. The test harness makes this feature
@@ -480,3 +604,51 @@ code that uses an ``if true {}`` or similar no-op scope instead of
 If you're specifically testing the autoreleasing behavior of code, or do not
 expect code to interact with the Objective-C runtime, it may be OK to use ``if
 true {}``, but those assumptions should be commented in the test.
+
+#### Enabling/disabling the lldb test allowlist
+
+It's possible to enable a allowlist of swift-specific lldb tests to run during
+PR smoke testing. Note that the default set of tests which run (which includes
+tests not in the allowlist) already only includes swift-specific tests.
+
+Enabling the allowlist is an option of last-resort to unblock swift PR testing
+in the event that lldb test failures cannot be resolved in a timely way. If
+this becomes necessary, be sure to double-check that enabling the allowlist
+actually unblocks PR testing by running the smoke test build preset locally.
+
+To enable the lldb test allowlist, add `-G swiftpr` to the
+`LLDB_TEST_CATEGORIES` variable in `utils/build-script-impl`. Disable it by
+removing that option.
+
+#### String constants in IR tests
+
+IRGen often needs to create private constants containing the NUL-terminated
+contents of strings, such as for string literals in user code or names in type
+metadata. When it does, IRGen names them in a specific format: they will
+have the prefix `.str.`, followed by the size in bytes (excluding terminator),
+followed by a `.`, followed by the contents of the string (excluding
+terminator). For example:
+
+```
+@.str.5.Hello             ; A constant containing "Hello\0"
+@".str.11.Hello World"    ; A constant containing "Hello World\0"
+@".str.7.Hello!\0A"       ; A constant containing "Hello!\n\0"
+@".str.4.\F0\9F\8F\8E"    ; A constant containing "🏎️\0"
+@.str.0.                  ; A constant containing "\0"
+```
+
+When writing IRGen tests, you can assume that names in this format have the
+expected contents, so you don't need to capture the constant's name and then
+check that it's referred to correctly at the use site.
+
+Note that this name format treats NUL characters (\00) specially. All string
+constants generated in this manner are NUL-terminated, so the terminator is not
+included in the count *or* the content. To work around LLVM IR limitations, NUL
+characters elsewhere in the content are replaced with `_` and a `.nul<index>`
+suffix is appended to the name, in order from lowest to highest index:
+
+```
+@.str.1._.nul0            ; A constant containing "\0\0"
+@.str.2.__.nul0.nul1      ; A constant containing "\0\0\0"
+@".str.6.nul: _.nul5"     ; A constant containing "nul: \0\0"
+```

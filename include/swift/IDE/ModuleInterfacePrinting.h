@@ -16,8 +16,14 @@
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/OptionSet.h"
 
+#include <optional>
+
 #include <string>
 #include <vector>
+
+namespace clang {
+class Module;
+}
 
 namespace swift {
 class ASTContext;
@@ -40,13 +46,11 @@ enum class ModuleTraversal : unsigned {
 };
 
 /// Options used to describe the traversal of a module for printing.
-typedef OptionSet<ModuleTraversal> ModuleTraversalOptions;
+using ModuleTraversalOptions = OptionSet<ModuleTraversal>;
 
-ArrayRef<StringRef> collectModuleGroups(ModuleDecl *M,
-                                        std::vector<StringRef> &Scratch);
+void collectModuleGroups(ModuleDecl *M, SmallVectorImpl<StringRef> &Into);
 
-Optional<StringRef>
-findGroupNameForUSR(ModuleDecl *M, StringRef USR);
+std::optional<StringRef> findGroupNameForUSR(ModuleDecl *M, StringRef USR);
 
 bool printTypeInterface(ModuleDecl *M, Type Ty, ASTPrinter &Printer,
                         std::string &TypeName, std::string &Error);
@@ -54,18 +58,10 @@ bool printTypeInterface(ModuleDecl *M, Type Ty, ASTPrinter &Printer,
 bool printTypeInterface(ModuleDecl *M, StringRef TypeUSR, ASTPrinter &Printer,
                         std::string &TypeName, std::string &Error);
 
-void printModuleInterface(ModuleDecl *M, Optional<StringRef> Group,
+void printModuleInterface(ModuleDecl *M, ArrayRef<StringRef> GroupNames,
                           ModuleTraversalOptions TraversalOptions,
                           ASTPrinter &Printer, const PrintOptions &Options,
                           const bool PrintSynthesizedExtensions);
-
-// FIXME: this API should go away when Swift can represent Clang submodules as
-// 'swift::ModuleDecl *' objects.
-void printSubmoduleInterface(ModuleDecl *M, ArrayRef<StringRef> FullModuleName,
-                             ArrayRef<StringRef> GroupNames,
-                             ModuleTraversalOptions TraversalOptions,
-                             ASTPrinter &Printer, const PrintOptions &Options,
-                             const bool PrintSynthesizedExtensions);
 
 /// Print the interface for a header that has been imported via the implicit
 /// objc header importing feature.
@@ -77,9 +73,12 @@ void printHeaderInterface(StringRef Filename, ASTContext &Ctx,
 void printSwiftSourceInterface(SourceFile &File, ASTPrinter &Printer,
                                const PrintOptions &Options);
 
+/// Print the symbolic Swift interface for a given imported clang module.
+void printSymbolicSwiftClangModuleInterface(ModuleDecl *M, ASTPrinter &Printer,
+                                            const clang::Module *clangModule);
+
 } // namespace ide
 
 } // namespace swift
 
 #endif // SWIFT_IDE_MODULE_INTERFACE_PRINTING_H
-

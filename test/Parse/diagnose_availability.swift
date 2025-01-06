@@ -1,6 +1,7 @@
 // RUN: %target-typecheck-verify-swift 
 
-// SR-4231: Misleading/wrong error message for malformed @available
+// https://github.com/apple/swift/issues/46814
+// Misleading/wrong error message for malformed '@available'
 
 @available(OSX 10.6, *) // no error
 func availableSince10_6() {}
@@ -26,3 +27,67 @@ func availableOnMultiplePlatforms() {}
 // expected-error@-1 {{'deprecated' can't be combined with shorthand specification 'OSX 10.0'}}
 // expected-error@-2 {{expected declaration}}
 func twoShorthandsFollowedByDeprecated() {}
+
+
+// https://github.com/apple/swift/issues/51114
+// Missing/wrong warning message for '*' or 'swift' platform.
+
+@available(*, deprecated: 4.2)
+// expected-warning@-1 {{unexpected version number in 'available' attribute for non-specific platform '*'}} {{25-30=}}
+func allPlatformsDeprecatedVersion() {}
+
+@available(*, deprecated, obsoleted: 4.2)
+// expected-warning@-1 {{unexpected version number in 'available' attribute for non-specific platform '*'}} {{36-41=}}
+func allPlatformsDeprecatedAndObsoleted() {}
+
+@available(*, introduced: 4.0, deprecated: 4.1, obsoleted: 4.2)
+// expected-warning@-1 {{unexpected version number in 'available' attribute for non-specific platform '*'}} {{25-30=}} {{42-47=}} {{58-63=}}
+func allPlatformsDeprecatedAndObsoleted2() {}
+
+@available(swift, unavailable)
+// expected-warning@-1 {{'unavailable' cannot be used in 'available' attribute for platform 'swift'}}
+func swiftUnavailable() {}
+
+@available(swift, unavailable, introduced: 4.2)
+// expected-warning@-1 {{'unavailable' cannot be used in 'available' attribute for platform 'swift'}}
+func swiftUnavailableIntroduced() {}
+
+@available(swift, deprecated)
+// expected-warning@-1 {{expected version number with 'deprecated' in 'available' attribute for platform 'swift'}}
+func swiftDeprecated() {}
+
+@available(swift, deprecated, obsoleted: 4.2)
+// expected-warning@-1 {{expected version number with 'deprecated' in 'available' attribute for platform 'swift'}}
+func swiftDeprecatedObsoleted() {}
+
+@available(swift, message: "missing valid option")
+// expected-warning@-1 {{expected 'introduced', 'deprecated', or 'obsoleted' in 'available' attribute for platform 'swift'}}
+func swiftMessage() {}
+
+@available(*, unavailable, message: "\("message")")
+// expected-error@-1{{'message' cannot be an interpolated string literal}}
+func interpolatedMessage() {}
+
+@available(*, unavailable, message: """
+  foobar message.
+  """)
+func multilineMessage() {}
+multilineMessage()
+// expected-error@-1{{'multilineMessage()' is unavailable: foobar message.}}
+// expected-note@-3{{'multilineMessage()' has been explicitly marked unavailable here}}
+
+@available(*, unavailable, message: " ")
+func emptyMessage() {}
+emptyMessage()
+// expected-error@-1{{'emptyMessage()' is unavailable:  }}
+// expected-note@-3{{'emptyMessage()' has been explicitly marked unavailable here}}
+
+// expected-error@+1{{'message' cannot be an extended escaping string literal}}
+@available(*, unavailable, message: #"""
+  foobar message.
+  """#)
+func extendedEscapedMultilineMessage() {}
+
+// expected-error@+1{{'renamed' cannot be an extended escaping string literal}}
+@available(*, unavailable, renamed: #"available()"#)
+func extendedEscapedRenamed() {}

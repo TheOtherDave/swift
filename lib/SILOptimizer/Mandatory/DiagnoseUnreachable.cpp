@@ -10,20 +10,30 @@
 //
 //===----------------------------------------------------------------------===//
 
-#define DEBUG_TYPE "diagnose-unreachable"
-#include "swift/SILOptimizer/PassManager/Passes.h"
+#define DEBUG_TYPE "sil-diagnose-unreachable"
+
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/Stmt.h"
+#include "swift/Basic/Assertions.h"
+#include "swift/Basic/Defer.h"
+#include "swift/SIL/MemAccessUtils.h"
+#include "swift/SIL/Projection.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILUndef.h"
-#include "swift/SILOptimizer/Utils/Local.h"
+#include "swift/SIL/TerminatorUtils.h"
+#include "swift/SIL/BasicBlockDatastructures.h"
+#include "swift/SIL/OwnershipUtils.h"
+#include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
+#include "swift/SILOptimizer/Utils/BasicBlockOptUtils.h"
+#include "swift/SILOptimizer/Utils/InstOptUtils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/Debug.h"
+
 using namespace swift;
 
 STATISTIC(NumBlocksRemoved, "Number of unreachable basic blocks removed");
@@ -31,8 +41,6 @@ STATISTIC(NumInstructionsRemoved, "Number of unreachable instructions removed");
 STATISTIC(NumTerminatorsFolded, "Number of terminators folded");
 STATISTIC(NumBasicBlockArgsPropagated,
           "Number of basic block arguments propagated");
-
-typedef llvm::SmallPtrSet<const SILBasicBlock*, 16> SILBasicBlockSet;
 
 template<typename...T, typename...U>
 static void diagnose(ASTContext &Context, SourceLoc loc, Diag<T...> diag,
@@ -45,15 +53,16 @@ enum class UnreachableKind {
   FoldedBranch,
   FoldedSwitchEnum,
   NoreturnCall,
+  UnavailableEnumElement,
 };
 
 /// Information about a folded conditional branch instruction: it's location
 /// and whether the condition evaluated to true or false.
 struct UnreachableInfo {
   UnreachableKind Kind;
-  /// \brief The location of the instruction that caused the unreachability.
+  /// The location of the instruction that caused the unreachability.
   SILLocation Loc;
-  /// \brief If this is the FoldedBranch kind, specifies if the condition is
+  /// If this is the FoldedBranch kind, specifies if the condition is
   /// always true.
   bool CondIsAlwaysTrue;
 };
@@ -69,29 +78,39 @@ struct UnreachableInfo {
 /// it possible.
 class UnreachableUserCodeReportingState {
 public:
-  /// \brief The set of top-level blocks that became immediately unreachable due
+
+  UnreachableUserCodeReportingState(SILFunction *F) :
+    PossiblyUnreachableBlocks(F), BlocksWithErrors(F) {}
+
+  /// The set of top-level blocks that became immediately unreachable due
   /// to conditional branch folding, etc.
   ///
   /// This is a SetVector since several blocks may lead to the same error
   /// report and we iterate through these when producing the diagnostic.
-  llvm::SetVector<const SILBasicBlock*> PossiblyUnreachableBlocks;
+  BasicBlockSetVector PossiblyUnreachableBlocks;
 
-  /// \brief The set of blocks in which we reported unreachable code errors.
+  /// The set of blocks in which we reported unreachable code errors.
   /// These are used to ensure that we don't issue duplicate reports.
   ///
   /// Note, this set is different from the PossiblyUnreachableBlocks as these
   /// are the blocks that do contain user code and they might not be immediate
   /// successors of a folded branch.
-  llvm::SmallPtrSet<const SILBasicBlock*, 2> BlocksWithErrors;
+  BasicBlockSet BlocksWithErrors;
 
   /// A map from the PossiblyUnreachableBlocks to the folded conditional
   /// branches that caused each of them to be unreachable. This extra info is
   /// used to enhance the diagnostics.
-  llvm::DenseMap<const SILBasicBlock*, UnreachableInfo> MetaMap;
+  llvm::DenseMap<SILBasicBlock*, UnreachableInfo> MetaMap;
 };
 
-/// \brief Propagate/remove basic block input values when all predecessors
+/// Propagate/remove basic block input values when all predecessors
 /// supply the same arguments.
+///
+/// NOTE: Since BranchInst always forwards guaranteed and owned parameters the
+/// same way (like owned parameters), we do not need to add any special handling
+/// for guaranteed parameters here. This is because if all of the incoming
+/// values into my guaranteed phi is the same, then we know that said incoming
+/// value must dominate the phi by definition.
 static void propagateBasicBlockArgs(SILBasicBlock &BB) {
   // This functions would simplify the code as following:
   //
@@ -143,7 +162,7 @@ static void propagateBasicBlockArgs(SILBasicBlock &BB) {
     }
 
     // After the first branch is processed, the arguments vector is populated.
-    assert(Args.size() > 0);
+    assert(!Args.empty());
     checkArgs = true;
   }
 
@@ -173,8 +192,13 @@ static void propagateBasicBlockArgs(SILBasicBlock &BB) {
     SILArgument *Arg = *AI;
 
     // We were able to fold, so all users should use the new folded value.
-    Arg->replaceAllUsesWith(Args[Idx]);
-    NumBasicBlockArgsPropagated++;
+    if (auto *bfi = getBorrowedFromUser(Arg)) {
+      bfi->replaceAllUsesWith(Args[Idx]);
+      bfi->eraseFromParent();
+    } else {
+      Arg->replaceAllUsesWith(Args[Idx]);
+    }
+    ++NumBasicBlockArgsPropagated;
   }
 
   // Remove args from the block.
@@ -183,6 +207,314 @@ static void propagateBasicBlockArgs(SILBasicBlock &BB) {
   // The old branch instructions are no longer used, erase them.
   recursivelyDeleteTriviallyDeadInstructions(ToBeDeleted, true);
   NumInstructionsRemoved += ToBeDeleted.size();
+}
+
+static bool constantFoldEnumTerminator(SILBasicBlock &BB,
+                                       UnreachableUserCodeReportingState *State,
+                                       SwitchEnumTermInst SUI,
+                                       EnumElementDecl *TheEnumElem,
+                                       EnumInst *EnumInst) {
+  SILBasicBlock *TheSuccessorBlock = nullptr;
+  int ReachableBlockIdx = -1;
+  for (unsigned Idx = 0; Idx < SUI.getNumCases(); ++Idx) {
+    const EnumElementDecl *EI;
+    SILBasicBlock *BI;
+    std::tie(EI, BI) = SUI.getCase(Idx);
+    if (EI == TheEnumElem) {
+      TheSuccessorBlock = BI;
+      ReachableBlockIdx = Idx;
+      break;
+    }
+  }
+
+  SILBasicBlock *DB = nullptr;
+  if (!TheSuccessorBlock) {
+    if (SUI.hasDefault()) {
+      DB = SUI.getDefaultBB();
+      if (!isa<UnreachableInst>(DB->getTerminator())) {
+        TheSuccessorBlock = DB;
+        ReachableBlockIdx = SUI.getNumCases();
+      }
+    }
+  }
+
+  // Not fully covered switches will be diagnosed later. SILGen represents
+  // them with a Default basic block with an unreachable instruction.
+  // We are going to produce an error on all unreachable instructions not
+  // eliminated by DCE.
+  if (!TheSuccessorBlock)
+    return false;
+
+  // Replace the switch with a branch to the TheSuccessorBlock.
+  SILBuilderWithScope B(&BB, SUI);
+  SILLocation Loc = SUI->getLoc();
+  if (!TheSuccessorBlock->args_empty()) {
+    // If the successor block that we are looking at is the default block,
+    // we create an argument not for the enum case, but for the original
+    // value.
+    SILValue branchOperand;
+    if (TheSuccessorBlock != DB) {
+      branchOperand = B.createUncheckedEnumData(Loc, EnumInst, TheEnumElem);
+    } else {
+      branchOperand = EnumInst;
+    }
+    B.createBranch(Loc, TheSuccessorBlock, branchOperand);
+  } else
+    B.createBranch(Loc, TheSuccessorBlock);
+
+  // Produce diagnostic info if we are not within an inlined function or
+  // template instantiation.
+  // FIXME: Do not report if we are within a template instantiation.
+  assert(ReachableBlockIdx >= 0);
+  if (Loc.is<RegularLocation>() && State) {
+    // Find the first unreachable block in the switch so that we could use
+    // it for better diagnostics.
+    SILBasicBlock *UnreachableBlock = nullptr;
+    if (SUI.getNumCases() > 1) {
+      // More than one case.
+      UnreachableBlock = (ReachableBlockIdx == 0) ? SUI.getCase(1).second
+                                                  : SUI.getCase(0).second;
+    } else {
+      if (SUI.getNumCases() == 1 && SUI.hasDefault()) {
+        // One case and a default.
+        UnreachableBlock = (ReachableBlockIdx == 0) ? SUI.getDefaultBB()
+                                                    : SUI.getCase(0).second;
+      }
+    }
+
+    // Generate diagnostic info.
+    if (UnreachableBlock &&
+        !State->PossiblyUnreachableBlocks.contains(UnreachableBlock)) {
+      State->PossiblyUnreachableBlocks.insert(UnreachableBlock);
+      State->MetaMap.insert(std::pair<SILBasicBlock *, UnreachableInfo>(
+          UnreachableBlock,
+          UnreachableInfo{UnreachableKind::FoldedSwitchEnum, Loc, true}));
+    }
+  }
+
+  LLVM_DEBUG(llvm::dbgs() << "Folding terminator: " << **SUI);
+  recursivelyDeleteTriviallyDeadInstructions(SUI, true);
+  ++NumTerminatorsFolded;
+  return true;
+}
+
+static bool constantFoldEnumAddrTerminator(
+    SILBasicBlock &BB, UnreachableUserCodeReportingState *State,
+    SwitchEnumTermInst SUI, const EnumElementDecl *TheEnumElem) {
+  SILBasicBlock *TheSuccessorBlock = nullptr;
+  int ReachableBlockIdx = -1;
+  for (unsigned Idx = 0; Idx < SUI.getNumCases(); ++Idx) {
+    const EnumElementDecl *EI;
+    SILBasicBlock *BI;
+    std::tie(EI, BI) = SUI.getCase(Idx);
+    if (EI == TheEnumElem) {
+      TheSuccessorBlock = BI;
+      ReachableBlockIdx = Idx;
+      break;
+    }
+  }
+
+  SILBasicBlock *DB = nullptr;
+  if (!TheSuccessorBlock) {
+    if (SUI.hasDefault()) {
+      DB = SUI.getDefaultBB();
+      if (!isa<UnreachableInst>(DB->getTerminator())) {
+        TheSuccessorBlock = DB;
+        ReachableBlockIdx = SUI.getNumCases();
+      }
+    }
+  }
+
+  // Not fully covered switches will be diagnosed later. SILGen represents
+  // them with a Default basic block with an unreachable instruction.
+  // We are going to produce an error on all unreachable instructions not
+  // eliminated by DCE.
+  if (!TheSuccessorBlock)
+    return false;
+
+  // Replace the switch with a branch to the TheSuccessorBlock.
+  SILBuilderWithScope B(&BB, SUI);
+  SILLocation Loc = SUI->getLoc();
+  B.createBranch(Loc, TheSuccessorBlock);
+
+  // Produce diagnostic info if we are not within an inlined function or
+  // template instantiation.
+  // FIXME: Do not report if we are within a template instantiation.
+  assert(ReachableBlockIdx >= 0);
+  if (Loc.is<RegularLocation>() && State) {
+    // Find the first unreachable block in the switch so that we could use
+    // it for better diagnostics.
+    SILBasicBlock *UnreachableBlock = nullptr;
+    if (SUI.getNumCases() > 1) {
+      // More than one case.
+      UnreachableBlock = (ReachableBlockIdx == 0) ? SUI.getCase(1).second
+                                                  : SUI.getCase(0).second;
+    } else {
+      if (SUI.getNumCases() == 1 && SUI.hasDefault()) {
+        // One case and a default.
+        UnreachableBlock = (ReachableBlockIdx == 0) ? SUI.getDefaultBB()
+                                                    : SUI.getCase(0).second;
+      }
+    }
+
+    // Generate diagnostic info.
+    if (UnreachableBlock &&
+        !State->PossiblyUnreachableBlocks.contains(UnreachableBlock)) {
+      State->PossiblyUnreachableBlocks.insert(UnreachableBlock);
+      State->MetaMap.insert(std::pair<SILBasicBlock *, UnreachableInfo>(
+          UnreachableBlock,
+          UnreachableInfo{UnreachableKind::FoldedSwitchEnum, Loc, true}));
+    }
+  }
+
+  LLVM_DEBUG(llvm::dbgs() << "Folding terminator: " << *SUI);
+  recursivelyDeleteTriviallyDeadInstructions(SUI, true);
+  ++NumTerminatorsFolded;
+  return true;
+}
+
+static InjectEnumAddrInst *
+getAllocStackSingleInitializingInjectEnumAddr(SwitchEnumAddrInst *SEAI) {
+  auto *stackSlot = dyn_cast<AllocStackInst>(SEAI->getOperand());
+  if (!stackSlot)
+    return nullptr;
+
+  LLVM_DEBUG(llvm::dbgs() << "Visiting Stack: " << *stackSlot);
+
+  InjectEnumAddrInst *singleInitializer = nullptr;
+  InitEnumDataAddrInst *singleInitializerAddr = nullptr;
+  SmallVector<Operand *, 16> worklist(stackSlot->use_begin(),
+                                      stackSlot->use_end());
+  LLVM_DEBUG(SWIFT_DEFER { llvm::dbgs() << "Exiting!\n"; });
+  while (worklist.size()) {
+    auto *op = worklist.pop_back_val();
+
+    LLVM_DEBUG(llvm::dbgs() << "Visiting: " << *op->getUser());
+    if (auto *svi = Projection::isAddressProjection(op->getUser())) {
+      LLVM_DEBUG(llvm::dbgs() << "Address projection. Continuing\n");
+      llvm::copy(svi->getUses(), std::back_inserter(worklist));
+      continue;
+    }
+
+    auto *user = op->getUser();
+
+    // Skip our self.
+    if (user == SEAI) {
+      LLVM_DEBUG(llvm::dbgs() << "Skipping SEAI.\n");
+      continue;
+    }
+
+    if (isa<LoadInst>(user) || isa<LoadBorrowInst>(user) ||
+        isa<DeallocStackInst>(user) || isa<DestroyAddrInst>(user)) {
+      LLVM_DEBUG(llvm::dbgs() << "Skipping loads/lifetime ends\n");
+      continue;
+    }
+
+    // If we are reading from the memory we are ok.
+    if (auto *cai = dyn_cast<CopyAddrInst>(user)) {
+      if (cai->getDest() == op->get() || cai->isTakeOfSrc() == IsTake) {
+        LLVM_DEBUG(llvm::dbgs() << "Found cai taking from src. Bailing!\n");
+        return nullptr;
+      }
+      LLVM_DEBUG(llvm::dbgs() << "Skipping!\n");
+      continue;
+    }
+
+    // Stash the initializer addr. We want to make sure it doesn't
+    // escape after we process.
+    if (auto *iedai = dyn_cast<InitEnumDataAddrInst>(user)) {
+      if (singleInitializerAddr) {
+        LLVM_DEBUG(llvm::dbgs() << "Multiple InitEnumDataAddrInst?!\n");
+        return nullptr;
+      }
+      singleInitializerAddr = iedai;
+      LLVM_DEBUG(llvm::dbgs() << "Continuing\n");
+      continue;
+    }
+
+    if (auto *ieai = dyn_cast<InjectEnumAddrInst>(user)) {
+      // If single initializer is already set,
+      if (singleInitializer) {
+        LLVM_DEBUG(llvm::dbgs() << "Multiple InitEnumDataAddrInst?!\n");
+        return nullptr;
+      }
+      singleInitializer = ieai;
+      LLVM_DEBUG(llvm::dbgs() << "Continuing\n");
+      continue;
+    }
+
+    LLVM_DEBUG(llvm::dbgs() << "Bailing at end of loop!\n");
+    return nullptr;
+  }
+
+  LLVM_DEBUG(llvm::dbgs() << "After Loop\n");
+
+  // If we didn't find a single initializer bail. We were initialized
+  // multiple times suggesting we are not actually looking at a SILGen
+  // temporary.
+  if (!singleInitializer) {
+    LLVM_DEBUG(llvm::dbgs() << "Did not find single initializer! Bailing!\n");
+    return nullptr;
+  }
+
+  // If we didn't have an addr, then it means we had a case without a
+  // payload.
+  if (!singleInitializerAddr) {
+    assert(!singleInitializer->getElement()->hasAssociatedValues());
+    LLVM_DEBUG(llvm::dbgs()
+               << "Did not find single initializer addr! Bailing!\n");
+    return singleInitializer;
+  }
+
+  // Otherwise, make sure we are initialized only once and never
+  // escape.
+  llvm::copy(singleInitializerAddr->getUses(), std::back_inserter(worklist));
+  bool foundInitializer = false;
+  while (worklist.size()) {
+    auto *op = worklist.pop_back_val();
+    LLVM_DEBUG(llvm::dbgs() << "Read only check for: " << *op->getUser());
+
+    // Look through projections.
+    if (auto *svi = Projection::isAddressProjection(op->getUser())) {
+      llvm::copy(svi->getUses(), std::back_inserter(worklist));
+      continue;
+    }
+
+    // Skip memory initializing operands. We should only ever see one
+    // since SILGen always initializes temporary allocations (our
+    // target) that way.
+    if (isa<StoreInst>(op->getUser())) {
+      if (foundInitializer) {
+        LLVM_DEBUG(llvm::dbgs() << "Found multiple initializers! Bailing!\n");
+        return nullptr;
+      }
+      foundInitializer = true;
+      continue;
+    }
+
+    if (auto *cai = dyn_cast<CopyAddrInst>(op->getUser())) {
+      if (cai->getDest() != op->get() ||
+          cai->isInitializationOfDest() != IsInitialization) {
+        return nullptr;
+      }
+      if (foundInitializer) {
+        LLVM_DEBUG(llvm::dbgs() << "Found multiple initializers! Bailing!\n");
+        return nullptr;
+      }
+      foundInitializer = true;
+      continue;
+    }
+
+    // Anything else consider unacceptable.
+    LLVM_DEBUG(llvm::dbgs() << "Found unknown addr initializer\n");
+    return nullptr;
+  }
+
+  // If we did not find a single address initializer, bail.
+  if (!foundInitializer)
+    return nullptr;
+
+  return singleInitializer;
 }
 
 static bool constantFoldTerminator(SILBasicBlock &BB,
@@ -213,7 +545,7 @@ static bool constantFoldTerminator(SILBasicBlock &BB,
         CondIsTrue = true;
       }
       recursivelyDeleteTriviallyDeadInstructions(TI, true);
-      NumInstructionsRemoved++;
+      ++NumInstructionsRemoved;
 
       // Produce an unreachable code warning for this basic block if it
       // contains user code (only if we are not within an inlined function or a
@@ -226,18 +558,18 @@ static bool constantFoldTerminator(SILBasicBlock &BB,
       // emit any warnings about it; if this is not the case it's Sema's
       // responsibility to warn about it.
       if (Loc.is<RegularLocation>() && State &&
-          !State->PossiblyUnreachableBlocks.count(UnreachableBlock) &&
+          !State->PossiblyUnreachableBlocks.contains(UnreachableBlock) &&
           !Loc.isASTNode<LabeledConditionalStmt>()) {
         // If this is the first time we see this unreachable block, store it
         // along with the folded branch info.
         State->PossiblyUnreachableBlocks.insert(UnreachableBlock);
         State->MetaMap.insert(
-          std::pair<const SILBasicBlock*, UnreachableInfo>(
+          std::pair<SILBasicBlock*, UnreachableInfo>(
             UnreachableBlock,
             UnreachableInfo{UnreachableKind::FoldedBranch, Loc, CondIsTrue}));
       }
 
-      NumTerminatorsFolded++;
+      ++NumTerminatorsFolded;
       return true;
     }
   }
@@ -248,83 +580,22 @@ static bool constantFoldTerminator(SILBasicBlock &BB,
   //                            case #Bool.false!unionelt: bb2
   // =>
   //   br bb2
-  if (auto *SUI = dyn_cast<SwitchEnumInst>(TI)) {
-    if (auto *TheEnum = dyn_cast<EnumInst>(SUI->getOperand())) {
-      const EnumElementDecl *TheEnumElem = TheEnum->getElement();
-      SILBasicBlock *TheSuccessorBlock = nullptr;
-      int ReachableBlockIdx = -1;
-      for (unsigned Idx = 0; Idx < SUI->getNumCases(); ++Idx) {
-        const EnumElementDecl *EI;
-        SILBasicBlock *BI;
-        std::tie(EI, BI) = SUI->getCase(Idx);
-        if (EI == TheEnumElem) {
-          TheSuccessorBlock = BI;
-          ReachableBlockIdx = Idx;
-          break;
-        }
-      }
-
-      if (!TheSuccessorBlock)
-        if (SUI->hasDefault()) {
-          SILBasicBlock *DB= SUI->getDefaultBB();
-          if (!isa<UnreachableInst>(DB->getTerminator())) {
-            TheSuccessorBlock = DB;
-            ReachableBlockIdx = SUI->getNumCases();
-          }
-        }
-
-      // Not fully covered switches will be diagnosed later. SILGen represents
-      // them with a Default basic block with an unreachable instruction.
-      // We are going to produce an error on all unreachable instructions not
-      // eliminated by DCE.
-      if (!TheSuccessorBlock)
-        return false;
-
-      // Replace the switch with a branch to the TheSuccessorBlock.
-      SILBuilderWithScope B(&BB, TI);
-      SILLocation Loc = TI->getLoc();
-      if (!TheSuccessorBlock->args_empty()) {
-        assert(TheEnum->hasOperand());
-        B.createBranch(Loc, TheSuccessorBlock, TheEnum->getOperand());
-      } else
-        B.createBranch(Loc, TheSuccessorBlock);
-
-      // Produce diagnostic info if we are not within an inlined function or
-      // template instantiation.
-      // FIXME: Do not report if we are within a template instantiation.
-      assert(ReachableBlockIdx >= 0);
-      if (Loc.is<RegularLocation>() && State) {
-        // Find the first unreachable block in the switch so that we could use
-        // it for better diagnostics.
-        SILBasicBlock *UnreachableBlock = nullptr;
-        if (SUI->getNumCases() > 1) {
-          // More than one case.
-          UnreachableBlock =
-            (ReachableBlockIdx == 0) ? SUI->getCase(1).second:
-                                       SUI->getCase(0).second;
-        } else {
-          if (SUI->getNumCases() == 1 && SUI->hasDefault()) {
-            // One case and a default.
-            UnreachableBlock =
-              (ReachableBlockIdx == 0) ? SUI->getDefaultBB():
-                                         SUI->getCase(0).second;
-          }
-        }
-
-        // Generate diagnostic info.
-        if (UnreachableBlock &&
-            !State->PossiblyUnreachableBlocks.count(UnreachableBlock)) {
-          State->PossiblyUnreachableBlocks.insert(UnreachableBlock);
-          State->MetaMap.insert(
-            std::pair<const SILBasicBlock*, UnreachableInfo>(
-              UnreachableBlock,
-              UnreachableInfo{UnreachableKind::FoldedSwitchEnum, Loc, true}));
-        }
-      }
-
-      recursivelyDeleteTriviallyDeadInstructions(TI, true);
-      NumTerminatorsFolded++;
-      return true;
+  if (auto *SEI = dyn_cast<SwitchEnumInst>(TI)) {
+    if (auto *TheEnum = dyn_cast<EnumInst>(SEI->getOperand())) {
+      return constantFoldEnumTerminator(BB, State, SEI, TheEnum->getElement(),
+                                        TheEnum);
+    }
+  }
+  if (auto *SEAI = dyn_cast<SwitchEnumAddrInst>(TI)) {
+    // We look for an alloc_stack that never escapes and that is initialized
+    // only once. This ensures we only need to find one initialization. This is
+    // a common pattern when unwrapping optional values in transparent
+    // functions.
+    //
+    // TODO: This needs a better name.
+    if (auto *IEAI = getAllocStackSingleInitializingInjectEnumAddr(SEAI)) {
+      return constantFoldEnumAddrTerminator(BB, State, SEAI,
+                                            IEAI->getElement());
     }
   }
 
@@ -357,7 +628,7 @@ static bool constantFoldTerminator(SILBasicBlock &BB,
         SILBuilderWithScope B(&BB, TI);
         B.createBranch(TI->getLoc(), TheSuccessorBlock);
         recursivelyDeleteTriviallyDeadInstructions(TI, true);
-        NumTerminatorsFolded++;
+        ++NumTerminatorsFolded;
         return true;
       }
       
@@ -368,7 +639,7 @@ static bool constantFoldTerminator(SILBasicBlock &BB,
   return false;
 }
 
-/// \brief Check if this instruction corresponds to user-written code.
+/// Check if this instruction corresponds to user-written code.
 static bool isUserCode(const SILInstruction *I) {
   SILLocation Loc = I->getLoc();
   if (Loc.isAutoGenerated())
@@ -384,16 +655,8 @@ static bool isUserCode(const SILInstruction *I) {
   
   // If the instruction corresponds to user-written return or some other
   // statement, we know it corresponds to user code.
-  if (Loc.is<RegularLocation>() || Loc.is<ReturnLocation>()) {
-    if (auto *E = Loc.getAsASTNode<Expr>())
-      return !E->isImplicit();
-    if (auto *D = Loc.getAsASTNode<Decl>())
-      return !D->isImplicit();
-    if (auto *S = Loc.getAsASTNode<Stmt>())
-      return !S->isImplicit();
-    if (auto *P = Loc.getAsASTNode<Pattern>())
-      return !P->isImplicit();
-  }
+  if (Loc.is<RegularLocation>() || Loc.is<ReturnLocation>())
+    return !Loc.isImplicit();
   return false;
 }
 
@@ -402,7 +665,6 @@ static void setOutsideBlockUsesToUndef(SILInstruction *I) {
     return;
 
   SILBasicBlock *BB = I->getParent();
-  SILModule &Mod = BB->getModule();
 
   // Replace all uses outside of I's basic block by undef.
   llvm::SmallVector<Operand *, 16> Uses;
@@ -411,7 +673,7 @@ static void setOutsideBlockUsesToUndef(SILInstruction *I) {
 
   for (auto *Use : Uses)
     if (Use->getUser()->getParent() != BB)
-      Use->set(SILUndef::get(Use->get()->getType(), Mod));
+      Use->set(SILUndef::get(Use->get()));
 }
 
 static SILInstruction *getAsCallToNoReturn(SILInstruction *I) {
@@ -423,6 +685,20 @@ static SILInstruction *getAsCallToNoReturn(SILInstruction *I) {
     if (BI->getModule().isNoReturnBuiltinOrIntrinsic(BI->getName()))
       return BI;
   }
+
+  // These appear in accessors for stored properties with uninhabited
+  // type. Since a type containing an uninhabited stored property is
+  // itself uninhabited, we treat these identically to fatalError(), etc.
+  if (auto *SEI = dyn_cast<StructExtractInst>(I)) {
+    if (SEI->getType().getASTType()->isUninhabited())
+      return SEI;
+  }
+
+  if (auto *SEAI = dyn_cast<StructElementAddrInst>(I)) {
+    if (SEAI->getType().getASTType()->isUninhabited())
+      return SEAI;
+  }
+
   return nullptr;
 }
 
@@ -455,6 +731,14 @@ static SILInstruction *getPrecedingCallToNoReturn(SILBasicBlock &BB) {
   return first;
 }
 
+static bool isUnavailableCodeReachedCall(SILInstruction *I) {
+  if (auto *AI = dyn_cast<ApplyInst>(I))
+    if (AI->hasSemantics(SEMANTICS_UNAVAILABLE_CODE_REACHED))
+      return true;
+
+  return false;
+}
+
 static bool simplifyBlocksWithCallsToNoReturn(SILBasicBlock &BB,
                                      UnreachableUserCodeReportingState *State) {
   auto I = BB.begin(), E = BB.end();
@@ -467,6 +751,59 @@ static bool simplifyBlocksWithCallsToNoReturn(SILBasicBlock &BB,
   // If all of the predecessor blocks end in a try_apply to a noreturn
   // function, the entire block is dead.
   NoReturnCall = getPrecedingCallToNoReturn(BB);
+
+  // Diagnose the unreachable code within the same block as the call to
+  // noreturn.
+  auto diagnoseUnreachableCode = [&](SILInstruction *noReturnCall,
+                                     SILInstruction *currInst) {
+    if (DiagnosedUnreachableCode)
+      return false;
+
+    // If current instruction belongs to the no-return call itself, skip it.
+    //
+    // It could happen when i.e. result has to be copied to be passed to
+    // some call.
+    if (currInst->getLoc().hasSameSourceLocation(noReturnCall->getLoc()))
+      return false;
+
+    if (!isUserCode(currInst))
+      return false;
+
+    // If we have an instruction that is an end_borrow, ignore it. This
+    // happens when passing a guaranteed argument through generic code paths
+    // to no return functions.
+    if (isa<EndBorrowInst>(currInst))
+      return false;
+
+    // destroy_value [dead_end] instructions are inserted at the availability
+    // boundary by lifetime completion.  Such instructions correctly mark the
+    // lifetime boundary of the destroyed value and never arise from dead user
+    // code.
+    auto *dvi = dyn_cast<DestroyValueInst>(currInst);
+    if (dvi && dvi->isDeadEnd())
+      return false;
+
+    // If no-return instruction is not something we can point in code or
+    // it's an explicit cast, skip it.
+    if (!noReturnCall->getLoc().is<RegularLocation>() ||
+        noReturnCall->getLoc().isASTNode<ExplicitCastExpr>())
+      return false;
+
+    // If the no-return instruction is a call to the unavailable code reached
+    // diagnostic function then we assume that the call was inserted by the
+    // compiler because the function is semantically unavailable. Diagnosing the
+    // user written body of the function as unreachable would be redundant.
+    if (isUnavailableCodeReachedCall(noReturnCall))
+      return false;
+
+    diagnose(BB.getModule().getASTContext(), currInst->getLoc().getSourceLoc(),
+             diag::unreachable_code);
+    diagnose(BB.getModule().getASTContext(),
+             noReturnCall->getLoc().getSourceLoc(),
+             diag::call_to_noreturn_note);
+
+    return true;
+  };
 
   // Does this block contain a call to a noreturn function?
   while (I != E) {
@@ -481,21 +818,8 @@ static bool simplifyBlocksWithCallsToNoReturn(SILBasicBlock &BB,
       // We will need to delete the instruction later on.
       ToBeDeleted.push_back(CurrentInst);
 
-      // Diagnose the unreachable code within the same block as the call to
-      // noreturn.
-      if (isUserCode(CurrentInst) && !DiagnosedUnreachableCode) {
-        if (NoReturnCall->getLoc().is<RegularLocation>()) {
-          if (!NoReturnCall->getLoc().isASTNode<ExplicitCastExpr>()) {
-            diagnose(BB.getModule().getASTContext(),
-                     CurrentInst->getLoc().getSourceLoc(),
-                     diag::unreachable_code);
-            diagnose(BB.getModule().getASTContext(),
-                     NoReturnCall->getLoc().getSourceLoc(),
-                     diag::call_to_noreturn_note);
-            DiagnosedUnreachableCode = true;
-          }
-        }
-      }
+      DiagnosedUnreachableCode |=
+          diagnoseUnreachableCode(NoReturnCall, CurrentInst);
 
       // We are going to bluntly remove these instructions. Change uses in
       // different basic blocks to undef. This is safe because all control flow
@@ -504,7 +828,7 @@ static bool simplifyBlocksWithCallsToNoReturn(SILBasicBlock &BB,
       // noreturn function and therefore dead.
       setOutsideBlockUsesToUndef(CurrentInst);
 
-      NumInstructionsRemoved++;
+      ++NumInstructionsRemoved;
       continue;
     }
 
@@ -529,12 +853,12 @@ static bool simplifyBlocksWithCallsToNoReturn(SILBasicBlock &BB,
       NoReturnCall->getLoc().is<RegularLocation>() && State){
     for (auto SI = BB.succ_begin(), SE = BB.succ_end(); SI != SE; ++SI) {
       SILBasicBlock *UnreachableBlock = *SI;
-      if (!State->PossiblyUnreachableBlocks.count(UnreachableBlock)) {
+      if (!State->PossiblyUnreachableBlocks.contains(UnreachableBlock)) {
         // If this is the first time we see this unreachable block, store it
         // along with the noreturn call info.
         State->PossiblyUnreachableBlocks.insert(UnreachableBlock);
         State->MetaMap.insert(
-          std::pair<const SILBasicBlock*, UnreachableInfo>(
+          std::pair<SILBasicBlock*, UnreachableInfo>(
             UnreachableBlock,
             UnreachableInfo{UnreachableKind::NoreturnCall,
                             NoReturnCall->getLoc(), true }));
@@ -558,18 +882,106 @@ static bool simplifyBlocksWithCallsToNoReturn(SILBasicBlock &BB,
   return true;
 }
 
-/// \brief Issue an "unreachable code" diagnostic if the blocks contains or
+/// Replaces  `switch_enum` / `switch_enum_addr` instructions that have cases
+/// matching unavailable enum elements with new instructions that have those
+/// cases removed since unavailable enum elements cannot be instantiated at
+/// run time.
+///
+/// If this pass removes a case, it will add a default case that traps if there
+/// was not already an existing default case. This artificial default case
+/// serves two purposes. The first is to ensure the new switch instruction still
+/// "covers" the entire enum as required by SIL verification (this analysis
+/// could be changed in the future to ignore unavailable elements). Secondly,
+/// the trapping default case may help developers catch issues at runtime where
+/// UB has been invoked and an unavailable element has been instantiated
+/// unexpectedly. Ideally, this debugging aid would be available consistently,
+/// but since we cannot leave any references to the unavailable elements in SIL
+/// it is not possible to transform switch instructions that already have
+/// default cases in such a way that unavailable elements would be detected.
+static bool eliminateSwitchDispatchOnUnavailableElements(
+    SILBasicBlock &BB, UnreachableUserCodeReportingState *State) {
+  SwitchEnumTermInst SWI(BB.getTerminator());
+  if (!SWI)
+    return false;
+
+  EnumDecl *ED = SWI->getOperand(0)->getType().getEnumOrBoundGenericEnum();
+  assert(ED && "operand is not an enum");
+
+  // No need to check the instruction if all elements are available.
+  if (!ED->hasCasesUnavailableDuringLowering())
+    return false;
+
+  SILLocation Loc = SWI->getLoc();
+  bool DidRemoveUnavailableCase = false;
+
+  SmallVector<std::pair<EnumElementDecl *, SILBasicBlock *>, 4> NewCaseBBs;
+  for (unsigned i : range(SWI.getNumCases())) {
+    auto CaseBB = SWI.getCase(i);
+    auto availableAtr = CaseBB.first->getUnavailableAttr();
+
+    if (availableAtr && availableAtr->isUnconditionallyUnavailable()) {
+      // Mark the basic block as potentially unreachable.
+      SILBasicBlock *UnreachableBlock = CaseBB.second;
+      if (!State->PossiblyUnreachableBlocks.contains(UnreachableBlock)) {
+        // If this is the first time we see this unreachable block, store it.
+        State->PossiblyUnreachableBlocks.insert(UnreachableBlock);
+        State->MetaMap.insert(
+            {UnreachableBlock,
+             UnreachableInfo{UnreachableKind::UnavailableEnumElement, Loc,
+                             true}});
+      }
+      DidRemoveUnavailableCase = true;
+    } else {
+      NewCaseBBs.push_back(CaseBB);
+    }
+  }
+
+  if (!DidRemoveUnavailableCase)
+    return false;
+
+  // Since at least one case was removed, we need to add a default case that
+  // traps if there isn't already an existing default case. The resulting SIL
+  // will have a structure that matches what SILGen would have produced for a
+  // switch statment that was written in source with unavailable cases
+  // unhandled.
+  SILBasicBlock *DefaultBB = SWI.getDefaultBBOrNull().getPtrOrNull();
+  bool DidCreateDefault = false;
+  if (!DefaultBB) {
+    DefaultBB = BB.getParent()->createBasicBlock();
+    SILLocation genLoc = Loc.asAutoGenerated();
+    SILBuilder B(DefaultBB);
+    B.createUnconditionalFail(genLoc, "unexpected enum value");
+    B.createUnreachable(genLoc);
+    DidCreateDefault = true;
+  }
+
+  if (isa<SwitchEnumInst>(*SWI)) {
+    auto *SEI = SILBuilderWithScope(SWI).createSwitchEnum(
+        Loc, SWI.getOperand(), DefaultBB, NewCaseBBs);
+
+    if (DidCreateDefault)
+      SEI->createDefaultResult();
+  } else {
+    assert(isa<SwitchEnumAddrInst>(*SWI) && "unknown switch_enum instruction");
+    SILBuilderWithScope(SWI).createSwitchEnumAddr(Loc, SWI.getOperand(),
+                                                  DefaultBB, NewCaseBBs);
+  }
+  SWI->eraseFromParent();
+
+  return true;
+}
+
+/// Issue an "unreachable code" diagnostic if the blocks contains or
 /// leads to another block that contains user code.
 ///
 /// Note, we rely on SILLocation information to determine if SILInstructions
 /// correspond to user code.
-static bool diagnoseUnreachableBlock(const SILBasicBlock &B,
-                                     SILModule &M,
-                                     const SILBasicBlockSet &Reachable,
-                                     UnreachableUserCodeReportingState *State,
-                                     const SILBasicBlock *TopLevelB,
-                         llvm::SmallPtrSetImpl<const SILBasicBlock*> &Visited){
-  if (Visited.count(&B))
+static bool diagnoseUnreachableBlock(
+    SILBasicBlock &B, SILModule &M,
+    const BasicBlockSet &Reachable,
+    UnreachableUserCodeReportingState *State, SILBasicBlock *TopLevelB,
+    BasicBlockSet &Visited) {
+  if (Visited.contains(&B))
     return false;
   Visited.insert(&B);
   
@@ -581,9 +993,18 @@ static bool diagnoseUnreachableBlock(const SILBasicBlock &B,
     if (Loc.is<ImplicitReturnLocation>() || Loc.isAutoGenerated())
       return false;
 
+    // Without debug info serialization, source locations are deserialized as
+    // implicit by default and as a result this diagnostic is never produced on
+    // deserialized code.  With support for serializing debug info/source
+    // locations, the implicit flag is deserialized properly .  However, this
+    // creates new diagnostic warnings in many tests. Until these tests are
+    // fixed, we suppress these warnings to match existing behavior.
+    if (Loc.isFilenameAndLocation())
+      continue;
+
     // Check if the instruction corresponds to user-written code, also make
     // sure we don't report an error twice for the same instruction.
-    if (isUserCode(&*I) && !State->BlocksWithErrors.count(&B)) {
+    if (isUserCode(&*I) && !State->BlocksWithErrors.contains(&B)) {
 
       // Emit the diagnostic.
       auto BrInfoIter = State->MetaMap.find(TopLevelB);
@@ -617,13 +1038,19 @@ static bool diagnoseUnreachableBlock(const SILBasicBlock &B,
       case (UnreachableKind::NoreturnCall): {
         // Specialcase when we are warning about unreachable code after a call
         // to a noreturn function.
-        if (!BrInfo.Loc.isASTNode<ExplicitCastExpr>()) {
+        if (!BrInfo.Loc.isASTNode<ExplicitCastExpr>() &&
+            !BrInfo.Loc.isSILFile()) {
           assert(BrInfo.Loc.isASTNode<ApplyExpr>());
           diagnose(M.getASTContext(), Loc.getSourceLoc(),
                    diag::unreachable_code);
           diagnose(M.getASTContext(), BrInfo.Loc.getSourceLoc(),
                    diag::call_to_noreturn_note);
         }
+        break;
+      }
+      case (UnreachableKind::UnavailableEnumElement): {
+        // Don't diagnose blocks removed because they were only reachable from
+        // a case matching an unavailable enum element.
         break;
       }
       }
@@ -645,7 +1072,7 @@ static bool diagnoseUnreachableBlock(const SILBasicBlock &B,
     SILBasicBlock *SB = *I;
     bool HasReachablePred = false;
     for (auto PI = SB->pred_begin(), PE = SB->pred_end(); PI != PE; ++PI) {
-      if (Reachable.count(*PI))
+      if (Reachable.contains(*PI))
         HasReachablePred = true;
     }
 
@@ -664,32 +1091,34 @@ static bool removeUnreachableBlocks(SILFunction &F, SILModule &M,
   if (F.empty())
     return false;
 
-  SILBasicBlockSet Reachable;
+  BasicBlockSet Reachable(&F);
   SmallVector<SILBasicBlock*, 128> Worklist;
   Worklist.push_back(&F.front());
   Reachable.insert(&F.front());
+  unsigned numReachableBlocks = 1;
 
   // Collect all reachable blocks by walking the successors.
   do {
     SILBasicBlock *BB = Worklist.pop_back_val();
     for (auto SI = BB->succ_begin(), SE = BB->succ_end(); SI != SE; ++SI) {
-      if (Reachable.insert(*SI).second)
+      if (Reachable.insert(*SI)) {
         Worklist.push_back(*SI);
+        ++numReachableBlocks;
+      }
     }
   } while (!Worklist.empty());
-  assert(Reachable.size() <= F.size());
 
   // If everything is reachable, we are done.
-  if (Reachable.size() == F.size())
+  if (numReachableBlocks == F.size())
     return false;
 
   // Diagnose user written unreachable code.
   if (State) {
     for (auto BI = State->PossiblyUnreachableBlocks.begin(),
               BE = State->PossiblyUnreachableBlocks.end(); BI != BE; ++BI) {
-      const SILBasicBlock *BB = *BI;
-      if (!Reachable.count(BB)) {
-        llvm::SmallPtrSet<const SILBasicBlock *, 1> visited;
+      SILBasicBlock *BB = *BI;
+      if (!Reachable.contains(BB)) {
+        BasicBlockSet visited(&F);
         diagnoseUnreachableBlock(**BI, M, Reachable, State, BB, visited);
       }
     }
@@ -698,31 +1127,33 @@ static bool removeUnreachableBlocks(SILFunction &F, SILModule &M,
   // Remove references from the dead blocks.
   for (auto I = F.begin(), E = F.end(); I != E; ++I) {
     SILBasicBlock *BB = &*I;
-    if (Reachable.count(BB))
+    if (Reachable.contains(BB))
       continue;
 
     // Drop references to other blocks.
     recursivelyDeleteTriviallyDeadInstructions(BB->getTerminator(), true);
-    NumInstructionsRemoved++;
+    ++NumInstructionsRemoved;
   }
 
   // Delete dead instructions and everything that could become dead after
   // their deletion.
   llvm::SmallVector<SILInstruction*, 32> ToBeDeleted;
   for (auto BI = F.begin(), BE = F.end(); BI != BE; ++BI)
-    if (!Reachable.count(&*BI))
+    if (!Reachable.contains(&*BI))
       for (auto I = BI->begin(), E = BI->end(); I != E; ++I)
         ToBeDeleted.push_back(&*I);
   recursivelyDeleteTriviallyDeadInstructions(ToBeDeleted, true);
   NumInstructionsRemoved += ToBeDeleted.size();
 
   // Delete the dead blocks.
-  for (auto I = F.begin(), E = F.end(); I != E;)
-    if (!Reachable.count(&*I)) {
-      I = F.getBlocks().erase(I);
-      NumBlocksRemoved++;
-    } else
-      ++I;
+  for (auto I = F.begin(), E = F.end(); I != E;) {
+    SILBasicBlock *BB = &*I;
+    ++I;
+    if (!Reachable.contains(BB)) {
+      F.eraseBlock(BB);
+      ++NumBlocksRemoved;
+    }
+  }
 
   return true;
 }
@@ -732,70 +1163,85 @@ static bool removeUnreachableBlocks(SILFunction &F, SILModule &M,
 /// diagnose any user code after it as being unreachable.  This pass happens
 /// before the definite initialization pass so that it doesn't see infeasible
 /// control flow edges.
-static void performNoReturnFunctionProcessing(SILModule *M,
-                                              SILModuleTransform *T) {
-  for (auto &Fn : *M) {
-    DEBUG(llvm::errs() << "*** No return function processing: "
-          << Fn.getName() << "\n");
-    
-    for (auto &BB : Fn) {
-      // Remove instructions from the basic block after a call to a noreturn
-      // function.
-      simplifyBlocksWithCallsToNoReturn(BB, nullptr);
-    }
-    T->invalidateAnalysis(&Fn, SILAnalysis::InvalidationKind::FunctionBody);
+static void performNoReturnFunctionProcessing(SILFunction &Fn,
+                                              SILFunctionTransform *T) {
+  LLVM_DEBUG(llvm::errs() << "*** No return function processing: "
+                          << Fn.getName() << "\n");
+  bool Changed = false;
+  for (auto &BB : Fn) {
+    // Remove instructions from the basic block after a call to a noreturn
+    // function.
+    Changed |= simplifyBlocksWithCallsToNoReturn(BB, nullptr);
+  }
+  if (Changed) {
+    removeUnreachableBlocks(Fn);
+    T->invalidateAnalysis(SILAnalysis::InvalidationKind::FunctionBody);
   }
 }
 
-void swift::performSILDiagnoseUnreachable(SILModule *M, SILModuleTransform *T) {
-  for (auto &Fn : *M) {
-    DEBUG(llvm::errs() << "*** Diagnose Unreachable processing: "
-          << Fn.getName() << "\n");
+static void diagnoseUnreachable(SILFunction &Fn) {
+  LLVM_DEBUG(llvm::errs() << "*** Diagnose Unreachable processing: "
+                          << Fn.getName() << "\n");
 
-    UnreachableUserCodeReportingState State;
+  UnreachableUserCodeReportingState State(&Fn);
 
-    for (auto &BB : Fn) {
-      // Simplify the blocks with terminators that rely on constant conditions.
-      if (constantFoldTerminator(BB, &State))
-        continue;
+  for (auto &BB : Fn) {
+    // Simplify the blocks with terminators that rely on constant conditions.
+    if (constantFoldTerminator(BB, &State))
+      continue;
 
-      // Remove instructions from the basic block after a call to a noreturn
-      // function.
-      if (simplifyBlocksWithCallsToNoReturn(BB, &State))
-        continue;
-    }
+    // Remove instructions from the basic block after a call to a noreturn
+    // function.
+    if (simplifyBlocksWithCallsToNoReturn(BB, &State))
+      continue;
 
-    // Remove unreachable blocks.
-    removeUnreachableBlocks(Fn, *M, &State);
-
-    for (auto &BB : Fn) {
-      propagateBasicBlockArgs(BB);
-    }
-
-    for (auto &BB : Fn) {
-      // Simplify the blocks with terminators that rely on constant conditions.
-      if (constantFoldTerminator(BB, &State)) {
-        continue;
-      }
-      // Remove instructions from the basic block after a call to a noreturn
-      // function.
-      if (simplifyBlocksWithCallsToNoReturn(BB, &State))
-        continue;
-    }
-
-    // Remove unreachable blocks.
-    removeUnreachableBlocks(Fn, *M, &State);
-
-    if (T)
-      T->invalidateAnalysis(&Fn, SILAnalysis::InvalidationKind::FunctionBody);
+    // Remove the cases of switch_enum / switch_enum_addr instructions that
+    // match unavailable enum elements.
+    if (eliminateSwitchDispatchOnUnavailableElements(BB, &State))
+      continue;
   }
+
+  // Remove unreachable blocks.
+  removeUnreachableBlocks(Fn, Fn.getModule(), &State);
+
+  for (auto &BB : Fn) {
+    propagateBasicBlockArgs(BB);
+  }
+
+  for (auto &BB : Fn) {
+    // Simplify the blocks with terminators that rely on constant conditions.
+    if (constantFoldTerminator(BB, &State)) {
+      continue;
+    }
+    // Remove instructions from the basic block after a call to a noreturn
+    // function.
+    if (simplifyBlocksWithCallsToNoReturn(BB, &State))
+      continue;
+    // Remove the cases of switch_enum / switch_enum_addr instructions that
+    // match unavailable enum elements.
+    if (eliminateSwitchDispatchOnUnavailableElements(BB, &State))
+      continue;
+  }
+
+  // Remove unreachable blocks.
+  removeUnreachableBlocks(Fn, Fn.getModule(), &State);
+}
+
+// External entry point for other passes, which must do their own invalidation.
+void swift::performSILDiagnoseUnreachable(SILModule *M) {
+  for (auto &Fn : *M)
+    diagnoseUnreachable(Fn);
 }
 
 namespace {
-  class NoReturnFolding : public SILModuleTransform {
-    void run() override {
-      performNoReturnFunctionProcessing(getModule(), this);
-    }
+class NoReturnFolding : public SILFunctionTransform {
+  void run() override {
+    // Don't rerun diagnostics on deserialized functions.
+    if (getFunction()->wasDeserializedCanonical())
+      return;
+
+    performNoReturnFunctionProcessing(*getFunction(), this);
+  }
   };
 } // end anonymous namespace
 
@@ -805,10 +1251,13 @@ SILTransform *swift::createNoReturnFolding() {
 
 
 namespace {
-  class DiagnoseUnreachable : public SILModuleTransform {
-    void run() override {
-      performSILDiagnoseUnreachable(getModule(), this);
-    }
+// This pass reruns on deserialized SIL because diagnostic constant propagation
+// can expose unreachable blocks which are then removed by this pass.
+class DiagnoseUnreachable : public SILFunctionTransform {
+  void run() override {
+    diagnoseUnreachable(*getFunction());
+    invalidateAnalysis(SILAnalysis::InvalidationKind::FunctionBody);
+  }
   };
 } // end anonymous namespace
 

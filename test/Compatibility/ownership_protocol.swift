@@ -4,9 +4,15 @@
 class SomeClass {}
 
 protocol P {
-  weak var foo: SomeClass? { get set } // expected-warning {{'weak' should not be applied to a property declaration in a protocol and will be disallowed in future versions}}
-  unowned var foo2: SomeClass { get set } // expected-warning {{'unowned' should not be applied to a property declaration in a protocol and will be disallowed in future versions}}
-  weak var foo3: Int? { get set } // expected-error {{'weak' may only be applied to class and class-bound protocol types, not 'Int'}}
-  unowned var foo4: Int { get set } // expected-error {{'unowned' may only be applied to class and class-bound protocol types, not 'Int'}}
+  // expected-warning@+1 {{'weak' cannot be applied to a property declaration in a protocol; this is an error in the Swift 5 language mode}}
+  weak var foo: SomeClass? { get set }
+  // expected-warning@+1 {{'unowned' cannot be applied to a property declaration in a protocol; this is an error in the Swift 5 language mode}}
+  unowned var foo2: SomeClass { get set }
+  // expected-warning@+2 {{'weak' cannot be applied to a property declaration in a protocol; this is an error in the Swift 5 language mode}}
+  // expected-error@+1 {{'weak' may only be applied to class and class-bound protocol types, not 'Int'}}
+  weak var foo3: Int? { get set }
+  // expected-warning@+2 {{'unowned' cannot be applied to a property declaration in a protocol; this is an error in the Swift 5 language mode}}
+  // expected-error@+1 {{'unowned' may only be applied to class and class-bound protocol types, not 'Int'}}
+  unowned var foo4: Int { get set }
 }
 

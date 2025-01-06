@@ -1,14 +1,14 @@
-// RUN: %target-sil-opt -assume-parsing-unqualified-ownership-sil %s | %FileCheck %s
+// RUN: %target-sil-opt %s | %FileCheck %s
 
 import Swift
 
-// CHECK: @sil_stored var orgx
+// CHECK: @_hasStorage var orgx
 class Rect {
-  @sil_stored var orgx: Double { get }
+  @_hasStorage var orgx: Double { get }
   init(orgx: Double)
 }
 
-// CHECK_LABEL: sil @_TFC4rect4Rectg4orgxSd
+// CHECK-LABEL: sil @_TFC4rect4Rectg4orgxSd
 sil @_TFC4rect4Rectg4orgxSd : $@convention(method) (@guaranteed Rect) -> Double {
 bb0(%0 : $Rect):
   debug_value %0 : $Rect
@@ -19,8 +19,8 @@ bb0(%0 : $Rect):
   return %3 : $Double
 }
 
-// CHECK_LABEL: sil_vtable Rect
+// CHECK-LABEL: sil_vtable Rect
 sil_vtable Rect {
   // CHECK: #Rect.orgx!getter
-  #Rect.orgx!getter.1: _TFC4rect4Rectg4orgxSd
+  #Rect.orgx!getter: @_TFC4rect4Rectg4orgxSd
 }

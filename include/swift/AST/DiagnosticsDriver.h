@@ -11,7 +11,7 @@
 //===----------------------------------------------------------------------===//
 //
 /// \file
-/// \brief This file defines diagnostics for the driver.
+/// This file defines diagnostics for the driver.
 /// \note Diagnostics shared between the driver and frontend are defined in
 /// \ref DiagnosticsFrontend.h.
 //
@@ -25,8 +25,8 @@
 namespace swift {
   namespace diag {
   // Declare common diagnostics objects with their appropriate types.
-#define DIAG(KIND,ID,Options,Text,Signature) \
-  extern detail::DiagWithArguments<void Signature>::type ID;
+#define DIAG(KIND, ID, Group, Options, Text, Signature)                      \
+    extern detail::DiagWithArguments<void Signature>::type ID;
 #include "DiagnosticsDriver.def"
   }
 }

@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2021 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -12,10 +12,12 @@
 
 import TestsUtils
 
-public let ObserverForwarderStruct = BenchmarkInfo(
-  name: "ObserverForwarderStruct",
-  runFunction: run_ObserverForwarderStruct,
-  tags: [.validation])
+public let benchmarks =
+  BenchmarkInfo(
+    name: "ObserverForwarderStruct",
+    runFunction: run_ObserverForwarderStruct,
+    tags: [.validation],
+    legacyFactor: 5)
 
 class Observer {
   @inline(never)
@@ -52,7 +54,7 @@ class Signal {
 public func run_ObserverForwarderStruct(_ iterations: Int) {
   let signal = Signal()
   let observer = Observer()
-  for _ in 0 ..< 10_000 * iterations {
+  for _ in 0 ..< 2_000 * iterations {
     signal.subscribe(Forwarder(object: observer))
   }
   signal.send(1)

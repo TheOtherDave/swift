@@ -1,7 +1,8 @@
 // RUN: %target-typecheck-verify-swift
 
-// https://bugs.swift.org/browse/SR-4426
-// '#if' in top-level code that contains only decls should not disturb forward reference.
+// https://github.com/apple/swift/issues/47003
+// '#if' in top-level code that contains only declarations should not disturb
+// forward reference.
 
 typealias A = B
 
@@ -11,8 +12,7 @@ func foo() {}
 
 struct B {}
 
-// If '#if' contains active non-decls, we don't support forward reference.
-typealias C = D // expected-error {{use of undeclared type 'D'}}
+typealias C = D
 
 #if true
 print("ok")

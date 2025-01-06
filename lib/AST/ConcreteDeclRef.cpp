@@ -22,41 +22,52 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "llvm/Support/raw_ostream.h"
 using namespace swift;
 
-ConcreteDeclRef::SpecializedDeclRef *
-ConcreteDeclRef::SpecializedDeclRef::create(
-                                       ASTContext &ctx, ValueDecl *decl,
-                                       SubstitutionList substitutions) {
-  size_t size = totalSizeToAlloc<Substitution>(substitutions.size());
-  void *memory = ctx.Allocate(size, alignof(SpecializedDeclRef));
-  return new (memory) SpecializedDeclRef(decl, substitutions);
-}
-
-ConcreteDeclRef
-ConcreteDeclRef::getOverriddenDecl(ASTContext &ctx) const {
+ConcreteDeclRef ConcreteDeclRef::getOverriddenDecl() const {
   auto *derivedDecl = getDecl();
   auto *baseDecl = derivedDecl->getOverriddenDecl();
 
-  auto *baseSig = baseDecl->getInnermostDeclContext()
+  auto baseSig = baseDecl->getInnermostDeclContext()
       ->getGenericSignatureOfContext();
-  auto *derivedSig = derivedDecl->getInnermostDeclContext()
+  auto derivedSig = derivedDecl->getInnermostDeclContext()
       ->getGenericSignatureOfContext();
 
-  SmallVector<Substitution, 4> subs = {};
+  SubstitutionMap subs;
   if (baseSig) {
-    Optional<SubstitutionMap> derivedSubMap;
+    subs = SubstitutionMap::getOverrideSubstitutions(baseDecl, derivedDecl);
     if (derivedSig)
-      derivedSubMap = derivedSig->getSubstitutionMap(getSubstitutions());
-    auto subMap = SubstitutionMap::getOverrideSubstitutions(
-        baseDecl, derivedDecl, derivedSubMap);
-    baseSig->getSubstitutions(subMap, subs);
+      subs = subs.subst(getSubstitutions());
   }
-  return ConcreteDeclRef(ctx, baseDecl, subs);
+  return ConcreteDeclRef(baseDecl, subs);
 }
 
-void ConcreteDeclRef::dump(raw_ostream &os) {
+ConcreteDeclRef ConcreteDeclRef::getOverriddenDecl(ValueDecl *baseDecl) const {
+  auto *derivedDecl = getDecl();
+  if (baseDecl == derivedDecl) return *this;
+
+#ifndef NDEBUG
+  {
+    auto cur = derivedDecl;
+    for (; cur && cur != baseDecl; cur = cur->getOverriddenDecl()) {}
+    assert(cur && "decl is not an indirect override of baseDecl");
+  }
+#endif
+
+  if (!baseDecl->getInnermostDeclContext()->isGenericContext()) {
+    return ConcreteDeclRef(baseDecl);
+  }
+
+  auto subs = SubstitutionMap::getOverrideSubstitutions(baseDecl, derivedDecl);
+  if (auto derivedSubs = getSubstitutions()) {
+    subs = subs.subst(derivedSubs);
+  }
+  return ConcreteDeclRef(baseDecl, subs);
+}
+
+void ConcreteDeclRef::dump(raw_ostream &os) const {
   if (!getDecl()) {
     os << "**NULL**";
     return;
@@ -67,30 +78,11 @@ void ConcreteDeclRef::dump(raw_ostream &os) {
   // If specialized, dump the substitutions.
   if (isSpecialized()) {
     os << " [with ";
-    interleave(getSubstitutions(),
-               [&](const Substitution &sub) {
-                 os << sub.getReplacement().getString();
-
-                 if (sub.getConformances().size()) {
-                   os << '[';
-                   interleave(sub.getConformances(),
-                              [&](ProtocolConformanceRef c) {
-                                if (c.isConcrete()) {
-                                  c.getConcrete()->printName(os);
-                                } else {
-                                  os << "abstract:"
-                                     << c.getAbstract()->getName();
-                                }
-                              },
-                              [&] { os << ", "; });
-                   os << ']';
-                 }
-               },
-               [&] { os << ", "; });
+    getSubstitutions().dump(os, SubstitutionMap::DumpStyle::Minimal);
     os << ']';
   }
 }
 
-void ConcreteDeclRef::dump() {
+void ConcreteDeclRef::dump() const {
   dump(llvm::errs());
 }

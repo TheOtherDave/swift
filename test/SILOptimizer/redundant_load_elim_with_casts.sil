@@ -1,4 +1,4 @@
-// RUN: %target-sil-opt -assume-parsing-unqualified-ownership-sil -enable-sil-verify-all %s -module-name Swift -redundant-load-elim | %FileCheck -check-prefix=CHECK-FUTURE %s
+// RUN: %target-sil-opt -enable-sil-verify-all %s -module-name Swift -redundant-load-elimination | %FileCheck -check-prefix=CHECK-FUTURE %s
 //
 // FIXME: Contains tests which are handled by old RLE, but not current one. Mostly due to casting. Eventually we probably should
 // handle these cases if they turn out to be important.
@@ -52,77 +52,6 @@ sil @use : $@convention(thin) (Builtin.Int32) -> ()
 sil @use_a : $@convention(thin) (@in A) -> ()
 sil @escaped_a_ptr : $@convention(thin) () -> @out A
 sil @escaped_a : $@convention(thin) () -> Builtin.RawPointer
-
-
-struct Agg2 {
-  var t : (Builtin.Int64, Builtin.Int32)
-}
-
-struct Agg1 {
-  var a : Agg2
-}
-
-struct Wrapper {
-  var value : Builtin.Int32
-}
-
-// CHECK-FUTURE: sil @tbaa_class_alias_nonclass
-// CHECK: strong_retain [[RET:%[0-9]+]]
-// CHECK: strong_retain [[RET]]
-// CHECK: return
-sil @tbaa_class_alias_nonclass : $@convention(thin) (@owned B, @inout Agg1) -> () {
-bb0(%0 : $B, %1 : $*Agg1):
-  %2 = alloc_box $<τ_0_0> { var τ_0_0 } <B>
-  %2a = project_box %2 : $<τ_0_0> { var τ_0_0 } <B>, 0
-  %3 = load %1 : $*Agg1
-  store %3 to %1 : $*Agg1
-  %5 = load %2a : $*B
-  store %3 to %1 : $*Agg1
-  %7 = load %2a : $*B
-  strong_retain %5 : $B   //%7 and %5 should really be one load.
-  strong_retain %7 : $B
-  %10 = tuple()
-  return %10 : $()
-}
-
-// FIXME: When RLE uses TBAA it should remove the second load.
-// CHECK-FUTURE: sil @tbaa_struct
-// CHECK: load
-// CHECK: store
-// CHECK: load
-// CHECK: return
-sil @tbaa_struct : $@convention(thin) (Builtin.RawPointer, A2) -> (A, A) {
-bb0(%0 : $Builtin.RawPointer, %1 : $A2):
-  %2 = pointer_to_address %0 : $Builtin.RawPointer to [strict] $*A
-  %3 = load %2 : $*A
-  %5 = pointer_to_address %0 : $Builtin.RawPointer to [strict] $*A2
-  store %1 to %5 : $*A2
-  %20 = load %2 : $*A
-  %30 = tuple(%3 : $A, %20 : $A)
-  return %30 : $(A, A)
-}
-
-// Even with TBAA, RLE should not remove the second load.
-// CHECK-FUTURE: sil @tbaa_bind_memory
-// CHECK: load
-// CHECK: bind_memory
-// CHECK: store
-// CHECK: bind_memory
-// CHECK: load
-// CHECK: return
-sil @tbaa_bind_memory : $@convention(thin) (Builtin.RawPointer, A2) -> (A, A) {
-bb0(%0 : $Builtin.RawPointer, %1 : $A2):
-  %2 = pointer_to_address %0 : $Builtin.RawPointer to [strict] $*A
-  %3 = load %2 : $*A
-  %4 = integer_literal $Builtin.Word, 1
-  bind_memory %0 : $Builtin.RawPointer, %4 : $Builtin.Word to $A2
-  %5 = pointer_to_address %0 : $Builtin.RawPointer to [strict] $*A2
-  store %1 to %5 : $*A2
-  bind_memory %0 : $Builtin.RawPointer, %4 : $Builtin.Word to $A
-  %20 = load %2 : $*A
-  %30 = tuple(%3 : $A, %20 : $A)
-  return %30 : $(A, A)
-}
 
 // *NOTE* This does not handle raw pointer since raw pointer is only layout compatible with heap references.
 // CHECK-FUTURE: sil @store_to_load_forward_unchecked_addr_cast_struct : $@convention(thin) (Optional<A>) -> () {
@@ -352,17 +281,17 @@ sil @invalidate_dead_loads_with_only_store_user_correctly : $@convention(thin) (
 bb0:
   %0 = alloc_stack $Optional<Builtin.Int32>
   %1 = integer_literal $Builtin.Int32, 0
-  %2 = enum $Optional<Builtin.Int32>, #Optional.some!enumelt.1, %1 : $Builtin.Int32
+  %2 = enum $Optional<Builtin.Int32>, #Optional.some!enumelt, %1 : $Builtin.Int32
   %3 = load %0 : $*Optional<Builtin.Int32>
   store %3 to %0 : $*Optional<Builtin.Int32>
-  %5 = unchecked_take_enum_data_addr %0 : $*Optional<Builtin.Int32>, #Optional.some!enumelt.1
+  %5 = unchecked_take_enum_data_addr %0 : $*Optional<Builtin.Int32>, #Optional.some!enumelt
   dealloc_stack %0 : $*Optional<Builtin.Int32>
   %9999 = tuple()
   return %9999 : $()
 }
 
 class Empty {}
-struct HoldsRef { @sil_stored var c: Empty }
+struct HoldsRef { @_hasStorage var c: Empty }
 
 sil @mutator : $@convention(method) (@inout HoldsRef) -> ()
 
@@ -374,7 +303,7 @@ sil @bad_store_forward : $@convention(thin) (@guaranteed Optional<HoldsRef>) -> 
 bb0(%0 : $Optional<HoldsRef>):
 // CHECK: [[LOC:%.*]] = alloc_stack
   %1 = alloc_stack $HoldsRef
-  switch_enum %0 : $Optional<HoldsRef>, case #Optional.some!enumelt.1: bb1, case #Optional.none!enumelt: bb2
+  switch_enum %0 : $Optional<HoldsRef>, case #Optional.some!enumelt: bb1, case #Optional.none!enumelt: bb2
 
 // CHECK: bb1([[ARG:%.*]] : ${{.*}}):
 bb1(%3 : $HoldsRef):

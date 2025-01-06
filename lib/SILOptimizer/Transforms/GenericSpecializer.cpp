@@ -17,64 +17,106 @@
 
 #define DEBUG_TYPE "sil-generic-specializer"
 
+#include "swift/AST/AvailabilityInference.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/OptimizationRemark.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
-#include "swift/SILOptimizer/Utils/Generics.h"
-#include "swift/SILOptimizer/Utils/Local.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
+#include "swift/SILOptimizer/Utils/BasicBlockOptUtils.h"
+#include "swift/SILOptimizer/Utils/ConstantFolding.h"
+#include "swift/SILOptimizer/Utils/Devirtualize.h"
+#include "swift/SILOptimizer/Utils/Generics.h"
+#include "swift/SILOptimizer/Utils/InstructionDeleter.h"
+#include "swift/SILOptimizer/Utils/SILInliner.h"
+#include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
+#include "swift/SILOptimizer/Utils/StackNesting.h"
 #include "llvm/ADT/SmallVector.h"
 
 using namespace swift;
 
 namespace {
+static void transferSpecializeAttributeTargets(SILModule &M,
+                                               SILOptFunctionBuilder &builder,
+                                               Decl *d) {
+  auto *vd = cast<AbstractFunctionDecl>(d);
+  for (auto *A : vd->getAttrs().getAttributes<SpecializeAttr>()) {
+    auto *SA = cast<SpecializeAttr>(A);
+    // Filter _spi.
+    auto spiGroups = SA->getSPIGroups();
+    auto hasSPIGroup = !spiGroups.empty();
+    if (hasSPIGroup) {
+      if (vd->getModuleContext() != M.getSwiftModule() &&
+          !M.getSwiftModule()->isImportedAsSPI(SA, vd)) {
+        continue;
+      }
+    }
+    if (auto *targetFunctionDecl = SA->getTargetFunctionDecl(vd)) {
+      auto kind = SA->getSpecializationKind() ==
+                          SpecializeAttr::SpecializationKind::Full
+                      ? SILSpecializeAttr::SpecializationKind::Full
+                      : SILSpecializeAttr::SpecializationKind::Partial;
+      Identifier spiGroupIdent;
+      if (hasSPIGroup) {
+        spiGroupIdent = spiGroups[0];
+      }
+      auto availability = AvailabilityInference::annotatedAvailableRangeForAttr(
+          vd, SA, M.getSwiftModule()->getASTContext());
 
-class GenericSpecializer : public SILFunctionTransform {
+      auto *attr = SILSpecializeAttr::create(
+          M, SA->getSpecializedSignature(vd), SA->getTypeErasedParams(),
+          SA->isExported(), kind, nullptr,
+          spiGroupIdent, vd->getModuleContext(), availability);
 
-  bool specializeAppliesInFunction(SILFunction &F);
-
-  /// The entry point to the transformation.
-  void run() override {
-    SILFunction &F = *getFunction();
-    DEBUG(llvm::dbgs() << "***** GenericSpecializer on function:" << F.getName()
-                       << " *****\n");
-
-    if (specializeAppliesInFunction(F))
-      invalidateAnalysis(SILAnalysis::InvalidationKind::Everything);
+      auto target = SILDeclRef(targetFunctionDecl);
+      std::string targetName = target.mangle();
+      if (SILFunction *targetSILFunction = M.lookUpFunction(targetName)) {
+        targetSILFunction->addSpecializeAttr(attr);
+      } else {
+        M.addPendingSpecializeAttr(targetName, attr);
+      }
+    }
   }
-
-};
-
+}
 } // end anonymous namespace
 
-bool GenericSpecializer::specializeAppliesInFunction(SILFunction &F) {
+bool swift::specializeAppliesInFunction(SILFunction &F,
+                                        SILTransform *transform,
+                                        bool isMandatory) {
+  SILOptFunctionBuilder FunctionBuilder(*transform);
   DeadInstructionSet DeadApplies;
   llvm::SmallSetVector<SILInstruction *, 8> Applies;
-  OptRemark::Emitter ORE(DEBUG_TYPE, F.getModule());
+  OptRemark::Emitter ORE(DEBUG_TYPE, F);
 
   bool Changed = false;
   for (auto &BB : F) {
     // Collect the applies for this block in reverse order so that we
     // can pop them off the end of our vector and process them in
     // forward order.
-    for (auto It = BB.rbegin(), End = BB.rend(); It != End; ++It) {
-      auto *I = &*It;
+    for (auto &I : llvm::reverse(BB)) {
 
       // Skip non-apply instructions, apply instructions with no
       // substitutions, apply instructions where we do not statically
       // know the called function, and apply instructions where we do
       // not have the body of the called function.
-      ApplySite Apply = ApplySite::isa(I);
+      ApplySite Apply = ApplySite::isa(&I);
       if (!Apply || !Apply.hasSubstitutions())
         continue;
 
-      auto *Callee = Apply.getReferencedFunction();
+      auto *Callee = Apply.getReferencedFunctionOrNull();
       if (!Callee)
         continue;
-      if (!Callee->isDefinition()) {
+
+      FunctionBuilder.getModule().performOnceForPrespecializedImportedExtensions(
+        [&FunctionBuilder](AbstractFunctionDecl *pre) {
+        transferSpecializeAttributeTargets(FunctionBuilder.getModule(), FunctionBuilder,
+                                           pre);
+        });
+
+      if (!Callee->isDefinition() && !Callee->hasPrespecialization()) {
         ORE.emit([&]() {
           using namespace OptRemark;
-          return RemarkMissed("NoDef", *I)
+          return RemarkMissed("NoDef", I)
                  << "Unable to specialize generic function "
                  << NV("Callee", Callee) << " since definition is not visible";
         });
@@ -92,16 +134,20 @@ bool GenericSpecializer::specializeAppliesInFunction(SILFunction &F) {
       auto *I = Applies.pop_back_val();
       auto Apply = ApplySite::isa(I);
       assert(Apply && "Expected an apply!");
-      SILFunction *Callee = Apply.getReferencedFunction();
+      SILFunction *Callee = Apply.getReferencedFunctionOrNull();
       assert(Callee && "Expected to have a known callee");
 
-      if (!Callee->shouldOptimize())
+      if (!Apply.canOptimize())
+        continue;
+
+      if (!isMandatory && !Callee->shouldOptimize())
         continue;
 
       // We have a call that can potentially be specialized, so
       // attempt to do so.
       llvm::SmallVector<SILFunction *, 2> NewFunctions;
-      trySpecializeApplyOfGeneric(Apply, DeadApplies, NewFunctions, ORE);
+      trySpecializeApplyOfGeneric(FunctionBuilder, Apply, DeadApplies,
+                                  NewFunctions, ORE, isMandatory);
 
       // Remove all the now-dead applies. We must do this immediately
       // rather than defer it in order to avoid problems with cloning
@@ -117,17 +163,39 @@ bool GenericSpecializer::specializeAppliesInFunction(SILFunction &F) {
         Changed = true;
       }
 
-      // If calling the specialization utility resulted in new functions
-      // (as opposed to returning a previous specialization), we need to notify
-      // the pass manager so that the new functions get optimized.
-      for (SILFunction *NewF : reverse(NewFunctions)) {
-        notifyAddFunction(NewF, Callee);
+      if (auto *sft = dyn_cast<SILFunctionTransform>(transform)) {
+        // If calling the specialization utility resulted in new functions
+        // (as opposed to returning a previous specialization), we need to notify
+        // the pass manager so that the new functions get optimized.
+        for (SILFunction *NewF : reverse(NewFunctions)) {
+          sft->addFunctionToPassManagerWorklist(NewF, Callee);
+        }
       }
     }
   }
 
   return Changed;
 }
+
+namespace {
+
+/// The generic specializer, used in the optimization pipeline.
+class GenericSpecializer : public SILFunctionTransform {
+
+  /// The entry point to the transformation.
+  void run() override {
+    SILFunction &F = *getFunction();
+
+    LLVM_DEBUG(llvm::dbgs() << "***** GenericSpecializer on function:"
+                            << F.getName() << " *****\n");
+
+    if (specializeAppliesInFunction(F, this, /*isMandatory*/ false)) {
+      invalidateAnalysis(SILAnalysis::InvalidationKind::FunctionBody);
+    }
+  }
+};
+
+} // end anonymous namespace
 
 SILTransform *swift::createGenericSpecializer() {
   return new GenericSpecializer();

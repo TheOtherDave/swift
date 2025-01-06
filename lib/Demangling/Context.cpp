@@ -16,9 +16,12 @@
 
 #include "swift/Demangling/Demangler.h"
 #include "swift/Demangling/ManglingMacros.h"
+#include "swift/Demangling/ManglingUtils.h"
+#include "swift/Demangling/NamespaceMacros.h"
 
 namespace swift {
 namespace Demangle {
+SWIFT_BEGIN_INLINE_NAMESPACE
 
 //////////////////////////////////
 // Context member functions     //
@@ -36,15 +39,21 @@ void Context::clear() {
 }
 
 NodePointer Context::demangleSymbolAsNode(llvm::StringRef MangledName) {
+#if SWIFT_SUPPORT_OLD_MANGLING
   if (isMangledName(MangledName)) {
     return D->demangleSymbol(MangledName);
   }
   return demangleOldSymbolAsNode(MangledName, *D);
+#else
+  return D->demangleSymbol(MangledName);
+#endif
 }
 
 NodePointer Context::demangleTypeAsNode(llvm::StringRef MangledName) {
   return D->demangleType(MangledName);
 }
+
+#if SWIFT_STDLIB_HAS_TYPE_PRINTING
 
 std::string Context::demangleSymbolAsString(llvm::StringRef MangledName,
                                             const DemangleOptions &Options) {
@@ -68,16 +77,50 @@ std::string Context::demangleTypeAsString(llvm::StringRef MangledName,
   return demangling;
 }
 
+#endif
+
+// Removes a '.<n>' suffix from \p Name. <n> is either a number or a combination of
+// '.<other-text>.<n>'.
+// Such symbols are produced in IRGen or in LLVM optimizations.
+static llvm::StringRef stripSuffix(llvm::StringRef Name) {
+  // A suffix always ends with a digit. Do this quick check to avoid scanning through the whole
+  // symbol name if the symbol has no suffix (= the common case).
+  if (swift::Mangle::isDigit(Name.back())) {
+    size_t dotPos = Name.find('.');
+    if (dotPos != StringRef::npos) {
+      Name = Name.substr(0, dotPos);
+    }
+  }
+  return Name;
+}
+
+// Removes a 'TQ<index>' or 'TY<index>' from \p Name.
+static llvm::StringRef stripAsyncContinuation(llvm::StringRef Name) {
+  if (!Name.ends_with("_"))
+    return Name;
+
+  StringRef Stripped = Name.drop_back();
+  while (!Stripped.empty() && swift::Mangle::isDigit(Stripped.back()))
+    Stripped = Stripped.drop_back();
+
+  if (Stripped.ends_with("TQ") || Stripped.ends_with("TY"))
+    return Stripped.drop_back(2);
+
+  return Name;
+}
+
 bool Context::isThunkSymbol(llvm::StringRef MangledName) {
   if (isMangledName(MangledName)) {
+    MangledName = stripAsyncContinuation(stripSuffix(MangledName));
     // First do a quick check
-    if (MangledName.endswith("TA") ||  // partial application forwarder
-        MangledName.endswith("Ta") ||  // ObjC partial application forwarder
-        MangledName.endswith("To") ||  // swift-as-ObjC thunk
-        MangledName.endswith("TO") ||  // ObjC-as-swift thunk
-        MangledName.endswith("TR") ||  // reabstraction thunk helper function
-        MangledName.endswith("Tr") ||  // reabstraction thunk
-        MangledName.endswith("TW")) {  // protocol witness thunk
+    if (MangledName.ends_with("TA") ||  // partial application forwarder
+        MangledName.ends_with("Ta") ||  // ObjC partial application forwarder
+        MangledName.ends_with("To") ||  // swift-as-ObjC thunk
+        MangledName.ends_with("TO") ||  // ObjC-as-swift thunk
+        MangledName.ends_with("TR") ||  // reabstraction thunk helper function
+        MangledName.ends_with("Tr") ||  // reabstraction thunk
+        MangledName.ends_with("TW") ||  // protocol witness thunk
+        MangledName.ends_with("fC")) {  // allocating constructor
 
       // To avoid false positives, we need to fully demangle the symbol.
       NodePointer Nd = D->demangleSymbol(MangledName);
@@ -93,6 +136,7 @@ bool Context::isThunkSymbol(llvm::StringRef MangledName) {
         case Node::Kind::ReabstractionThunkHelper:
         case Node::Kind::ReabstractionThunk:
         case Node::Kind::ProtocolWitness:
+        case Node::Kind::Allocator:
           return true;
         default:
           break;
@@ -101,13 +145,13 @@ bool Context::isThunkSymbol(llvm::StringRef MangledName) {
     return false;
   }
 
-  if (MangledName.startswith("_T")) {
+  if (MangledName.starts_with("_T")) {
     // Old mangling.
     StringRef Remaining = MangledName.substr(2);
-    if (Remaining.startswith("To") ||   // swift-as-ObjC thunk
-        Remaining.startswith("TO") ||   // ObjC-as-swift thunk
-        Remaining.startswith("PA_") ||  // partial application forwarder
-        Remaining.startswith("PAo_")) { // ObjC partial application forwarder
+    if (Remaining.starts_with("To") ||   // swift-as-ObjC thunk
+        Remaining.starts_with("TO") ||   // ObjC-as-swift thunk
+        Remaining.starts_with("PA_") ||  // partial application forwarder
+        Remaining.starts_with("PAo_")) { // ObjC partial application forwarder
       return true;
     }
   }
@@ -119,22 +163,35 @@ std::string Context::getThunkTarget(llvm::StringRef MangledName) {
     return std::string();
 
   if (isMangledName(MangledName)) {
-    // The targets of those thunks not derivable from the mangling.
-    if (MangledName.endswith("TR") ||
-        MangledName.endswith("Tr") ||
-        MangledName.endswith("TW") )
+    // If the symbol has a suffix we cannot derive the target.
+    if (stripSuffix(MangledName) != MangledName)
       return std::string();
+
+    // Ignore any async continuation suffix
+    MangledName = stripAsyncContinuation(MangledName);
+
+    // The targets of those thunks not derivable from the mangling.
+    if (MangledName.ends_with("TR") ||
+        MangledName.ends_with("Tr") ||
+        MangledName.ends_with("TW") )
+      return std::string();
+
+    if (MangledName.ends_with("fC")) {
+      std::string target = MangledName.str();
+      target[target.size() - 1] = 'c';
+      return target;
+    }
 
     return MangledName.substr(0, MangledName.size() - 2).str();
   }
   // Old mangling.
-  assert(MangledName.startswith("_T"));
+  assert(MangledName.starts_with("_T"));
   StringRef Remaining = MangledName.substr(2);
-  if (Remaining.startswith("PA_"))
+  if (Remaining.starts_with("PA_"))
     return Remaining.substr(3).str();
-  if (Remaining.startswith("PAo_"))
+  if (Remaining.starts_with("PAo_"))
     return Remaining.substr(4).str();
-  assert(Remaining.startswith("To") || Remaining.startswith("TO"));
+  assert(Remaining.starts_with("To") || Remaining.starts_with("TO"));
   return std::string("_T") + Remaining.substr(2).str();
 }
 
@@ -154,6 +211,7 @@ bool Context::hasSwiftCallingConvention(llvm::StringRef MangledName) {
     case Node::Kind::LazyProtocolWitnessTableAccessor:
     case Node::Kind::AssociatedTypeMetadataAccessor:
     case Node::Kind::AssociatedTypeWitnessTableAccessor:
+    case Node::Kind::BaseWitnessTableAccessor:
     case Node::Kind::ObjCAttribute:
       return false;
     default:
@@ -162,9 +220,52 @@ bool Context::hasSwiftCallingConvention(llvm::StringRef MangledName) {
   return true;
 }
 
+std::string Context::getModuleName(llvm::StringRef mangledName) {
+  NodePointer node = demangleSymbolAsNode(mangledName);
+  while (node) {
+    switch (node->getKind()) {
+    case Demangle::Node::Kind::Module:
+      return node->getText().str();
+    case Demangle::Node::Kind::TypeMangling:
+    case Demangle::Node::Kind::Type:
+      node = node->getFirstChild();
+      break;
+    case Demangle::Node::Kind::Global: {
+      NodePointer newNode = nullptr;
+      for (NodePointer child : *node) {
+        if (!isFunctionAttr(child->getKind())) {
+          newNode = child;
+          break;
+        }
+      }
+      node = newNode;
+      break;
+    }
+    default:
+      if (isSpecialized(node)) {
+        auto unspec = getUnspecialized(node, *D);
+        if (!unspec.isSuccess())
+          node = nullptr;
+        else
+          node = unspec.result();
+        break;
+      }
+      if (isContext(node->getKind())) {
+        node = node->getFirstChild();
+        break;
+      }
+      return std::string();
+    }
+  }
+  return std::string();
+}
+
+
 //////////////////////////////////
 // Public utility functions     //
 //////////////////////////////////
+
+#if SWIFT_STDLIB_HAS_TYPE_PRINTING
 
 std::string demangleSymbolAsString(const char *MangledName,
                                    size_t MangledNameLength,
@@ -182,5 +283,8 @@ std::string demangleTypeAsString(const char *MangledName,
                                   Options);
 }
 
+#endif
+
+SWIFT_END_INLINE_NAMESPACE
 } // namespace Demangle
 } // namespace swift

@@ -17,18 +17,17 @@ func main() {
         markUsed("element = \(element)")
     }
     markUsed("Done with the for loop")
-// CHECK: call {{.*}}void @_T04main8markUsedyxlF
+// CHECK: call {{.*}}void @"$s4main8markUsedyyxlF"
 // CHECK: br label
-// CHECK: <label>:
-// CHECK: call %Ts16IndexingIteratorVySaySiGG* @_T0s16IndexingIteratorVySaySiGGWh0_(%Ts16IndexingIteratorVySaySiGG* %{{.*}}), !dbg ![[LOOPHEADER_LOC:.*]]
-// CHECK: call {{.*}}void @_T04main8markUsedyxlF
+// CHECK: {{[0-9]+}}:
+// CHECK: call ptr @"$ss16IndexingIteratorVySaySiGGWOh"(ptr %{{.*}}), !dbg ![[LOOPHEADER_LOC:.*]]
+// CHECK: call {{.*}}void @"$s4main8markUsedyyxlF"
 // The cleanups should share the line number with the ret stmt.
-// CHECK:  call %TSa* @_T0SaySiGWh0_(%TSa* %{{.*}}), !dbg ![[CLEANUPS:.*]]
-// CHECK-NEXT:  !dbg ![[CLEANUPS]]
+// CHECK:  call ptr @"$sSaySiGWOh"(ptr %{{.*}}), !dbg ![[CLEANUPS:.*]]
 // CHECK-NEXT:  llvm.lifetime.end
+// CHECK-SAME:  !dbg ![[CLEANUPS]]
 // CHECK-NEXT:  load
-// CHECK-NEXT:  swift_rt_swift_release
-// CHECK-NEXT:  bitcast
+// CHECK-NEXT:  swift_release
 // CHECK-NEXT:  llvm.lifetime.end
 // CHECK-NEXT:  ret void, !dbg ![[CLEANUPS]]
 // CHECK: ![[CLEANUPS]] = !DILocation(line: [[@LINE+1]], column: 1,

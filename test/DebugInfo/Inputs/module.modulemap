@@ -15,3 +15,12 @@ module OtherClangModule {
     export *
   }
 }
+
+module Macro {
+  header "Macro.h"
+}
+
+module ClangModuleWithOverlay {
+  header "ClangModuleWithOverlay.h"
+  export *
+}

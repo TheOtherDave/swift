@@ -14,6 +14,7 @@
 #define SWIFT_IRGEN_GENENUM_H
 
 #include "TypeInfo.h"
+#include "LoadableTypeInfo.h"
 
 namespace llvm {
   class BasicBlock;
@@ -32,16 +33,25 @@ namespace swiftcall {
 }
 
 namespace swift {
+namespace irgen {
+  class IRBuilder;
+}
+}
+
+namespace swift {
   class EnumElementDecl;
-  
+  enum IsInitialization_t : bool;
+  enum IsTake_t : bool;
+
 namespace irgen {
   class EnumPayload;
   class EnumPayloadSchema;
   class IRGenFunction;
+  class MetadataDependencyCollector;
   class TypeConverter;
   using clang::CodeGen::swiftcall::SwiftAggLowering;
 
-/// \brief Emit the dispatch branch(es) for an address-only enum.
+/// Emit the dispatch branch(es) for an address-only enum.
 void emitSwitchAddressOnlyEnumDispatch(IRGenFunction &IGF,
                                         SILType enumTy,
                                         Address enumAddr,
@@ -49,7 +59,7 @@ void emitSwitchAddressOnlyEnumDispatch(IRGenFunction &IGF,
                                                            llvm::BasicBlock*>> dests,
                                         llvm::BasicBlock *defaultDest);
 
-/// \brief Injects a case and its associated data, if any, into a loadable enum
+/// Injects a case and its associated data, if any, into a loadable enum
 /// value.
 void emitInjectLoadableEnum(IRGenFunction &IGF,
                              SILType enumTy,
@@ -57,7 +67,7 @@ void emitInjectLoadableEnum(IRGenFunction &IGF,
                              Explosion &data,
                              Explosion &out);
   
-/// \brief Extracts the associated data for an enum case. This is an unchecked
+/// Extracts the associated data for an enum case. This is an unchecked
 /// operation; the input enum value must be of the given case.
 void emitProjectLoadableEnum(IRGenFunction &IGF,
                               SILType enumTy,
@@ -65,14 +75,14 @@ void emitProjectLoadableEnum(IRGenFunction &IGF,
                               EnumElementDecl *theCase,
                               Explosion &out);
 
-/// \brief Projects the address of the associated data for a case inside a
+/// Projects the address of the associated data for a case inside a
 /// enum, to which a new data value can be stored.
 Address emitProjectEnumAddressForStore(IRGenFunction &IGF,
                                         SILType enumTy,
                                         Address enumAddr,
                                         EnumElementDecl *theCase);
 
-/// \brief Projects the address of the associated data for a case inside a
+/// Projects the address of the associated data for a case inside a
 /// enum, clearing any tag bits interleaved into the data area, so that the
 /// value inside can be loaded. Does not check that the enum has a value of the
 /// given case.
@@ -81,37 +91,44 @@ Address emitDestructiveProjectEnumAddressForLoad(IRGenFunction &IGF,
                                                   Address enumAddr,
                                                   EnumElementDecl *theCase);
 
-/// \brief Stores the tag bits for an enum case to the given address, overlaying
+// Should an outlined value function be created for by address enum SIL
+// instructions instead of emitting the code inline.
+bool shouldOutlineEnumValueOperation(const TypeInfo &TI, IRGenModule &IGM);
+
+/// Stores the tag bits for an enum case to the given address, overlaying
 /// the data (if any) stored there.
 void emitStoreEnumTagToAddress(IRGenFunction &IGF,
                                 SILType enumTy,
                                 Address enumAddr,
                                 EnumElementDecl *theCase);
-  
-/// Interleave the occupiedValue and spareValue bits, taking a bit from one
-/// or the other at each position based on the spareBits mask.
-APInt
-interleaveSpareBits(IRGenModule &IGM, const SpareBitVector &spareBits,
-                    unsigned bits, unsigned spareValue, unsigned occupiedValue);
 
-/// A version of the above where the tag value is dynamic.
-EnumPayload interleaveSpareBits(IRGenFunction &IGF,
-                                const EnumPayloadSchema &schema,
-                                const SpareBitVector &spareBitVector,
-                                llvm::Value *value);
+/// Pack masked bits into the low bits of an integer value.
+/// Equivalent to a parallel bit extract instruction (PEXT),
+/// although we don't currently emit PEXT directly.
+llvm::Value *emitGatherBits(IRGenFunction &IGF,
+                            llvm::APInt mask,
+                            llvm::Value *source,
+                            unsigned resultLowBit,
+                            unsigned resultBitWidth);
 
-/// Gather spare bits into the low bits of a smaller integer value.
-llvm::Value *emitGatherSpareBits(IRGenFunction &IGF,
-                                 const SpareBitVector &spareBitMask,
-                                 llvm::Value *spareBits,
-                                 unsigned resultLowBit,
-                                 unsigned resultBitWidth);
-/// Scatter spare bits from the low bits of a smaller integer value.
-llvm::Value *emitScatterSpareBits(IRGenFunction &IGF,
-                                  const SpareBitVector &spareBitMask,
-                                  llvm::Value *packedBits,
-                                  unsigned packedLowBit);
-  
+/// Pack masked bits into the low bits of an integer value.
+llvm::APInt gatherBits(const llvm::APInt &mask,
+                       const llvm::APInt &value);
+
+/// Unpack bits from the low bits of an integer value and
+/// move them to the bit positions indicated by the mask.
+/// Equivalent to a parallel bit deposit instruction (PDEP),
+/// although we don't currently emit PDEP directly.
+llvm::Value *emitScatterBits(IRGenModule &IGM,
+                             IRBuilder &builder,
+                             llvm::APInt mask,
+                             llvm::Value *packedBits,
+                             unsigned packedLowBit);
+
+/// Unpack bits from the low bits of an integer value and
+/// move them to the bit positions indicated by the mask.
+llvm::APInt scatterBits(const llvm::APInt &mask, unsigned value);
+
 /// An implementation strategy for an enum, which handles how the enum is
 /// laid out and how to perform TypeInfo operations on values of the enum.
 class EnumImplStrategy {
@@ -135,19 +152,21 @@ protected:
   const TypeInfo *TI = nullptr;
   TypeInfoKind TIK;
   IsFixedSize_t AlwaysFixedSize;
+  IsABIAccessible_t ElementsAreABIAccessible;
+  IsTriviallyDestroyable_t TriviallyDestroyable;
+  IsCopyable_t Copyable;
+  IsBitwiseTakable_t BitwiseTakable;
   unsigned NumElements;
   
   EnumImplStrategy(IRGenModule &IGM,
                    TypeInfoKind tik,
                    IsFixedSize_t alwaysFixedSize,
+                   IsTriviallyDestroyable_t triviallyDestroyable,
+                   IsCopyable_t copyable,
+                   IsBitwiseTakable_t bitwiseTakable,
                    unsigned NumElements,
                    std::vector<Element> &&ElementsWithPayload,
-                   std::vector<Element> &&ElementsWithNoPayload)
-  : ElementsWithPayload(std::move(ElementsWithPayload)),
-    ElementsWithNoPayload(std::move(ElementsWithNoPayload)),
-    IGM(IGM), TIK(tik), AlwaysFixedSize(alwaysFixedSize),
-    NumElements(NumElements)
-  {}
+                   std::vector<Element> &&ElementsWithNoPayload);
   
   /// Save the TypeInfo created for the enum.
   TypeInfo *registerEnumTypeInfo(TypeInfo *mutableTI) {
@@ -158,8 +177,11 @@ protected:
   /// Constructs a TypeInfo for an enum of the best possible kind for its
   /// layout, FixedEnumTypeInfo or LoadableEnumTypeInfo.
   TypeInfo *getFixedEnumTypeInfo(llvm::StructType *T, Size S, SpareBitVector SB,
-                                 Alignment A, IsPOD_t isPOD,
-                                 IsBitwiseTakable_t isBT);
+                                 Alignment A,
+                                 IsTriviallyDestroyable_t isTriviallyDestroyable,
+                                 IsBitwiseTakable_t isBT,
+                                 IsCopyable_t isCopyable,
+                                 IsABIAccessible_t abiAccessible);
   
 public:
   virtual ~EnumImplStrategy() { }
@@ -186,10 +208,13 @@ public:
     return cast<llvm::StructType>(getTypeInfo().getStorageType());
   }
   
-  IsPOD_t isPOD(ResilienceExpansion expansion) const {
-    return getTypeInfo().isPOD(expansion);
+  IsTriviallyDestroyable_t isTriviallyDestroyable(ResilienceExpansion expansion) const {
+    return getTypeInfo().isTriviallyDestroyable(expansion);
   }
-  
+
+  const TypeInfo &getTypeInfoForPayloadCase(EnumElementDecl *theCase) const;
+  bool isPayloadCase(EnumElementDecl *theCase) const;
+
   /// \group Query enum layout
   ///
   /// These APIs assume a fixed layout; they will not work on generic
@@ -212,10 +237,6 @@ public:
   /// Return a tag index in the range [0..NumElements].
   unsigned getTagIndex(EnumElementDecl *Case) const;
 
-  /// Return a tag index in the range
-  /// [-ElementsWithPayload..ElementsWithNoPayload-1].
-  int getResilientTagIndex(EnumElementDecl *Case) const;
-
   /// Map the given element to the appropriate index in the
   /// discriminator type.
   /// Returns -1 if this is not supported by the enum implementation.
@@ -224,9 +245,9 @@ public:
   }
 
   /// Emit field names for enum reflection.
-  virtual llvm::Constant *emitCaseNames() const;
+  virtual bool isReflectable() const;
 
-  /// \brief Return the bits used for discriminators for payload cases.
+  /// Return the bits used for discriminators for payload cases.
   ///
   /// These bits are populated in increasing value according to the order of
   /// the getElementsWithPayload() array, starting from zero for the first
@@ -245,9 +266,19 @@ public:
   
   /// Return the enum case tag for the given value. Payload cases come first,
   /// followed by non-payload cases. Used for the getEnumTag value witness.
-  virtual llvm::Value *emitGetEnumTag(IRGenFunction &IGF,
-                                      SILType T,
-                                      Address enumAddr) const = 0;
+  virtual llvm::Value *emitGetEnumTag(IRGenFunction &IGF, SILType T,
+                                      Address enumAddr,
+                                      bool maskExtraTagBits = false) const = 0;
+
+  /// Return the enum case tag for the given value. Payload cases come first,
+  /// followed by non-payload cases. Used for the getEnumTag value witness.
+  ///
+  /// Only ever called for fixed types.
+  virtual llvm::Value *emitFixedGetEnumTag(IRGenFunction &IGF, SILType T,
+                                           Address enumAddr,
+                                           bool maskExtraTagBits = false) const;
+  llvm::Value *emitOutlinedGetEnumTag(IRGenFunction &IGF, SILType T,
+                                           Address enumAddr) const;
 
   /// Project the address of the data for a case. Does not check or modify
   /// the referenced enum value.
@@ -291,20 +322,24 @@ public:
 
   /// Return an i1 value that indicates whether the specified indirect enum
   /// value holds the specified case.  This is a light-weight form of a switch.
+  /// If `noLoad` is true don't load the enum's value from the address.
   virtual llvm::Value *emitIndirectCaseTest(IRGenFunction &IGF,
                                             SILType T,
                                             Address enumAddr,
-                                            EnumElementDecl *Case) const = 0;
+                                            EnumElementDecl *Case,
+                                            bool noLoad) const = 0;
   
   /// Emit a branch on the case contained by an enum explosion.
   /// Performs the branching for a SIL 'switch_enum_addr'
   /// instruction.
+  /// If `noLoad` is true don't load the enum's value from the address.
   virtual void emitIndirectSwitch(IRGenFunction &IGF,
                                   SILType T,
                                   Address enumAddr,
                                   ArrayRef<std::pair<EnumElementDecl*,
                                                      llvm::BasicBlock*>> dests,
-                                  llvm::BasicBlock *defaultDest) const = 0;
+                                  llvm::BasicBlock *defaultDest,
+                                  bool noLoad) const = 0;
 
   /// Emit code to extract the discriminator as an integer value.
   /// Returns null if this is not supported by the enum implementation.
@@ -321,11 +356,17 @@ public:
   
   /// Emit the construction sequence for an enum case into an explosion.
   /// Corresponds to the SIL 'enum' instruction.
-  virtual void emitValueInjection(IRGenFunction &IGF,
+  virtual void emitValueInjection(IRGenModule &IGM,
+                                  IRBuilder &builder,
                                   EnumElementDecl *elt,
                                   Explosion &params,
                                   Explosion &out) const = 0;
   
+  /// Return true for single-case (singleton) enums.
+  /// The enum doesn't need any tag bits and the payload of the enum case can
+  /// (and needs!) to be emitted as-is into a constant.
+  virtual bool emitPayloadDirectlyIntoConstant() const { return false; }
+
   /// Return an i1 value that indicates whether the specified loadable enum
   /// value holds the specified case.  This is a light-weight form of a switch.
   virtual llvm::Value *emitValueCaseTest(IRGenFunction &IGF,
@@ -368,22 +409,45 @@ public:
   virtual void initializeWithCopy(IRGenFunction &IGF, Address dest, Address src,
                                   SILType T, bool isOutlined) const = 0;
   virtual void initializeWithTake(IRGenFunction &IGF, Address dest, Address src,
-                                  SILType T, bool isOutlined) const = 0;
+                                  SILType T, bool isOutlined,
+                                  bool zeroizeIfSensitive) const = 0;
 
   virtual void initializeMetadata(IRGenFunction &IGF,
                                   llvm::Value *metadata,
-                                  llvm::Value *vwtable,
-                                  SILType T) const = 0;
+                                  bool isVWTMutable,
+                                  SILType T,
+                              MetadataDependencyCollector *collector) const = 0;
+
+  virtual void initializeMetadataWithLayoutString(IRGenFunction &IGF,
+                                                  llvm::Value *metadata,
+                                                  bool isVWTMutable,
+                                                  SILType T,
+                              MetadataDependencyCollector *collector) const = 0;
 
   virtual bool mayHaveExtraInhabitants(IRGenModule &IGM) const = 0;
 
+  // Only ever called for fixed types.
   virtual llvm::Value *getExtraInhabitantIndex(IRGenFunction &IGF,
                                                Address src,
-                                               SILType T) const = 0;
+                                               SILType T,
+                                               bool isOutlined) const = 0;
+  // Only ever called for fixed types.
   virtual void storeExtraInhabitant(IRGenFunction &IGF,
                                     llvm::Value *index,
                                     Address dest,
-                                    SILType T) const = 0;
+                                    SILType T,
+                                    bool isOutlined) const = 0;
+  virtual llvm::Value *getEnumTagSinglePayload(IRGenFunction &IGF,
+                                               llvm::Value *numEmptyCases,
+                                               Address enumAddr,
+                                               SILType T,
+                                               bool isOutlined) const = 0;
+  virtual void storeEnumTagSinglePayload(IRGenFunction &IGF,
+                                         llvm::Value *whichCase,
+                                         llvm::Value *numEmptyCases,
+                                         Address enumAddr,
+                                         SILType T,
+                                         bool isOutlined) const = 0;
   
   /// \group Delegated FixedTypeInfo operations
   
@@ -405,17 +469,18 @@ public:
   virtual void loadAsTake(IRGenFunction &IGF, Address addr,
                           Explosion &e) const = 0;
   virtual void assign(IRGenFunction &IGF, Explosion &e, Address addr,
-                      bool isOutlined) const = 0;
+                      bool isOutlined, SILType T) const = 0;
   virtual void initialize(IRGenFunction &IGF, Explosion &e, Address addr,
                           bool isOutlined) const = 0;
-  virtual void reexplode(IRGenFunction &IGF, Explosion &src,
+  virtual void reexplode(Explosion &src,
                          Explosion &dest) const = 0;
   virtual void copy(IRGenFunction &IGF, Explosion &src,
                     Explosion &dest, Atomicity atomicity) const = 0;
   virtual void consume(IRGenFunction &IGF, Explosion &src,
-                       Atomicity atomicity) const = 0;
+                       Atomicity atomicity, SILType T) const = 0;
   virtual void fixLifetime(IRGenFunction &IGF, Explosion &src) const = 0;
-  virtual void packIntoEnumPayload(IRGenFunction &IGF,
+  virtual void packIntoEnumPayload(IRGenModule &IGM,
+                                   IRBuilder &builder,
                                    EnumPayload &payload,
                                    Explosion &in,
                                    unsigned offset) const = 0;
@@ -428,13 +493,52 @@ public:
   virtual bool needsPayloadSizeInMetadata() const = 0;
   virtual unsigned getPayloadSizeForMetadata() const;
   
-  virtual llvm::Value *loadRefcountedPtr(IRGenFunction &IGF, SourceLoc loc,
-                                         Address addr) const;
+  virtual LoadedRef loadRefcountedPtr(IRGenFunction &IGF, SourceLoc loc,
+                                      Address addr) const;
 
-  virtual void collectArchetypeMetadata(
-      IRGenFunction &IGF,
-      llvm::MapVector<CanType, llvm::Value *> &typeToMetadataVec,
-      SILType T) const = 0;
+  void callOutlinedCopy(IRGenFunction &IGF, Address dest, Address src,
+                        SILType T, IsInitialization_t isInit,
+                        IsTake_t isTake) const {
+    TI->callOutlinedCopy(IGF, dest, src, T, isInit, isTake);
+  }
+
+  void callOutlinedDestroy(IRGenFunction &IGF, Address addr, SILType T) const {
+    TI->callOutlinedDestroy(IGF, addr, T);
+  }
+
+  virtual void collectMetadataForOutlining(OutliningMetadataCollector &collector,
+                                           SILType T) const = 0;
+
+  virtual TypeLayoutEntry
+  *buildTypeLayoutEntry(IRGenModule &IGM,
+                        SILType T,
+                        bool useStructLayouts) const = 0;
+
+  virtual bool isSingleRetainablePointer(ResilienceExpansion expansion,
+                                         ReferenceCounting *rc) const {
+    return false;
+  }
+
+  void emitResilientTagIndices(IRGenModule &IGM) const;
+
+  virtual bool canValueWitnessExtraInhabitantsUpTo(IRGenModule &IGM,
+                                                   unsigned index) const {
+    return false;
+  }
+
+  struct SpareBitsMaskInfo {
+    const llvm::APInt bits;
+    const uint32_t byteOffset;
+    const uint32_t bytesInMask;
+
+    uint64_t wordsInMask() const { return (bytesInMask + 3) / 4; }
+  };
+
+  /// Calculates the spare bits mask for the enum. Returns none if the type
+  /// should not emit the spare bits.
+  virtual std::optional<SpareBitsMaskInfo> calculateSpareBitsMask() const {
+    return {};
+  };
 
 private:
   EnumImplStrategy(const EnumImplStrategy &) = delete;
